@@ -1,0 +1,6 @@
+.venv/
+.claude/
+.idea/
+/build/
+dist/
+*.spec
