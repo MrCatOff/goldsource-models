@@ -140,7 +140,6 @@ class _ModelListPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._threads: list = []
-        self._loading_dlg: QProgressDialog | None = None
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -189,23 +188,93 @@ class _ModelListPanel(QWidget):
         return result
 
     def add_model_entry(self, name: str, directory: str) -> None:
-        """Load a model from directory and add to the list (async)."""
+        """Load one model (shows a modal progress dialog).
+        Each call captures its own dialog via closure — no shared state."""
         if any(m.name == name for m in self.models()):
             QMessageBox.warning(self, "Duplicate name",
                                 f"A model named '{name}' is already in the list.")
             return
+        self._start_load(name, directory, show_dialog=True)
 
-        self._loading_dlg = QProgressDialog(f"Loading {name}…", None, 0, 0, self)
-        self._loading_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self._loading_dlg.show()
+    def bulk_load_entries(
+        self,
+        entries: list[tuple[str, str]],
+        on_all_done: object = None,
+        on_status: object = None,
+    ) -> None:
+        """Load a list of (name, directory) entries one after another.
+        No per-model dialogs; progress is reported via *on_status(msg)*.
+        *on_all_done()* is called when the last model finishes."""
+        queue = list(entries)
+        total = len(queue)
+        counter = [0]  # mutable cell for closure
+
+        def _load_next() -> None:
+            while queue:
+                name, directory = queue.pop(0)
+                if any(m.name == name for m in self.models()):
+                    counter[0] += 1
+                    continue  # skip duplicate, try next immediately
+                if on_status:
+                    on_status(f"Loading {name}… ({counter[0] + 1}/{total})")
+                self._start_load(
+                    name, directory,
+                    show_dialog=False,
+                    on_done=lambda model, d: _on_one_done(model, d),
+                    on_fail=lambda err, n=name: _on_one_fail(err, n),
+                )
+                return  # wait for callback before continuing
+            # Queue is empty
+            if on_all_done:
+                on_all_done()
+
+        def _on_one_done(model: ModelInput, d: str) -> None:
+            self._on_model_loaded(model, d)
+            counter[0] += 1
+            _load_next()
+
+        def _on_one_fail(err: str, name: str) -> None:
+            QMessageBox.critical(self, f"Failed to load '{name}'", err)
+            counter[0] += 1
+            _load_next()
+
+        _load_next()
+
+    def _start_load(
+        self,
+        name: str,
+        directory: str,
+        *,
+        show_dialog: bool,
+        on_done: object = None,
+        on_fail: object = None,
+    ) -> None:
+        """Internal: launch a _LoadWorker, optionally showing a modal dialog."""
+        dlg: QProgressDialog | None = None
+        if show_dialog:
+            dlg = QProgressDialog(f"Loading {name}…", None, 0, 0, self)
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            dlg.show()
 
         worker = _LoadWorker(name, directory)
-        _launch_thread(
-            worker,
-            on_finish=self._on_model_loaded,
-            on_fail=self._on_load_failed,
-            keeper=self._threads,
-        )
+
+        def _finish(model: ModelInput, d: str, _dlg: object = dlg) -> None:
+            if _dlg:
+                _dlg.close()
+            if on_done:
+                on_done(model, d)
+            else:
+                self._on_model_loaded(model, d)
+
+        def _fail(err: str, _dlg: object = dlg) -> None:
+            if _dlg:
+                _dlg.close()
+            if on_fail:
+                on_fail(err)
+            else:
+                self._on_load_failed(err)
+
+        _launch_thread(worker, on_finish=_finish, on_fail=_fail, keeper=self._threads)
 
     # ------------------------------------------------------------------
     def _on_selection_changed(self) -> None:
@@ -229,10 +298,6 @@ class _ModelListPanel(QWidget):
         self.add_model_entry(name.strip(), directory)
 
     def _on_model_loaded(self, model: ModelInput, directory: str) -> None:
-        if self._loading_dlg:
-            self._loading_dlg.close()
-            self._loading_dlg = None
-
         row = self._table.rowCount()
         self._table.insertRow(row)
 
@@ -255,9 +320,6 @@ class _ModelListPanel(QWidget):
         self.modelsChanged.emit()
 
     def _on_load_failed(self, error: str) -> None:
-        if self._loading_dlg:
-            self._loading_dlg.close()
-            self._loading_dlg = None
         QMessageBox.critical(self, "Failed to load model", error)
 
     def _on_remove(self) -> None:
@@ -1393,45 +1455,37 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_app_config(self, cfg: AppConfig) -> None:
-        """Restore UI from an AppConfig (models are reloaded from disk)."""
-        # Clear model table
-        self._model_panel._table.setRowCount(0)
-        self._model_panel.modelsChanged.emit()
-
-        # Reload models (each triggers an async load)
-        for entry in cfg.models:
-            self._model_panel.add_model_entry(entry.name, entry.directory)
-
-        # Apply seq renames immediately (models load async but these are independent)
+        """Restore UI from an AppConfig. Models are reloaded sequentially."""
+        # Apply non-model settings immediately.
         self._seq_panel.set_renames(cfg.sequence_renames)
         self._output_panel.set_model_name(cfg.output_model_name)
         self._output_panel.set_output_dir(cfg.output_directory)
 
-        # Skin variants and slots are applied after models load via a deferred helper
-        # stored on self to avoid being GC'd
-        self._pending_skin_cfg = cfg
-        # We need to wait for all models to load before applying skins.
-        # Use a timer that polls until model count matches.
-        self._skin_apply_timer = QTimer(self)
-        self._skin_apply_timer.setInterval(200)
-        expected = len(cfg.models)
-        self._skin_apply_timer.timeout.connect(
-            lambda: self._try_apply_skins(expected)
-        )
-        self._skin_apply_timer.start()
+        # Clear existing models.
+        self._model_panel._table.setRowCount(0)
+        self._model_panel.modelsChanged.emit()
 
-    def _try_apply_skins(self, expected: int) -> None:
-        if len(self._model_panel.models()) < expected:
-            return
-        self._skin_apply_timer.stop()
-        cfg = self._pending_skin_cfg
-        # Build variants dict from config
-        variants: dict[str, list[SkinVariantSpec]] = {
-            m.name: m.skin_variants for m in cfg.models
-        }
-        slots = [SkinSlotSpec(name=s.name, assignments=s.assignments)
-                 for s in cfg.skin_slots]
-        self._skins_panel.load_from_config(variants, slots)
+        entries = [(m.name, m.directory) for m in cfg.models]
+
+        def _all_loaded() -> None:
+            # All models loaded — now safe to apply skin config.
+            variants: dict[str, list[SkinVariantSpec]] = {
+                m.name: m.skin_variants for m in cfg.models
+            }
+            slots = [
+                SkinSlotSpec(name=s.name, assignments=s.assignments)
+                for s in cfg.skin_slots
+            ]
+            self._skins_panel.load_from_config(variants, slots)
+            self.statusBar().showMessage(
+                f"Config loaded — {len(cfg.models)} model(s) ready."
+            )
+
+        self._model_panel.bulk_load_entries(
+            entries,
+            on_all_done=_all_loaded,
+            on_status=lambda msg: self.statusBar().showMessage(msg),
+        )
 
     # ------------------------------------------------------------------
     # File menu actions

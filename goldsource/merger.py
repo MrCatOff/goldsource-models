@@ -510,16 +510,53 @@ def _build_rename_maps(
     canonical: dict[str, str | None],
 ) -> dict[str, dict[str, str]]:
     """
-    For each model, build {old_bone_name: new_bone_name} for bones whose
-    parent deviates from the canonical definition.
-    Models conforming to the canonical skeleton have an empty rename map.
+    For each model, build {old_bone_name: new_bone_name} for every bone that
+    cannot share its name safely with the canonical skeleton.
+
+    Two situations require renaming:
+    1. **Direct conflict** — the bone exists in multiple models but its parent
+       differs from the canonical parent (studiomdl "illegal parent bone
+       replacement").
+    2. **Cascade conflict** — a bone's parent was renamed (situation 1 or 2).
+       Because the parent node has a new name in this model while keeping the
+       original name in others, the child bone would present two different
+       parent names for the same bone name → same error.
+
+    The fix: whenever a bone is renamed, *all of its descendants in the same
+    model* are also renamed with the same ``{model_name}__`` prefix so that
+    they become fully model-specific and cannot conflict with bones of the
+    same name in other models.
     """
     rename_maps: dict[str, dict[str, str]] = {m.name: {} for m in models}
+
     for model in models:
-        for bone_name, parent in model_bones[model.name].items():
+        bones = model_bones[model.name]
+
+        # Build a children index for this model's bone tree.
+        children: dict[str, list[str]] = defaultdict(list)
+        for bone_name, parent in bones.items():
+            if parent is not None:
+                children[parent].append(bone_name)
+
+        # Step 1 — find directly conflicting bones.
+        to_rename: set[str] = set()
+        for bone_name, parent in bones.items():
             if canonical.get(bone_name) != parent:
-                # Prepend model name to make it unique and traceable.
-                rename_maps[model.name][bone_name] = f"{model.name}__{bone_name}"
+                to_rename.add(bone_name)
+
+        # Step 2 — cascade: rename all descendants of every renamed bone.
+        queue = list(to_rename)
+        while queue:
+            bone = queue.pop()
+            for child in children.get(bone, []):
+                if child not in to_rename:
+                    to_rename.add(child)
+                    queue.append(child)
+
+        # Build the final map.
+        for bone_name in to_rename:
+            rename_maps[model.name][bone_name] = f"{model.name}__{bone_name}"
+
     return rename_maps
 
 
