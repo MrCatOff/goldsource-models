@@ -69,7 +69,7 @@ from goldsource.qc import (
     BoneController,
     TextureGroup,
 )
-from goldsource.smd import SMD, Node
+from goldsource.smd import SMD, Node, BoneTransform
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +181,7 @@ class MergeReport:
         )
         lines.append(
             f"Merged skeleton: {self.total_unique_bones} / {self.bone_limit} bones"
+            f"  (includes Universal_Root)"
         )
         lines.append("")
         lines.append("Per-model breakdown:")
@@ -346,7 +347,9 @@ class ModelMerger:
         rename_maps = _build_rename_maps(self._models, model_bones, canonical)
         effective = _effective_bone_sets(self._models, model_bones, rename_maps)
 
-        total = len(set().union(*effective.values())) if effective else 0
+        # +1 for Universal_Root, which is injected into every output SMD
+        # and counts as one shared bone in the compiled model.
+        total = (len(set().union(*effective.values())) if effective else 0) + 1
         exceeds = total > self.BONE_LIMIT
 
         suggestions = _suggest_removals(effective, self.BONE_LIMIT) if exceeds else []
@@ -403,6 +406,10 @@ class ModelMerger:
                 out_key = f"{model.name}/{_norm_path(smd_key)}"
                 output_smds[out_key] = _rewrite_smd(smd, b_rmap, t_rmap)
 
+        # Inject Universal_Root into every output SMD so all bodygroup meshes
+        # share a common top-level bone.
+        output_smds = {k: _inject_universal_root(v) for k, v in output_smds.items()}
+
         merged_qc = _build_merged_qc(self._models, bone_maps, output_modelname, config)
 
         # Build $texturegroup if skin slots are configured.
@@ -428,13 +435,19 @@ class ModelMerger:
 
     def _collect_model_bones(self) -> dict[str, dict[str, str | None]]:
         """
-        Returns {model_name: {bone_name: parent_name_or_None}} using each
-        model's first available reference SMD.
+        Returns {model_name: {bone_name: parent_name_or_None}}.
+
+        Unions ALL SMDs for each model so that bones appearing only in
+        animation files (or in secondary reference meshes) are captured.
+        In well-formed GoldSource models all SMDs share the same node
+        hierarchy, so the union is idempotent in practice.
         """
         result: dict[str, dict[str, str | None]] = {}
         for model in self._models:
-            smd = _pick_ref_smd(model)
-            result[model.name] = _bone_map(smd) if smd else {}
+            bones: dict[str, str | None] = {}
+            for smd in model.smds.values():
+                bones.update(_bone_map(smd))
+            result[model.name] = bones
         return result
 
 
@@ -527,6 +540,16 @@ def _build_rename_maps(
     they become fully model-specific and cannot conflict with bones of the
     same name in other models.
     """
+    # Bones that appear in more than one model (by original name).
+    # Only these can create a parent-mismatch after a cascade rename.
+    from collections import Counter as _Counter
+    bone_model_count: _Counter[str] = _Counter(
+        b for m in models for b in model_bones[m.name]
+    )
+    shared_bones: frozenset[str] = frozenset(
+        b for b, cnt in bone_model_count.items() if cnt > 1
+    )
+
     rename_maps: dict[str, dict[str, str]] = {m.name: {} for m in models}
 
     for model in models:
@@ -544,12 +567,14 @@ def _build_rename_maps(
             if canonical.get(bone_name) != parent:
                 to_rename.add(bone_name)
 
-        # Step 2 — cascade: rename all descendants of every renamed bone.
+        # Step 2 — cascade only into descendants that are SHARED across models.
+        # Bones that exist exclusively in this model can never cause a
+        # parent-name mismatch in another model, so they don't need renaming.
         queue = list(to_rename)
         while queue:
             bone = queue.pop()
             for child in children.get(bone, []):
-                if child not in to_rename:
+                if child not in to_rename and child in shared_bones:
                     to_rename.add(child)
                     queue.append(child)
 
@@ -683,6 +708,62 @@ def _rewrite_smd(
         for tri in new_smd.triangles:
             if tri.material in tex_rename:
                 tri.material = tex_rename[tri.material]
+    return new_smd
+
+
+# ---------------------------------------------------------------------------
+# Internal: Universal_Root injection
+# ---------------------------------------------------------------------------
+
+UNIVERSAL_ROOT_NAME = "Universal_Root"
+
+
+def _inject_universal_root(smd: SMD) -> SMD:
+    """Prepend a ``Universal_Root`` bone as ID 0, shifting all existing bone
+    IDs up by one, so that the root bone always has the lowest ID.
+
+    studiomdl expects every parent bone to have a lower ID than its children.
+    Appending the root at the *end* (highest ID) breaks that contract.  We
+    therefore insert it at ID 0 and increment every existing bone_id reference
+    throughout the nodes, skeleton *and* triangle-vertex sections.
+
+    Idempotent: if the SMD already contains a bone named ``Universal_Root``,
+    the original is returned unchanged.
+    """
+    if any(n.name == UNIVERSAL_ROOT_NAME for n in smd.nodes):
+        return smd
+
+    new_smd = deepcopy(smd)
+
+    # ── Step 1: shift every existing bone ID up by 1 ───────────────────
+    for node in new_smd.nodes:
+        node.id += 1
+        if node.parent_id != -1:
+            node.parent_id += 1
+        # Old root bones (parent_id was -1) keep parent_id=-1 for now;
+        # we reassign them to Universal_Root (id=0) in step 3.
+
+    for frame in new_smd.skeleton:
+        for bt in frame.bones:
+            bt.bone_id += 1
+
+    for tri in new_smd.triangles:
+        for v in (tri.v0, tri.v1, tri.v2):
+            v.bone_id += 1
+
+    # ── Step 2: insert Universal_Root as bone 0 ─────────────────────────
+    new_smd.nodes.insert(0, Node(id=0, name=UNIVERSAL_ROOT_NAME, parent_id=-1))
+
+    # ── Step 3: re-parent old root bones to Universal_Root ──────────────
+    for node in new_smd.nodes:
+        if node.id != 0 and node.parent_id == -1:
+            node.parent_id = 0
+
+    # ── Step 4: add identity transform for Universal_Root in every frame ─
+    zero = BoneTransform(bone_id=0, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0)
+    for frame in new_smd.skeleton:
+        frame.bones.insert(0, zero)
+
     return new_smd
 
 
