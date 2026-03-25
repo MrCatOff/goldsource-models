@@ -5,6 +5,10 @@ from goldsource.merger import (
     BoneConflict,
     MergeReport,
     MergeResult,
+    TextureReplacement,
+    SkinVariant,
+    SkinSlot,
+    MergeConfig,
 )
 from goldsource.smd import (
     SMD,
@@ -35,6 +39,10 @@ __all__ = [
     "BoneConflict",
     "MergeReport",
     "MergeResult",
+    "TextureReplacement",
+    "SkinVariant",
+    "SkinSlot",
+    "MergeConfig",
     # SMD
     "SMD",
     "Node",

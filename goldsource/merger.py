@@ -67,6 +67,7 @@ from goldsource.qc import (
     Attachment,
     HitBox,
     BoneController,
+    TextureGroup,
 )
 from goldsource.smd import SMD, Node
 
@@ -259,6 +260,47 @@ class MergeResult:
 
 
 # ---------------------------------------------------------------------------
+# Merge configuration (optional)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TextureReplacement:
+    """Single texture swap within a skin variant."""
+    original: str      # texture filename as in SMD material field (e.g. "hand.bmp")
+    replacement: str   # filename of the replacement texture (e.g. "hand_blood.bmp")
+
+
+@dataclass
+class SkinVariant:
+    """A named set of texture replacements for one model."""
+    name: str
+    model_name: str
+    replacements: list[TextureReplacement] = field(default_factory=list)
+    # Raw bytes for replacement textures, keyed by filename
+    replacement_data: dict[str, bytes] = field(default_factory=dict)
+
+
+@dataclass
+class SkinSlot:
+    """One global skin slot in the merged model (slot 0 = all defaults is implicit).
+    Maps model_name → the variant name to activate for that model."""
+    name: str
+    assignments: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class MergeConfig:
+    """Optional configuration that customises the merge behaviour."""
+    # String replacement rules applied in order to every sequence name.
+    # E.g. [("SP_", ""), ("DEPLOY", "draw")] renames "SP_DEPLOY_idle" → "draw_idle".
+    sequence_renames: list[tuple[str, str]] = field(default_factory=list)
+    # Per-model skin variants: model_name → list of variants
+    skin_variants: dict[str, list[SkinVariant]] = field(default_factory=dict)
+    # Global skin slots (skin 0 = defaults is always prepended automatically)
+    skin_slots: list[SkinSlot] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Merger
 # ---------------------------------------------------------------------------
 
@@ -320,7 +362,11 @@ class ModelMerger:
             warnings=warnings,
         )
 
-    def merge(self, output_modelname: str = "merged.mdl") -> MergeResult:
+    def merge(
+        self,
+        output_modelname: str = "merged.mdl",
+        config: MergeConfig | None = None,
+    ) -> MergeResult:
         """
         Perform the merge.
 
@@ -345,6 +391,9 @@ class ModelMerger:
         bone_maps = _build_rename_maps(self._models, model_bones, canonical)
         tex_plan = _build_texture_plan(self._models)
 
+        # Mutable copy so skin replacement textures can be appended.
+        output_textures: dict[str, bytes] = dict(tex_plan.output_textures)
+
         # Rewrite every SMD: apply bone renames + texture renames.
         output_smds: dict[str, SMD] = {}
         for model in self._models:
@@ -354,13 +403,20 @@ class ModelMerger:
                 out_key = f"{model.name}/{_norm_path(smd_key)}"
                 output_smds[out_key] = _rewrite_smd(smd, b_rmap, t_rmap)
 
-        merged_qc = _build_merged_qc(self._models, bone_maps, output_modelname)
+        merged_qc = _build_merged_qc(self._models, bone_maps, output_modelname, config)
+
+        # Build $texturegroup if skin slots are configured.
+        if config and config.skin_slots:
+            tg = _build_texturegroup(self._models, config, tex_plan, output_textures)
+            if tg:
+                merged_qc.texturegroups.append(tg)
+
         report = self.analyze()
 
         return MergeResult(
             qc=merged_qc,
             smds=output_smds,
-            textures=tex_plan.output_textures,
+            textures=output_textures,
             renamed_bones={k: v for k, v in bone_maps.items() if v},
             renamed_textures={k: v for k, v in tex_plan.model_renames.items() if v},
             report=report,
@@ -594,6 +650,83 @@ def _rewrite_smd(
 
 
 # ---------------------------------------------------------------------------
+# Internal: skin / sequence helpers
+# ---------------------------------------------------------------------------
+
+def _apply_seq_renames(name: str, renames: list[tuple[str, str]]) -> str:
+    """Apply ordered substring-replacement rules to a sequence name."""
+    for old, new in renames:
+        name = name.replace(old, new)
+    return name
+
+
+def _build_texturegroup(
+    models: list[ModelInput],
+    config: MergeConfig,
+    tex_plan: _TexturePlan,
+    output_textures: dict[str, bytes],
+) -> TextureGroup | None:
+    """
+    Build a ``$texturegroup "skins"`` block from *config.skin_slots*.
+
+    Row 0 = default (original) textures.
+    Row N = all originals with substitutions from slot N applied.
+    Only textures that appear in at least one slot's replacements are listed.
+    Replacement texture bytes are added to *output_textures* in-place.
+    """
+    if not config.skin_slots:
+        return None
+
+    # Collect, in encounter order, all original texture names that are
+    # referenced by any variant anywhere.  Translate through the texture
+    # plan rename map so we reference the final merged filenames.
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    for slot in config.skin_slots:
+        for model_name, variant_name in slot.assignments.items():
+            for variant in config.skin_variants.get(model_name, []):
+                if variant.name != variant_name:
+                    continue
+                for rep in variant.replacements:
+                    final = tex_plan.model_renames.get(model_name, {}).get(
+                        rep.original, rep.original
+                    )
+                    if final not in seen:
+                        seen.add(final)
+                        ordered.append(final)
+
+    if not ordered:
+        return None
+
+    # Row 0: defaults
+    rows: list[list[str]] = [list(ordered)]
+
+    # Rows 1..N: per slot
+    for slot in config.skin_slots:
+        row = list(ordered)
+        for model_name, variant_name in slot.assignments.items():
+            for variant in config.skin_variants.get(model_name, []):
+                if variant.name != variant_name:
+                    continue
+                for rep in variant.replacements:
+                    final_orig = tex_plan.model_renames.get(model_name, {}).get(
+                        rep.original, rep.original
+                    )
+                    if final_orig in seen:
+                        idx = ordered.index(final_orig)
+                        row[idx] = rep.replacement
+                        # Ensure replacement bytes are in the output
+                        if rep.replacement not in output_textures:
+                            data = variant.replacement_data.get(rep.replacement)
+                            if data is not None:
+                                output_textures[rep.replacement] = data
+        rows.append(row)
+
+    return TextureGroup(name="skins", skins=rows)
+
+
+# ---------------------------------------------------------------------------
 # Internal: merged QC construction
 # ---------------------------------------------------------------------------
 
@@ -601,6 +734,7 @@ def _build_merged_qc(
     models: list[ModelInput],
     rename_maps: dict[str, dict[str, str]],
     output_modelname: str,
+    config: MergeConfig | None = None,
 ) -> QC:
     base = models[0].qc
     merged = QC(
@@ -667,7 +801,8 @@ def _build_merged_qc(
         merged.texturemodes.extend(model.qc.texturemodes)
 
     # ---- sequences ---------------------------------------------------------
-    # Sequences are prefixed with the model name on collision.
+    # Apply rename rules, then prefix with model name on collision.
+    seq_renames = config.sequence_renames if config else []
     seen_seq_names: set[str] = set()
     for model in models:
         for seq in model.qc.sequences:
@@ -676,6 +811,7 @@ def _build_merged_qc(
             out_seq.smd_paths = [
                 f"{model.name}/{_norm_path(p)}" for p in seq.smd_paths
             ]
+            out_seq.name = _apply_seq_renames(out_seq.name, seq_renames)
             if out_seq.name in seen_seq_names:
                 out_seq.name = f"{model.name}__{out_seq.name}"
             seen_seq_names.add(out_seq.name)
