@@ -347,9 +347,56 @@ class ModelMerger:
         rename_maps = _build_rename_maps(self._models, model_bones, canonical)
         effective = _effective_bone_sets(self._models, model_bones, rename_maps)
 
-        # +1 for Universal_Root, which is injected into every output SMD
-        # and counts as one shared bone in the compiled model.
-        total = (len(set().union(*effective.values())) if effective else 0) + 1
+        # Build the output reference SMDs (rename + inject Universal_Root) using
+        # the same bodygroup-deduplication logic as _build_merged_qc, then run
+        # the studiomdl pruning estimate to get an accurate bone count.
+        tex_plan = _build_texture_plan(self._models)
+        preview_smds: dict[str, SMD] = {}
+        preview_ref_names: list[str] = []
+        all_group_names = _ordered_unique(
+            bg.name for m in self._models for bg in m.qc.bodygroups
+        )
+        for model in self._models:
+            b_rmap = rename_maps[model.name]
+            t_rmap = tex_plan.model_renames[model.name]
+            # $body entry
+            if model.qc.body and not model.qc.body.is_blank:
+                raw = model.qc.body.smd
+                norm = _norm_path(raw)
+                smd = model.smds.get(norm) or next(
+                    (s for k, s in model.smds.items() if k.split("/")[-1] == norm.split("/")[-1]),
+                    None,
+                )
+                if smd:
+                    out_key = f"{model.name}/{norm}"
+                    preview_smds[out_key] = _inject_universal_root(_rewrite_smd(smd, b_rmap, t_rmap))
+                    preview_ref_names.append(out_key)
+            # $bodygroup entries — one group per unique name (same as _build_merged_qc)
+            for group_name in all_group_names:
+                bg = model.qc.bodygroup_by_name(group_name)
+                if bg is None:
+                    continue
+                for entry in bg.entries:
+                    if entry.is_blank:
+                        continue
+                    norm = _norm_path(entry.smd)
+                    smd = model.smds.get(norm) or next(
+                        (s for k, s in model.smds.items() if k.split("/")[-1] == norm.split("/")[-1]),
+                        None,
+                    )
+                    if smd:
+                        out_key = f"{model.name}/{norm}"
+                        if out_key not in preview_smds:
+                            preview_smds[out_key] = _inject_universal_root(
+                                _rewrite_smd(smd, b_rmap, t_rmap)
+                            )
+                        if out_key not in preview_ref_names:
+                            preview_ref_names.append(out_key)
+
+        total = _studiomdl_bone_count(preview_smds, preview_ref_names)
+        if total == 0:
+            # Fallback to simple union count if no reference SMDs resolved
+            total = (len(set().union(*effective.values())) if effective else 0) + 1
         exceeds = total > self.BONE_LIMIT
 
         suggestions = _suggest_removals(effective, self.BONE_LIMIT) if exceeds else []
@@ -420,6 +467,20 @@ class ModelMerger:
 
         report = self.analyze()
 
+        # Replace the predicted bone count with the studiomdl-equivalent count
+        # from the actual merged output SMDs.
+        #
+        # studiomdl only keeps bones that are:
+        #   a) directly vertex-referenced in at least one reference mesh, OR
+        #   b) ancestors of such bones (needed to form the hierarchy).
+        # Bones that appear only in the node section with no geometry (effect
+        # helpers, IK targets, etc.) are pruned from the compiled .mdl.
+        ref_names = _ref_smd_names(merged_qc)
+        actual_count = _studiomdl_bone_count(output_smds, ref_names)
+        if actual_count > 0:
+            report.total_unique_bones = actual_count
+            report.exceeds_limit = actual_count > self.BONE_LIMIT
+
         return MergeResult(
             qc=merged_qc,
             smds=output_smds,
@@ -437,16 +498,40 @@ class ModelMerger:
         """
         Returns {model_name: {bone_name: parent_name_or_None}}.
 
-        Unions ALL SMDs for each model so that bones appearing only in
-        animation files (or in secondary reference meshes) are captured.
-        In well-formed GoldSource models all SMDs share the same node
-        hierarchy, so the union is idempotent in practice.
+        Only reference SMDs (the mesh SMDs listed in ``$bodygroup`` /
+        ``$body`` entries) are used.  Animation SMDs are excluded because
+        they can carry different parent assignments for the same bone (e.g.
+        motion-extraction rigs), which would produce false conflicts and
+        inflate the predicted bone count.
+
+        All reference SMDs for a model are unioned so that models with
+        multiple bodygroup meshes (each potentially covering a slightly
+        different subset of the skeleton) are handled correctly.
         """
         result: dict[str, dict[str, str | None]] = {}
         for model in self._models:
             bones: dict[str, str | None] = {}
-            for smd in model.smds.values():
-                bones.update(_bone_map(smd))
+
+            for raw_name in _ref_smd_names(model.qc):
+                norm = _norm_path(raw_name)
+                smd = model.smds.get(norm)
+                if smd is None:
+                    # Try basename match (QC may use relative paths)
+                    base = norm.split("/")[-1]
+                    smd = next(
+                        (s for k, s in model.smds.items() if k.split("/")[-1] == base),
+                        None,
+                    )
+                if smd:
+                    bones.update(_bone_map(smd))
+
+            # Fallback: no QC bodygroup entries resolved → use any non-animation SMD
+            if not bones:
+                for smd in model.smds.values():
+                    if not smd.is_animation:
+                        bones.update(_bone_map(smd))
+                        break
+
             result[model.name] = bones
         return result
 
@@ -941,6 +1026,53 @@ def _build_merged_qc(
 # ---------------------------------------------------------------------------
 # Internal: misc helpers
 # ---------------------------------------------------------------------------
+
+def _studiomdl_bone_count(output_smds: dict[str, "SMD"], ref_names: list[str]) -> int:
+    """
+    Estimate the number of bones studiomdl will include in the compiled model.
+
+    studiomdl keeps a bone if and only if it (a) is directly referenced by at
+    least one vertex in any reference mesh, OR (b) is an ancestor of such a
+    bone in the skeleton hierarchy.  Bones that only appear in the nodes
+    section with no geometry (effect helpers, IK targets, …) are pruned.
+
+    Returns 0 if no reference SMDs could be resolved.
+    """
+    needed: set[str] = set()
+
+    for raw in ref_names:
+        norm = _norm_path(raw)
+        smd = output_smds.get(norm)
+        if smd is None:
+            base = norm.split("/")[-1]
+            smd = next(
+                (s for k, s in output_smds.items() if k.split("/")[-1] == base),
+                None,
+            )
+        if smd is None:
+            continue
+
+        id_to_node = {n.id: n for n in smd.nodes}
+        name_to_node = {n.name: n for n in smd.nodes}
+
+        # Collect vertex-referenced bone ids
+        vertex_ids: set[int] = set()
+        for tri in smd.triangles:
+            for v in (tri.v0, tri.v1, tri.v2):
+                vertex_ids.add(v.bone_id)
+
+        # Walk up the parent chain for each vertex-referenced bone
+        for bid in vertex_ids:
+            node = id_to_node.get(bid)
+            while node is not None:
+                if node.name in needed:
+                    break  # already processed this ancestor chain
+                needed.add(node.name)
+                parent = id_to_node.get(node.parent_id)
+                node = parent
+
+    return len(needed)
+
 
 def _ref_smd_names(qc: QC) -> list[str]:
     """SMD names referenced in $body and all $bodygroup studio entries."""

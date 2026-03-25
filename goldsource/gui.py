@@ -1415,6 +1415,7 @@ class MainWindow(QMainWindow):
             f"Merge complete — {len(result.smds)} SMDs, "
             f"{len(result.textures)} textures → {output_dir}"
         )
+        self._analysis_panel.update_report(result.report)
         dlg = _MergeResultDialog(result, output_dir, self)
         dlg.exec()
 
