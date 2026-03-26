@@ -50,7 +50,62 @@ try:
 except Exception:
     _GL_OK = False
 
+from PyQt6.QtWidgets import QMessageBox
+
 from goldsource.smd import SMD
+
+
+# ---------------------------------------------------------------------------
+# Bone-editing helpers (operate on SMD in-place)
+# ---------------------------------------------------------------------------
+
+def _delete_bone(smd: SMD, bone_name: str) -> bool:
+    """
+    Remove the bone with *bone_name* from *smd* in-place.
+
+    - Child bones are re-parented to the deleted bone's parent.
+    - Vertices referencing the bone are reassigned to the parent bone
+      (or to bone 0 when the deleted bone is a root).
+    - All skeleton frame transforms for the bone are removed.
+
+    Returns True if the bone was found and removed, False otherwise.
+    """
+    node = next((n for n in smd.nodes if n.name == bone_name), None)
+    if node is None:
+        return False
+
+    bid            = node.id
+    parent_bid     = node.parent_id  # -1 for root bones
+
+    # Choose the bone id to reassign orphaned vertices to
+    if parent_bid != -1:
+        reassign_to = parent_bid
+    else:
+        # Deleted bone was a root — find another root or fall back to 0
+        other_root = next(
+            (n.id for n in smd.nodes if n.parent_id == -1 and n.id != bid),
+            0,
+        )
+        reassign_to = other_root
+
+    # Re-parent direct children
+    for n in smd.nodes:
+        if n.parent_id == bid:
+            n.parent_id = parent_bid
+
+    # Re-assign vertices
+    for tri in smd.triangles:
+        for v in (tri.v0, tri.v1, tri.v2):
+            if v.bone_id == bid:
+                v.bone_id = reassign_to
+
+    # Remove skeleton transforms
+    for frame in smd.skeleton:
+        frame.bones = [b for b in frame.bones if b.bone_id != bid]
+
+    # Remove node
+    smd.nodes = [n for n in smd.nodes if n.id != bid]
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -585,13 +640,44 @@ class ViewerPanel(QWidget):
         self._tree.itemDoubleClicked.connect(lambda item, _: self._rename(item))
         ll.addWidget(self._tree, 1)
 
-        btn_row = QHBoxLayout()
+        bone_btns = QVBoxLayout()
+        bone_btns.setSpacing(3)
+
+        row1 = QHBoxLayout()
         self._btn_rename = QPushButton("Rename")
         self._btn_rename.setEnabled(False)
         self._btn_rename.clicked.connect(self._on_rename_clicked)
-        btn_row.addWidget(self._btn_rename)
-        btn_row.addStretch()
-        ll.addLayout(btn_row)
+        row1.addWidget(self._btn_rename)
+        row1.addStretch()
+        bone_btns.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self._btn_delete = QPushButton("Delete Bone")
+        self._btn_delete.setEnabled(False)
+        self._btn_delete.setStyleSheet("color: #e05555;")
+        self._btn_delete.clicked.connect(self._on_delete_clicked)
+        row2.addWidget(self._btn_delete)
+        row2.addStretch()
+        bone_btns.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        self._btn_delete_all = QPushButton("Delete from All SMDs")
+        self._btn_delete_all.setEnabled(False)
+        self._btn_delete_all.setStyleSheet("color: #e05555;")
+        self._btn_delete_all.clicked.connect(self._on_delete_all_clicked)
+        row3.addWidget(self._btn_delete_all)
+        row3.addStretch()
+        bone_btns.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        self._btn_export = QPushButton("Export SMD")
+        self._btn_export.setEnabled(False)
+        self._btn_export.clicked.connect(self._on_export_clicked)
+        row4.addWidget(self._btn_export)
+        row4.addStretch()
+        bone_btns.addLayout(row4)
+
+        ll.addLayout(bone_btns)
 
         left.setMinimumWidth(220)
         left.setMaximumWidth(380)
@@ -669,13 +755,19 @@ class ViewerPanel(QWidget):
         self._viewport.set_smd(self._cur_smd)
         tex_dir = self._dirs.get(self._cur_model_name, "")
         self._viewport.set_texture_dir(tex_dir)
+        self._btn_export.setEnabled(self._cur_smd is not None)
 
     def _on_textures_toggled(self, checked: bool) -> None:
         self._viewport.set_textures_visible(checked)
 
     def _on_selection_changed(self) -> None:
         items = self._tree.selectedItems()
-        self._btn_rename.setEnabled(bool(items))
+        has_sel = bool(items)
+        has_smd = self._cur_smd is not None
+        self._btn_rename.setEnabled(has_sel)
+        self._btn_delete.setEnabled(has_sel)
+        self._btn_delete_all.setEnabled(has_sel)
+        self._btn_export.setEnabled(has_smd)
         if items:
             bid = items[0].data(0, Qt.ItemDataRole.UserRole)
             self._viewport.set_selected_bone(bid)
@@ -685,6 +777,65 @@ class ViewerPanel(QWidget):
         items = self._tree.selectedItems()
         if items:
             self._rename(items[0])
+
+    def _on_delete_clicked(self) -> None:
+        items = self._tree.selectedItems()
+        if not items or self._cur_smd is None:
+            return
+        bone_name = items[0].text(0)
+        ans = QMessageBox.question(
+            self, "Delete Bone",
+            f"Delete bone '{bone_name}' from the current SMD?\n\n"
+            "Its vertices will be reassigned to the parent bone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        if _delete_bone(self._cur_smd, bone_name):
+            self._rebuild_tree()
+            self._viewport.set_smd(self._cur_smd)
+            self.bonesRenamed.emit()
+
+    def _on_delete_all_clicked(self) -> None:
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        bone_name = items[0].text(0)
+        model = next((m for m in self._models if m.name == self._cur_model_name), None)
+        if model is None:
+            return
+        ans = QMessageBox.question(
+            self, "Delete from All SMDs",
+            f"Delete bone '{bone_name}' from ALL {len(model.smds)} SMD(s) "
+            f"in model '{self._cur_model_name}'?\n\n"
+            "Its vertices will be reassigned to the parent bone in each file.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        count = sum(1 for smd in model.smds.values() if _delete_bone(smd, bone_name))
+        self._rebuild_tree()
+        self._viewport.set_smd(self._cur_smd)
+        self.bonesRenamed.emit()
+        QMessageBox.information(
+            self, "Done",
+            f"Bone '{bone_name}' deleted from {count} SMD(s).",
+        )
+
+    def _on_export_clicked(self) -> None:
+        if self._cur_smd is None:
+            return
+        smd_key = self._smd_combo.currentText()
+        model_dir = self._dirs.get(self._cur_model_name, "")
+        if not model_dir:
+            QMessageBox.warning(self, "Export SMD", "Model directory is unknown.")
+            return
+        out_path = Path(model_dir) / (smd_key + ".smd")
+        try:
+            self._cur_smd.save(out_path)
+            QMessageBox.information(self, "Export SMD", f"Saved:\n{out_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export SMD", f"Failed to save:\n{exc}")
 
     def _on_bone_hovered(self, name: str, x: float, y: float, z: float) -> None:
         self._info_label.setText(
