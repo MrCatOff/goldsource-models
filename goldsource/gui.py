@@ -27,6 +27,7 @@ from goldsource.merger import ModelInput, MergeConfig, MergeReport, MergeResult,
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
 )
+from goldsource.viewer import ViewerPanel
 
 
 # ---------------------------------------------------------------------------
@@ -1235,8 +1236,21 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(4, 4, 4, 4)
 
+        # Top-level tab widget: Merger | Viewer
+        self._main_tabs = QTabWidget()
+        root.addWidget(self._main_tabs)
+
+        # ── Merger tab ───────────────────────────────────────────────────
+        merger_widget  = QWidget()
+        merger_layout  = QVBoxLayout(merger_widget)
+        merger_layout.setContentsMargins(0, 0, 0, 0)
         outer_splitter = QSplitter(Qt.Orientation.Vertical)
-        root.addWidget(outer_splitter)
+        merger_layout.addWidget(outer_splitter)
+        self._main_tabs.addTab(merger_widget, "Merger")
+
+        # ── Viewer tab ───────────────────────────────────────────────────
+        self._viewer_panel = ViewerPanel()
+        self._main_tabs.addTab(self._viewer_panel, "Viewer")
 
         # Top: left tabs + analysis
         inner_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1268,6 +1282,7 @@ class MainWindow(QMainWindow):
         self._model_panel.modelsChanged.connect(self._on_models_changed)
         self._output_panel.analyzeRequested.connect(self._run_analysis)
         self._output_panel.mergeRequested.connect(self._on_merge_requested)
+        self._viewer_panel.bonesRenamed.connect(self._on_bones_renamed)
 
         self.statusBar().showMessage("Ready. Add decompiled model directories to begin.")
 
@@ -1310,7 +1325,9 @@ class MainWindow(QMainWindow):
 
     def _on_models_changed(self) -> None:
         models = self._model_panel.models()
-        self._skins_panel.update_models(models, self._model_panel.model_directories())
+        dirs   = self._model_panel.model_directories()
+        self._skins_panel.update_models(models, dirs)
+        self._viewer_panel.update_models(models, dirs)
 
         if len(models) < 2:
             self._analysis_panel.show_placeholder()
@@ -1444,6 +1461,11 @@ class MainWindow(QMainWindow):
             self._merge_progress = None
         self.statusBar().showMessage("Merge failed.")
         QMessageBox.critical(self, "Merge error", error)
+
+    def _on_bones_renamed(self) -> None:
+        """Triggered when the Viewer renames a bone in-place; re-run analysis."""
+        self.statusBar().showMessage("Bone renamed — re-analysing…")
+        self._analysis_debounce.start(200)
 
     # ------------------------------------------------------------------
     # Config serialisation
