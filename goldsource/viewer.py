@@ -14,13 +14,14 @@ Provides:
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
+    QCheckBox, QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QInputDialog,
 )
 
@@ -39,6 +40,10 @@ try:
         GL_TRIANGLES, GL_LINES, GL_POINTS,
         GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_VIEWPORT,
         glBlendFunc,
+        GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+        GL_LINEAR, GL_RGBA, GL_UNSIGNED_BYTE,
+        glGenTextures, glBindTexture, glTexImage2D, glTexParameteri,
+        glDeleteTextures, glTexCoord2f,
     )
     from OpenGL.GLU import gluPerspective, gluLookAt, gluProject
     _GL_OK = True
@@ -119,8 +124,16 @@ if _GL_OK:
             # Geometry
             self._verts:       list[tuple[float, float, float]] = []
             self._tris:        list[tuple[int, int, int]]       = []
+            # mat -> list of ((x0,y0,z0,u0,v0),(x1,...),(x2,...))
+            self._mat_tris:    dict[str, list] = {}
             self._bone_pos:    dict[int, tuple[float, float, float]] = {}
             self._bone_lines:  list[tuple[int, int]]            = []
+
+            # Textures
+            self._tex_dir:     str  = ""
+            self._textures:    dict[str, int] = {}   # material -> GL texture id
+            self._show_textures: bool = False
+            self._tex_dirty:   bool  = True
 
             # Orbit camera
             self._azimuth   = 45.0   # degrees
@@ -143,6 +156,19 @@ if _GL_OK:
             self._smd = smd
             self._build_geometry()
             self._auto_frame()
+            self._tex_dirty = True
+            self.update()
+
+        def set_texture_dir(self, directory: str) -> None:
+            if self._tex_dir != directory:
+                self._tex_dir  = directory
+                self._tex_dirty = True
+                self.update()
+
+        def set_textures_visible(self, visible: bool) -> None:
+            self._show_textures = visible
+            if visible:
+                self._tex_dirty = True
             self.update()
 
         def set_selected_bone(self, bone_id: int | None) -> None:
@@ -158,6 +184,7 @@ if _GL_OK:
 
         def _build_geometry(self) -> None:
             self._verts, self._tris = [], []
+            self._mat_tris = {}
             self._bone_pos, self._bone_lines = {}, []
 
             if self._smd is None:
@@ -169,6 +196,15 @@ if _GL_OK:
                 for v in (tri.v0, tri.v1, tri.v2):
                     self._verts.append((v.x, v.y, v.z))
                 self._tris.append((base, base + 1, base + 2))
+                # Also store UV-aware data grouped by material
+                mat = tri.material
+                if mat not in self._mat_tris:
+                    self._mat_tris[mat] = []
+                self._mat_tris[mat].append((
+                    (tri.v0.x, tri.v0.y, tri.v0.z, tri.v0.u, tri.v0.v),
+                    (tri.v1.x, tri.v1.y, tri.v1.z, tri.v1.u, tri.v1.v),
+                    (tri.v2.x, tri.v2.y, tri.v2.z, tri.v2.u, tri.v2.v),
+                ))
 
             # Skeleton
             world = compute_world_transforms(self._smd)
@@ -186,6 +222,54 @@ if _GL_OK:
             self._target    = arr.mean(axis=0)
             extent          = float(np.linalg.norm(arr.max(axis=0) - arr.min(axis=0)))
             self._distance  = max(extent * 1.2, 1.0)
+
+        # ── Texture management ───────────────────────────────────────────
+
+        def _free_textures(self) -> None:
+            for tid in self._textures.values():
+                try:
+                    glDeleteTextures(1, [tid])
+                except Exception:
+                    pass
+            self._textures.clear()
+
+        def _load_textures(self) -> None:
+            self._free_textures()
+            if not self._tex_dir or self._smd is None:
+                return
+            try:
+                from PIL import Image
+            except ImportError:
+                return
+            tex_dir = Path(self._tex_dir)
+            if not tex_dir.is_dir():
+                return
+            # Build case-insensitive filename map for the directory
+            dir_files: dict[str, Path] = {}
+            for f in tex_dir.iterdir():
+                dir_files[f.name.lower()] = f
+
+            for mat in self._mat_tris:
+                fname = Path(mat).name
+                if not fname.lower().endswith(".bmp"):
+                    fname = fname + ".bmp"
+                fpath = dir_files.get(fname.lower())
+                if fpath is None:
+                    continue
+                try:
+                    img  = Image.open(fpath).convert("RGBA")
+                    img  = img.transpose(Image.FLIP_TOP_BOTTOM)
+                    data = img.tobytes()
+                    w, h = img.size
+                    tid  = glGenTextures(1)
+                    glBindTexture(GL_TEXTURE_2D, tid)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                    self._textures[mat] = tid
+                except Exception:
+                    pass
 
         # ── OpenGL callbacks ─────────────────────────────────────────────
 
@@ -255,25 +339,48 @@ if _GL_OK:
         def _draw_mesh(self) -> None:
             if not self._tris:
                 return
-            # Solid fill (semi-transparent)
-            glColor4f(0.55, 0.65, 0.80, 0.20)
-            glBegin(GL_TRIANGLES)
-            for a, b, c in self._tris:
-                for idx in (a, b, c):
-                    x, y, z = self._verts[idx]
-                    glVertex3f(x, y, z)
-            glEnd()
-            # Wireframe overlay
-            glColor4f(0.45, 0.55, 0.70, 0.35)
-            glLineWidth(0.6)
-            glBegin(GL_LINES)
-            for a, b, c in self._tris:
-                for u, v in ((a, b), (b, c), (c, a)):
-                    x1, y1, z1 = self._verts[u]
-                    x2, y2, z2 = self._verts[v]
-                    glVertex3f(x1, y1, z1)
-                    glVertex3f(x2, y2, z2)
-            glEnd()
+
+            if self._show_textures and self._mat_tris:
+                if self._tex_dirty:
+                    self._load_textures()
+                    self._tex_dirty = False
+                glEnable(GL_TEXTURE_2D)
+                for mat, tris_data in self._mat_tris.items():
+                    tid = self._textures.get(mat)
+                    if tid:
+                        glBindTexture(GL_TEXTURE_2D, tid)
+                        glColor4f(1.0, 1.0, 1.0, 1.0)
+                    else:
+                        glBindTexture(GL_TEXTURE_2D, 0)
+                        glColor4f(0.55, 0.65, 0.80, 0.80)
+                    glBegin(GL_TRIANGLES)
+                    for (x0, y0, z0, u0, v0), (x1, y1, z1, u1, v1), (x2, y2, z2, u2, v2) in tris_data:
+                        glTexCoord2f(u0, v0); glVertex3f(x0, y0, z0)
+                        glTexCoord2f(u1, v1); glVertex3f(x1, y1, z1)
+                        glTexCoord2f(u2, v2); glVertex3f(x2, y2, z2)
+                    glEnd()
+                glBindTexture(GL_TEXTURE_2D, 0)
+                glDisable(GL_TEXTURE_2D)
+            else:
+                # Solid fill (semi-transparent)
+                glColor4f(0.55, 0.65, 0.80, 0.20)
+                glBegin(GL_TRIANGLES)
+                for a, b, c in self._tris:
+                    for idx in (a, b, c):
+                        x, y, z = self._verts[idx]
+                        glVertex3f(x, y, z)
+                glEnd()
+                # Wireframe overlay
+                glColor4f(0.45, 0.55, 0.70, 0.35)
+                glLineWidth(0.6)
+                glBegin(GL_LINES)
+                for a, b, c in self._tris:
+                    for u, v in ((a, b), (b, c), (c, a)):
+                        x1, y1, z1 = self._verts[u]
+                        x2, y2, z2 = self._verts[v]
+                        glVertex3f(x1, y1, z1)
+                        glVertex3f(x2, y2, z2)
+                glEnd()
 
         def _draw_skeleton(self) -> None:
             if not self._bone_pos:
@@ -496,6 +603,16 @@ class ViewerPanel(QWidget):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
+        # Toolbar above viewport
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(4, 2, 4, 2)
+        self._chk_textures = QCheckBox("Show Textures")
+        self._chk_textures.setChecked(False)
+        self._chk_textures.toggled.connect(self._on_textures_toggled)
+        toolbar.addWidget(self._chk_textures)
+        toolbar.addStretch()
+        rl.addLayout(toolbar)
+
         self._viewport = _SMDViewport()
         self._viewport.boneHovered.connect(self._on_bone_hovered)
         self._viewport.boneUnhovered.connect(self._on_bone_unhovered)
@@ -550,6 +667,11 @@ class ViewerPanel(QWidget):
         self._cur_smd = model.smds.get(key) if model else None
         self._rebuild_tree()
         self._viewport.set_smd(self._cur_smd)
+        tex_dir = self._dirs.get(self._cur_model_name, "")
+        self._viewport.set_texture_dir(tex_dir)
+
+    def _on_textures_toggled(self, checked: bool) -> None:
+        self._viewport.set_textures_visible(checked)
 
     def _on_selection_changed(self) -> None:
         items = self._tree.selectedItems()
