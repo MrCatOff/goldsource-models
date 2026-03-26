@@ -610,6 +610,10 @@ class ViewerPanel(QWidget):
         self._dirs:    dict[str, str] = {}
         self._cur_smd: SMD | None = None
         self._cur_model_name: str = ""
+        # Recorded ops not yet propagated to all SMDs.
+        # Each entry is {"type": "rename", "old": str, "new": str}
+        #             or {"type": "delete", "name": str}
+        self._pending_ops: list[dict] = []
         self._setup_ui()
 
     # ── Setup ────────────────────────────────────────────────────────────
@@ -667,11 +671,13 @@ class ViewerPanel(QWidget):
         bone_btns.addLayout(row2)
 
         row3 = QHBoxLayout()
-        self._btn_delete_all = QPushButton("Delete from All SMDs")
-        self._btn_delete_all.setEnabled(False)
-        self._btn_delete_all.setStyleSheet("color: #e05555;")
-        self._btn_delete_all.clicked.connect(self._on_delete_all_clicked)
-        row3.addWidget(self._btn_delete_all)
+        self._btn_apply_all = QPushButton("Apply to All")
+        self._btn_apply_all.setEnabled(False)
+        self._btn_apply_all.setToolTip(
+            "Replay all pending renames / deletions on every SMD in this model"
+        )
+        self._btn_apply_all.clicked.connect(self._on_apply_all_clicked)
+        row3.addWidget(self._btn_apply_all)
         row3.addStretch()
         bone_btns.addLayout(row3)
 
@@ -745,6 +751,8 @@ class ViewerPanel(QWidget):
     def _on_model_changed(self) -> None:
         name = self._model_combo.currentText()
         self._cur_model_name = name
+        self._pending_ops.clear()
+        self._update_apply_button()
         model = next((m for m in self._models if m.name == name), None)
 
         prev = self._smd_combo.currentText()
@@ -780,7 +788,6 @@ class ViewerPanel(QWidget):
         has_smd = self._cur_smd is not None
         self._btn_rename.setEnabled(has_sel)
         self._btn_delete.setEnabled(has_sel)
-        self._btn_delete_all.setEnabled(has_sel)
         self._btn_export.setEnabled(has_smd)
         if items:
             bid = items[0].data(0, Qt.ItemDataRole.UserRole)
@@ -800,41 +807,74 @@ class ViewerPanel(QWidget):
         ans = QMessageBox.question(
             self, "Delete Bone",
             f"Delete bone '{bone_name}' from the current SMD?\n\n"
-            "Its vertices will be reassigned to the parent bone.",
+            "Use 'Apply to All' to propagate this to all SMDs in the model.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
         if _delete_bone(self._cur_smd, bone_name):
+            self._pending_ops.append({"type": "delete", "name": bone_name})
+            self._update_apply_button()
             self._rebuild_tree()
             self._viewport.set_smd(self._cur_smd)
             self.bonesRenamed.emit()
 
-    def _on_delete_all_clicked(self) -> None:
-        items = self._tree.selectedItems()
-        if not items:
+    def _on_apply_all_clicked(self) -> None:
+        if not self._pending_ops:
             return
-        bone_name = items[0].text(0)
         model = next((m for m in self._models if m.name == self._cur_model_name), None)
         if model is None:
             return
+
+        # Build human-readable summary
+        lines = []
+        for op in self._pending_ops:
+            if op["type"] == "rename":
+                lines.append(f"  Rename  '{op['old']}'  →  '{op['new']}'")
+            else:
+                lines.append(f"  Delete  '{op['name']}'")
+        summary = "\n".join(lines)
+        other_count = len(model.smds) - 1  # current SMD already has the changes
+
         ans = QMessageBox.question(
-            self, "Delete from All SMDs",
-            f"Delete bone '{bone_name}' from ALL {len(model.smds)} SMD(s) "
-            f"in model '{self._cur_model_name}'?\n\n"
-            "Its vertices will be reassigned to the parent bone in each file.",
+            self, "Apply to All SMDs",
+            f"Apply {len(self._pending_ops)} pending change(s) to the other "
+            f"{other_count} SMD(s) in '{self._cur_model_name}'?\n\n{summary}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        count = sum(1 for smd in model.smds.values() if _delete_bone(smd, bone_name))
-        self._rebuild_tree()
-        self._viewport.set_smd(self._cur_smd)
+
+        cur_key = self._smd_combo.currentText()
+        applied = 0
+        for key, smd in model.smds.items():
+            if key == cur_key:
+                continue  # already done
+            for op in self._pending_ops:
+                if op["type"] == "rename":
+                    for node in smd.nodes:
+                        if node.name == op["old"]:
+                            node.name = op["new"]
+                else:
+                    _delete_bone(smd, op["name"])
+            applied += 1
+
+        self._pending_ops.clear()
+        self._update_apply_button()
         self.bonesRenamed.emit()
         QMessageBox.information(
             self, "Done",
-            f"Bone '{bone_name}' deleted from {count} SMD(s).",
+            f"Changes applied to {applied} SMD(s).",
         )
+
+    def _update_apply_button(self) -> None:
+        n = len(self._pending_ops)
+        if n == 0:
+            self._btn_apply_all.setText("Apply to All")
+            self._btn_apply_all.setEnabled(False)
+        else:
+            self._btn_apply_all.setText(f"Apply to All  ({n} pending)")
+            self._btn_apply_all.setEnabled(True)
 
     def _on_export_clicked(self) -> None:
         if self._cur_smd is None:
@@ -919,15 +959,12 @@ class ViewerPanel(QWidget):
         if not new_name or new_name == old_name:
             return
 
-        # Apply to every SMD in this model
-        model = next((m for m in self._models if m.name == self._cur_model_name), None)
-        if model is None:
-            return
-        for smd in model.smds.values():
-            for node in smd.nodes:
+        # Apply to current SMD only; record op so Apply-to-All can propagate it
+        if self._cur_smd is not None:
+            for node in self._cur_smd.nodes:
                 if node.name == old_name:
                     node.name = new_name
-
-        # Refresh tree and emit change signal
+        self._pending_ops.append({"type": "rename", "old": old_name, "new": new_name})
+        self._update_apply_button()
         self._rebuild_tree()
         self.bonesRenamed.emit()
