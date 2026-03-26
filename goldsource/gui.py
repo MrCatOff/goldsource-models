@@ -357,6 +357,8 @@ class _SkinsPanel(QWidget):
         # list[SkinSlotSpec]
         self._slots: list[SkinSlotSpec] = []
         self._model_names: list[str] = []
+        # model_name -> source directory (for BMP listing)
+        self._model_dirs: dict[str, str] = {}
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -449,8 +451,10 @@ class _SkinsPanel(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def update_models(self, models: list[ModelInput]) -> None:
+    def update_models(self, models: list[ModelInput], dirs: dict[str, str] | None = None) -> None:
         """Called when the model list changes. Sync internal state."""
+        if dirs:
+            self._model_dirs.update(dirs)
         new_names = [m.name for m in models]
 
         # Remove variants for models that disappeared
@@ -597,19 +601,34 @@ class _SkinsPanel(QWidget):
         if not model_name or not variant_name:
             return
 
-        # Ask for original texture name
-        orig, ok = QInputDialog.getText(
-            self, "Original Texture",
-            "Original texture filename (as in SMD, e.g. hand.bmp):",
-        )
+        # Build list of BMP files from the model's source directory
+        model_dir = self._model_dirs.get(model_name, "")
+        bmp_files: list[str] = []
+        if model_dir:
+            bmp_files = sorted(
+                p.name for p in Path(model_dir).iterdir()
+                if p.suffix.lower() == ".bmp"
+            )
+
+        if bmp_files:
+            orig, ok = QInputDialog.getItem(
+                self, "Original Texture",
+                f"Select original texture for {model_name}:",
+                bmp_files, 0, False,
+            )
+        else:
+            orig, ok = QInputDialog.getText(
+                self, "Original Texture",
+                "Original texture filename (as in SMD, e.g. hand.bmp):",
+            )
         if not ok or not orig.strip():
             return
         orig = orig.strip()
 
-        # Browse for replacement file
+        # Browse for replacement file, starting in the model's directory
         src_path, _ = QFileDialog.getOpenFileName(
             self, "Select replacement texture",
-            "",
+            model_dir,
             "BMP Images (*.bmp *.BMP);;All files (*)",
         )
         if not src_path:
@@ -889,7 +908,7 @@ class _AnalysisPanel(QWidget):
         bone_row.addWidget(QLabel("Merged:"))
         self._bone_bar = QProgressBar()
         self._bone_bar.setRange(0, ModelMerger.BONE_LIMIT)
-        self._bone_bar.setFormat("%v / 128 bones")
+        self._bone_bar.setFormat("%v / 127 bones")
         self._bone_bar.setValue(0)
         self._bone_bar.setMinimumWidth(200)
         bone_row.addWidget(self._bone_bar, 1)
@@ -948,17 +967,17 @@ class _AnalysisPanel(QWidget):
         count = report.total_unique_bones
         self._bone_bar.setValue(min(count, ModelMerger.BONE_LIMIT))
         if report.exceeds_limit:
-            self._bone_bar.setFormat(f"{count} / 128 bones  ⚠ EXCEEDS LIMIT")
+            self._bone_bar.setFormat(f"{count} / 127 bones  ⚠ EXCEEDS LIMIT")
             color = "#e74c3c"
         elif count >= 116:
-            self._bone_bar.setFormat("%v / 128 bones")
+            self._bone_bar.setFormat("%v / 127 bones")
             color = "#e74c3c"
         elif count >= 90:
             color = "#e67e22"
-            self._bone_bar.setFormat("%v / 128 bones")
+            self._bone_bar.setFormat("%v / 127 bones")
         else:
             color = "#27ae60"
-            self._bone_bar.setFormat("%v / 128 bones")
+            self._bone_bar.setFormat("%v / 127 bones")
         self._bone_bar.setStyleSheet(
             f"QProgressBar::chunk {{ background-color: {color}; }}"
         )
@@ -1291,7 +1310,7 @@ class MainWindow(QMainWindow):
 
     def _on_models_changed(self) -> None:
         models = self._model_panel.models()
-        self._skins_panel.update_models(models)
+        self._skins_panel.update_models(models, self._model_panel.model_directories())
 
         if len(models) < 2:
             self._analysis_panel.show_placeholder()
@@ -1326,7 +1345,7 @@ class MainWindow(QMainWindow):
         self._output_panel.set_merge_enabled(not report.exceeds_limit)
 
         msg = (
-            f"Analysis complete — {report.total_unique_bones}/128 bones"
+            f"Analysis complete — {report.total_unique_bones}/127 bones"
             + (f", {len(report.conflicts)} conflict(s)" if report.conflicts else "")
             + (f", {len(report.warnings)} warning(s)" if report.warnings else "")
         )

@@ -308,7 +308,7 @@ class MergeConfig:
 class ModelMerger:
     """Accumulates models and produces a merged result."""
 
-    BONE_LIMIT: int = 128
+    BONE_LIMIT: int = 127
     # studiomdl warns / errors when a single reference mesh exceeds this many
     # raw triangles (each contributes 3 normals → ~682 triangles ≈ 2046 normals).
     NORMALS_PER_MESH_SOFT_LIMIT: int = 682
