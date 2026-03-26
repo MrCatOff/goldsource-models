@@ -187,6 +187,7 @@ if _GL_OK:
             # Textures
             self._tex_dir:     str  = ""
             self._textures:    dict[str, int] = {}   # material -> GL texture id
+            self._show_mesh:     bool = True
             self._show_textures: bool = False
             self._tex_dirty:   bool  = True
 
@@ -219,6 +220,10 @@ if _GL_OK:
                 self._tex_dir  = directory
                 self._tex_dirty = True
                 self.update()
+
+        def set_mesh_visible(self, visible: bool) -> None:
+            self._show_mesh = visible
+            self.update()
 
         def set_textures_visible(self, visible: bool) -> None:
             self._show_textures = visible
@@ -362,7 +367,8 @@ if _GL_OK:
             )
 
             self._draw_grid()
-            self._draw_mesh()
+            if self._show_mesh:
+                self._draw_mesh()
             self._draw_skeleton()
 
         # ── Camera helpers ───────────────────────────────────────────────
@@ -692,6 +698,11 @@ class ViewerPanel(QWidget):
         # Toolbar above viewport
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(4, 2, 4, 2)
+        self._chk_mesh = QCheckBox("Show Mesh")
+        self._chk_mesh.setChecked(True)
+        self._chk_mesh.toggled.connect(self._on_mesh_toggled)
+        toolbar.addWidget(self._chk_mesh)
+
         self._chk_textures = QCheckBox("Show Textures")
         self._chk_textures.setChecked(False)
         self._chk_textures.toggled.connect(self._on_textures_toggled)
@@ -756,6 +767,9 @@ class ViewerPanel(QWidget):
         tex_dir = self._dirs.get(self._cur_model_name, "")
         self._viewport.set_texture_dir(tex_dir)
         self._btn_export.setEnabled(self._cur_smd is not None)
+
+    def _on_mesh_toggled(self, checked: bool) -> None:
+        self._viewport.set_mesh_visible(checked)
 
     def _on_textures_toggled(self, checked: bool) -> None:
         self._viewport.set_textures_visible(checked)
