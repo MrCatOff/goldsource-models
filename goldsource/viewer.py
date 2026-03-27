@@ -818,6 +818,416 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# SMD Editor viewport (triangle picking + selection highlight)
+# ---------------------------------------------------------------------------
+
+if _GL_OK:
+    class _SMDEditorViewport(QOpenGLWidget):
+        """Orbit 3-D viewport for the SMD Editor — triangle picking and highlight."""
+
+        triangleSelected = pyqtSignal(int)  # emits SMD triangle index
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self._smd:          SMD | None = None
+            self._tex_dir:      str        = ""
+            # [{idx, mat, v: [(x,y,z,u,v)×3]}]
+            self._tris_data:    list       = []
+            self._textures:     dict[str, int] = {}
+            self._tex_dirty:    bool       = True
+            self._show_textures: bool      = False
+            self._selected_tri: int | None = None
+
+            self._azimuth   = 45.0
+            self._elevation = 20.0
+            self._distance  = 50.0
+            self._target    = np.zeros(3, dtype=float)
+            self._last_mouse: QPoint | None     = None
+            self._drag_btn:   Qt.MouseButton | None = None
+
+            self.setMinimumSize(300, 300)
+
+        # ── Public API ───────────────────────────────────────────────────
+
+        def set_smd(self, smd: SMD | None, tex_dir: str = "") -> None:
+            self._smd          = smd
+            self._tex_dir      = tex_dir
+            self._selected_tri = None
+            self._tris_data    = []
+            self._tex_dirty    = True
+            self._free_textures()
+            if smd:
+                self._build_tris()
+                self._auto_frame()
+            self.update()
+
+        def set_textures_visible(self, visible: bool) -> None:
+            self._show_textures = visible
+            if visible:
+                self._tex_dirty = True
+            self.update()
+
+        def set_selected(self, tri_idx: int | None) -> None:
+            self._selected_tri = tri_idx
+            self.update()
+
+        # ── Geometry ─────────────────────────────────────────────────────
+
+        def _build_tris(self) -> None:
+            if self._smd is None:
+                return
+            for i, tri in enumerate(self._smd.triangles):
+                self._tris_data.append({
+                    'idx': i,
+                    'mat': tri.material,
+                    'v': [
+                        (tri.v0.x, tri.v0.y, tri.v0.z, tri.v0.u, tri.v0.v),
+                        (tri.v1.x, tri.v1.y, tri.v1.z, tri.v1.u, tri.v1.v),
+                        (tri.v2.x, tri.v2.y, tri.v2.z, tri.v2.u, tri.v2.v),
+                    ],
+                })
+
+        def _auto_frame(self) -> None:
+            pts = [(d['v'][j][0], d['v'][j][1], d['v'][j][2])
+                   for d in self._tris_data for j in range(3)]
+            if not pts:
+                return
+            arr = np.array(pts, dtype=float)
+            self._target   = arr.mean(axis=0)
+            extent         = float(np.linalg.norm(arr.max(axis=0) - arr.min(axis=0)))
+            self._distance = max(extent * 1.2, 1.0)
+
+        def _eye(self) -> np.ndarray:
+            az = math.radians(self._azimuth)
+            el = math.radians(max(-88.0, min(88.0, self._elevation)))
+            return self._target + self._distance * np.array([
+                math.cos(el) * math.cos(az),
+                math.cos(el) * math.sin(az),
+                math.sin(el),
+            ])
+
+        # ── Texture management ───────────────────────────────────────────
+
+        def _free_textures(self) -> None:
+            for tid in self._textures.values():
+                try:
+                    glDeleteTextures(1, [tid])
+                except Exception:
+                    pass
+            self._textures.clear()
+
+        def _load_textures(self) -> None:
+            self._free_textures()
+            if not self._tex_dir or not self._tris_data:
+                return
+            try:
+                from PIL import Image
+            except ImportError:
+                return
+            tex_dir = Path(self._tex_dir)
+            if not tex_dir.is_dir():
+                return
+            dir_files: dict[str, Path] = {}
+            for f in tex_dir.iterdir():
+                dir_files[f.name.lower()] = f
+            mats = {d['mat'] for d in self._tris_data}
+            for mat in mats:
+                fname = Path(mat).name
+                if not fname.lower().endswith(".bmp"):
+                    fname = fname + ".bmp"
+                fpath = dir_files.get(fname.lower())
+                if fpath is None:
+                    continue
+                try:
+                    img  = Image.open(fpath).convert("RGBA")
+                    img  = img.transpose(Image.FLIP_TOP_BOTTOM)
+                    data = img.tobytes()
+                    w, h = img.size
+                    tid  = glGenTextures(1)
+                    glBindTexture(GL_TEXTURE_2D, tid)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, data)
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                    self._textures[mat] = tid
+                except Exception:
+                    pass
+
+        # ── OpenGL callbacks ─────────────────────────────────────────────
+
+        def initializeGL(self) -> None:
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glEnable(GL_LINE_SMOOTH)
+            glClearColor(0.14, 0.14, 0.17, 1.0)
+
+        def resizeGL(self, w: int, h: int) -> None:
+            glViewport(0, 0, w, h)
+
+        def paintGL(self) -> None:
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            w, h = self.width(), self.height()
+            if w == 0 or h == 0:
+                return
+
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
+            near = max(self._distance * 0.001, 0.01)
+            far  = self._distance * 20.0
+            gluPerspective(45.0, w / h, near, far)
+
+            glMatrixMode(GL_MODELVIEW)
+            glLoadIdentity()
+            eye = self._eye()
+            gluLookAt(
+                eye[0], eye[1], eye[2],
+                self._target[0], self._target[1], self._target[2],
+                0.0, 0.0, 1.0,
+            )
+
+            self._draw_grid()
+            self._draw_triangles()
+
+        # ── Drawing ──────────────────────────────────────────────────────
+
+        def _draw_grid(self) -> None:
+            step = max(self._distance / 12.0, 0.01)
+            n    = 10
+            glLineWidth(1.0)
+            glColor4f(0.28, 0.28, 0.32, 0.6)
+            glBegin(GL_LINES)
+            for i in range(-n, n + 1):
+                glVertex3f(i * step, -n * step, 0.0)
+                glVertex3f(i * step,  n * step, 0.0)
+                glVertex3f(-n * step, i * step, 0.0)
+                glVertex3f( n * step, i * step, 0.0)
+            glEnd()
+
+        def _draw_triangles(self) -> None:
+            if not self._tris_data:
+                return
+
+            sel = self._selected_tri
+
+            if self._show_textures:
+                if self._tex_dirty:
+                    self._load_textures()
+                    self._tex_dirty = False
+                by_mat: dict[str, list] = {}
+                for d in self._tris_data:
+                    if d['idx'] == sel:
+                        continue
+                    by_mat.setdefault(d['mat'], []).append(d)
+                glEnable(GL_TEXTURE_2D)
+                for mat, tris in by_mat.items():
+                    tid = self._textures.get(mat)
+                    if tid:
+                        glBindTexture(GL_TEXTURE_2D, tid)
+                        glColor4f(1.0, 1.0, 1.0, 1.0)
+                    else:
+                        glBindTexture(GL_TEXTURE_2D, 0)
+                        glColor4f(0.55, 0.65, 0.80, 0.80)
+                    glBegin(GL_TRIANGLES)
+                    for d in tris:
+                        for (x, y, z, u, v) in d['v']:
+                            glTexCoord2f(u, v)
+                            glVertex3f(x, y, z)
+                    glEnd()
+                glBindTexture(GL_TEXTURE_2D, 0)
+                glDisable(GL_TEXTURE_2D)
+            else:
+                # Solid fill (semi-transparent)
+                glColor4f(0.55, 0.65, 0.80, 0.25)
+                glBegin(GL_TRIANGLES)
+                for d in self._tris_data:
+                    if d['idx'] == sel:
+                        continue
+                    for (x, y, z, u, v) in d['v']:
+                        glVertex3f(x, y, z)
+                glEnd()
+
+            # Wireframe overlay
+            glColor4f(0.45, 0.55, 0.70, 0.50)
+            glLineWidth(0.6)
+            glBegin(GL_LINES)
+            for d in self._tris_data:
+                if d['idx'] == sel:
+                    continue
+                vv = d['v']
+                for (a, b) in ((0, 1), (1, 2), (2, 0)):
+                    glVertex3f(vv[a][0], vv[a][1], vv[a][2])
+                    glVertex3f(vv[b][0], vv[b][1], vv[b][2])
+            glEnd()
+
+            # Selected triangle highlight
+            if sel is not None:
+                sd = next((d for d in self._tris_data if d['idx'] == sel), None)
+                if sd:
+                    glColor4f(1.0, 0.85, 0.1, 0.85)
+                    glBegin(GL_TRIANGLES)
+                    for (x, y, z, u, v) in sd['v']:
+                        glVertex3f(x, y, z)
+                    glEnd()
+                    glColor4f(1.0, 0.85, 0.1, 1.0)
+                    glLineWidth(2.5)
+                    glBegin(GL_LINES)
+                    vv = sd['v']
+                    for (a, b) in ((0, 1), (1, 2), (2, 0)):
+                        glVertex3f(vv[a][0], vv[a][1], vv[a][2])
+                        glVertex3f(vv[b][0], vv[b][1], vv[b][2])
+                    glEnd()
+
+        # ── Mouse events ─────────────────────────────────────────────────
+
+        def mousePressEvent(self, event) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                idx = self._pick_triangle(event.pos().x(), event.pos().y())
+                if idx is not None:
+                    self._selected_tri = idx
+                    self.triangleSelected.emit(idx)
+                    self.update()
+            self._last_mouse = event.pos()
+            self._drag_btn   = event.button()
+
+        def mouseReleaseEvent(self, event) -> None:
+            self._last_mouse = None
+            self._drag_btn   = None
+
+        def mouseMoveEvent(self, event) -> None:
+            pos = event.pos()
+            if self._last_mouse is not None and self._drag_btn is not None:
+                dx = pos.x() - self._last_mouse.x()
+                dy = pos.y() - self._last_mouse.y()
+                if self._drag_btn == Qt.MouseButton.LeftButton:
+                    self._azimuth   -= dx * 0.5
+                    self._elevation  = max(-88.0, min(88.0, self._elevation + dy * 0.5))
+                    self.update()
+                elif self._drag_btn in (
+                    Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton,
+                ):
+                    az    = math.radians(self._azimuth)
+                    right = np.array([-math.sin(az), math.cos(az), 0.0])
+                    fwd   = self._eye() - self._target
+                    up    = np.cross(right, fwd)
+                    n     = np.linalg.norm(up)
+                    up    = up / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+                    scale          = self._distance * 0.0018
+                    self._target  -= right * dx * scale
+                    self._target  += up    * dy * scale
+                    self.update()
+            self._last_mouse = pos
+
+        def wheelEvent(self, event) -> None:
+            factor        = 0.88 if event.angleDelta().y() > 0 else 1.14
+            self._distance = max(0.2, self._distance * factor)
+            self.update()
+
+        # ── Triangle picking (Möller–Trumbore) ───────────────────────────
+
+        def _pick_triangle(self, mx: int, my: int) -> int | None:
+            """
+            Cast a perspective ray from screen pixel (mx, my) and return the
+            index of the nearest hit triangle.
+
+            The ray is computed analytically from our camera parameters so
+            it is always consistent with what paintGL renders, without relying
+            on querying the OpenGL matrix state after the frame.
+            """
+            if not self._tris_data:
+                return None
+
+            w, h = self.width(), self.height()
+            if w == 0 or h == 0:
+                return None
+
+            # Camera basis vectors (same as paintGL / gluLookAt)
+            eye    = self._eye()
+            target = self._target
+            fwd    = target - eye
+            fwd_n  = np.linalg.norm(fwd)
+            if fwd_n < 1e-12:
+                return None
+            fwd /= fwd_n
+
+            world_up = np.array([0.0, 0.0, 1.0])
+            right    = np.cross(fwd, world_up)
+            r_n      = np.linalg.norm(right)
+            if r_n < 1e-9:
+                # Looking straight up/down — pick an arbitrary right
+                right = np.array([1.0, 0.0, 0.0])
+            else:
+                right /= r_n
+            up = np.cross(right, fwd)   # true up (already unit length)
+
+            # Perspective: fov=45° (same as gluPerspective(45, ...))
+            tan_half = math.tan(math.radians(45.0) / 2.0)
+            aspect   = w / h
+
+            # NDC coords: pixel (0,0) is top-left; NDC (-1,-1) is bottom-left
+            ndc_x =  (2.0 * mx / w) - 1.0
+            ndc_y = -(2.0 * my / h) + 1.0   # flip Y
+
+            ray_dir = fwd + right * (ndc_x * tan_half * aspect) + up * (ndc_y * tan_half)
+            n_rd    = np.linalg.norm(ray_dir)
+            if n_rd < 1e-12:
+                return None
+            ray_dir /= n_rd
+
+            orig    = eye
+            EPSILON = 1e-9
+            best_t  = float('inf')
+            best_idx = None
+
+            for td in self._tris_data:
+                v0    = np.array(td['v'][0][:3], dtype=float)
+                v1    = np.array(td['v'][1][:3], dtype=float)
+                v2    = np.array(td['v'][2][:3], dtype=float)
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                hh    = np.cross(ray_dir, edge2)
+                a     = np.dot(edge1, hh)
+                if abs(a) < EPSILON:
+                    continue
+                f  = 1.0 / a
+                s  = orig - v0
+                u  = f * np.dot(s, hh)
+                if u < 0.0 or u > 1.0:
+                    continue
+                q  = np.cross(s, edge1)
+                vv = f * np.dot(ray_dir, q)
+                if vv < 0.0 or u + vv > 1.0:
+                    continue
+                t = f * np.dot(edge2, q)
+                if t > EPSILON and t < best_t:
+                    best_t   = t
+                    best_idx = td['idx']
+
+            return best_idx
+
+else:
+    class _SMDEditorViewport(QLabel):  # type: ignore[no-redef]
+        triangleSelected = pyqtSignal(int)
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(
+                "OpenGL not available.\nInstall PyOpenGL:  pip install PyOpenGL",
+                parent,
+            )
+            self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        def set_smd(self, smd: SMD | None, tex_dir: str = "") -> None:
+            pass
+
+        def set_textures_visible(self, visible: bool) -> None:
+            pass
+
+        def set_selected(self, tri_idx: int | None) -> None:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Viewer panel (left controls + right viewport)
 # ---------------------------------------------------------------------------
 

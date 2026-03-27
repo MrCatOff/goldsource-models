@@ -29,7 +29,7 @@ from goldsource.sanitize import sanitize_directory
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
 )
-from goldsource.viewer import ViewerPanel
+from goldsource.viewer import ViewerPanel, _SMDEditorViewport
 
 
 # ---------------------------------------------------------------------------
@@ -1490,6 +1490,143 @@ class _QCEditorPanel(QWidget):
         self.qcSaved.emit(self._cur_model)
 
 
+# ---------------------------------------------------------------------------
+# SMD Editor panel
+# ---------------------------------------------------------------------------
+
+class _SMDEditorPanel(QWidget):
+    """Tab for viewing and selecting triangles in reference SMD files."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._dirs:     dict[str, str] = {}   # model_name → directory
+        self._cur_smd:  object | None  = None  # SMD | None
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # ── Top controls ─────────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Model:"))
+        self._model_combo = QComboBox()
+        self._model_combo.setMinimumWidth(160)
+        self._model_combo.currentTextChanged.connect(self._on_model_changed)
+        ctrl.addWidget(self._model_combo)
+
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QLabel("SMD file:"))
+        self._smd_combo = QComboBox()
+        self._smd_combo.setMinimumWidth(200)
+        self._smd_combo.currentIndexChanged.connect(self._on_smd_changed)
+        ctrl.addWidget(self._smd_combo)
+
+        ctrl.addSpacing(12)
+        self._chk_tex = QCheckBox("Show Textures")
+        self._chk_tex.toggled.connect(self._on_textures_toggled)
+        ctrl.addWidget(self._chk_tex)
+
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        # ── Viewport ─────────────────────────────────────────────────────
+        self._viewport = _SMDEditorViewport()
+        self._viewport.triangleSelected.connect(self._on_triangle_selected)
+        layout.addWidget(self._viewport, 1)
+
+        # ── Info bar ─────────────────────────────────────────────────────
+        self._info_label = QLabel("Select a model and SMD file to begin.")
+        self._info_label.setStyleSheet(
+            "color: #aaa; font-style: italic; padding: 2px 6px;"
+        )
+        layout.addWidget(self._info_label)
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def set_models(self, dirs: dict[str, str]) -> None:
+        self._dirs = dirs
+        prev = self._model_combo.currentText()
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        self._model_combo.addItems(sorted(dirs.keys()))
+        # Restore selection if still valid
+        idx = self._model_combo.findText(prev)
+        self._model_combo.setCurrentIndex(max(idx, 0))
+        self._model_combo.blockSignals(False)
+        self._on_model_changed(self._model_combo.currentText())
+
+    # ── Internal slots ───────────────────────────────────────────────────
+
+    def _on_model_changed(self, name: str) -> None:
+        self._smd_combo.blockSignals(True)
+        self._smd_combo.clear()
+        directory = self._dirs.get(name, "")
+        if directory:
+            d = Path(directory)
+            for f in sorted(d.glob("*.smd")):
+                self._smd_combo.addItem(f.name, str(f))
+        self._smd_combo.blockSignals(False)
+        # Clear viewport — user selects SMD explicitly to avoid blocking the UI
+        self._cur_smd = None
+        self._viewport.set_smd(None)
+        count = self._smd_combo.count()
+        self._info_label.setText(
+            f"{count} SMD file(s) found. Select one from the dropdown above."
+            if count else "No SMD files found in this model directory."
+        )
+
+    def _on_smd_changed(self, index: int) -> None:
+        self._cur_smd = None
+        if index < 0 or self._smd_combo.count() == 0:
+            self._viewport.set_smd(None)
+            self._info_label.setText("No SMD selected.")
+            return
+        path = self._smd_combo.itemData(index)
+        if not path:
+            return
+        try:
+            from goldsource.smd import SMD as _SMD
+            smd = _SMD.from_file(path)
+            if not smd.triangles:
+                self._viewport.set_smd(None)
+                self._info_label.setText(
+                    "This SMD has no triangles (animation-only file)."
+                )
+                return
+            self._cur_smd = smd
+            tex_dir = str(Path(path).parent)
+            self._viewport.set_smd(smd, tex_dir)
+            self._info_label.setText(
+                f"Loaded {len(smd.triangles)} triangles. "
+                "Left-drag to orbit  |  Right-drag to pan  |  Scroll to zoom  |  "
+                "Click to select a triangle."
+            )
+        except Exception as exc:
+            self._viewport.set_smd(None)
+            self._info_label.setText(f"Error loading SMD: {exc}")
+
+    def _on_textures_toggled(self, checked: bool) -> None:
+        self._viewport.set_textures_visible(checked)
+
+    def _on_triangle_selected(self, idx: int) -> None:
+        from goldsource.smd import SMD as _SMD
+        if self._cur_smd is None:
+            return
+        smd = self._cur_smd  # type: ignore[assignment]
+        if idx >= len(smd.triangles):
+            return
+        tri = smd.triangles[idx]
+        v0, v1, v2 = tri.v0, tri.v1, tri.v2
+        self._info_label.setText(
+            f"Triangle #{idx}  |  Material: {tri.material}  |  "
+            f"V0 ({v0.x:.3f}, {v0.y:.3f}, {v0.z:.3f})  "
+            f"V1 ({v1.x:.3f}, {v1.y:.3f}, {v1.z:.3f})  "
+            f"V2 ({v2.x:.3f}, {v2.y:.3f}, {v2.z:.3f})"
+        )
+
+
 class _OutputPanel(QGroupBox):
     analyzeRequested = pyqtSignal()
     mergeRequested   = pyqtSignal(str, str)   # modelname, output_dir
@@ -1723,6 +1860,10 @@ class MainWindow(QMainWindow):
         self._qc_editor = _QCEditorPanel()
         self._main_tabs.addTab(self._qc_editor, "QC Editor")
 
+        # ── SMD Editor tab ───────────────────────────────────────────────
+        self._smd_editor = _SMDEditorPanel()
+        self._main_tabs.addTab(self._smd_editor, "SMD Editor")
+
         # Top: left tabs + analysis
         inner_splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -1801,6 +1942,7 @@ class MainWindow(QMainWindow):
         self._skins_panel.update_models(models, dirs)
         self._viewer_panel.update_models(models, dirs)
         self._qc_editor.set_models(dirs)
+        self._smd_editor.set_models(dirs)
 
         if len(models) < 2:
             self._analysis_panel.show_placeholder()
