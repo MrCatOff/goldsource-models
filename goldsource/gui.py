@@ -934,7 +934,7 @@ class _AnalysisPanel(QWidget):
         layout.addWidget(self._stack)
 
         # Page 0 — placeholder
-        placeholder = QLabel("Add at least two models to begin analysis.")
+        placeholder = QLabel("Add at least one model to begin analysis.")
         placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         placeholder.setStyleSheet("color: grey; font-style: italic;")
         self._stack.addWidget(placeholder)
@@ -1729,6 +1729,7 @@ class _OutputPanel(QGroupBox):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Output", parent)
+        self._merge_allowed = False
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -1738,6 +1739,7 @@ class _OutputPanel(QGroupBox):
 
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("e.g. v_merged")
+        self._name_edit.textChanged.connect(self._refresh_merge_button)
         form.addRow("Model name (.mdl):", self._name_edit)
 
         dir_row = QHBoxLayout()
@@ -1791,8 +1793,14 @@ class _OutputPanel(QGroupBox):
         self._dir_edit.setText(path)
 
     def set_merge_enabled(self, enabled: bool) -> None:
+        self._merge_allowed = enabled
+        self._refresh_merge_button()
+
+    def _refresh_merge_button(self) -> None:
         self._btn_merge.setEnabled(
-            enabled and bool(self._name_edit.text().strip()) and bool(self._dir_edit.text())
+            self._merge_allowed
+            and bool(self._name_edit.text().strip())
+            and bool(self._dir_edit.text())
         )
 
     def set_analyzing(self, active: bool) -> None:
@@ -1803,6 +1811,7 @@ class _OutputPanel(QGroupBox):
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if path:
             self._dir_edit.setText(path)
+            self._refresh_merge_button()
 
     def _on_merge_clicked(self) -> None:
         name = self._name_edit.text().strip()
@@ -2048,7 +2057,7 @@ class MainWindow(QMainWindow):
         self._qc_editor.set_models(dirs)
         self._smd_editor.set_models(dirs)
 
-        if len(models) < 2:
+        if len(models) < 1:
             self._analysis_panel.show_placeholder()
             self._last_report = None
             self._output_panel.set_merge_enabled(False)
@@ -2061,7 +2070,7 @@ class MainWindow(QMainWindow):
 
     def _run_analysis(self) -> None:
         models = self._model_panel.models()
-        if len(models) < 2:
+        if len(models) < 1:
             return
         self._output_panel.set_analyzing(True)
         self.statusBar().showMessage("Analyzing…")
