@@ -117,7 +117,6 @@ def _apply_hand_replacement(
     smd: SMD,
     bone_map: dict[str, str],   # weapon_bone_name → hand_bone_name
     hands_smd: SMD,
-    is_reference: bool,
 ) -> SMD:
     """
     Return a *new* SMD where the bones named as keys in *bone_map* have been
@@ -173,40 +172,35 @@ def _apply_hand_replacement(
         new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
 
     # ── Skeleton frames ───────────────────────────────────────────────────
-    hand_bt0: dict[int, BoneTransform] = {}
-    if hands_smd.skeleton:
-        hand_bt0 = {bt.bone_id: bt for bt in hands_smd.skeleton[0].bones}
+    # Pre-build a name→old-weapon-node lookup for hand bones
+    wp_node_by_hand_name: dict[str, "Node"] = {}
+    for hn in hands_smd.nodes:
+        wp_name = reverse_map.get(hn.name, "")
+        wp_node = next((n for n in smd.nodes if n.name == wp_name), None)
+        if wp_node:
+            wp_node_by_hand_name[hn.name] = wp_node
 
-    # Build per-frame lookup for old weapon bone IDs
     new_frames: list[SkeletonFrame] = []
     for frame in (smd.skeleton or []):
         old_bt = {bt.bone_id: bt for bt in frame.bones}
         new_bones: list[BoneTransform] = []
 
-        # Hand bones
+        # Hand bones — always use the weapon's own skeleton data (just re-ID'd).
+        # The master hands file only contributes node IDs/names/hierarchy,
+        # never transforms, so animation is preserved correctly.
         for hn in hands_smd.nodes:
-            if is_reference and hn.id in hand_bt0:
-                src = hand_bt0[hn.id]
+            wp_node = wp_node_by_hand_name.get(hn.name)
+            src_bt  = old_bt.get(wp_node.id) if wp_node else None
+            if src_bt:
                 new_bones.append(BoneTransform(
                     bone_id=hn.id,
-                    tx=src.tx, ty=src.ty, tz=src.tz,
-                    rx=src.rx, ry=src.ry, rz=src.rz,
+                    tx=src_bt.tx, ty=src_bt.ty, tz=src_bt.tz,
+                    rx=src_bt.rx, ry=src_bt.ry, rz=src_bt.rz,
                 ))
             else:
-                # Animation SMD: map from the old weapon bone that corresponds
-                wp_name = reverse_map.get(hn.name, "")
-                wp_node = next((n for n in smd.nodes if n.name == wp_name), None)
-                src_bt  = old_bt.get(wp_node.id) if wp_node else None
-                if src_bt:
-                    new_bones.append(BoneTransform(
-                        bone_id=hn.id,
-                        tx=src_bt.tx, ty=src_bt.ty, tz=src_bt.tz,
-                        rx=src_bt.rx, ry=src_bt.ry, rz=src_bt.rz,
-                    ))
-                else:
-                    new_bones.append(BoneTransform(
-                        bone_id=hn.id, tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
-                    ))
+                new_bones.append(BoneTransform(
+                    bone_id=hn.id, tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
+                ))
 
         # Weapon-specific bones
         for n in weapon_ordered:
@@ -1544,9 +1538,8 @@ class ViewerPanel(QWidget):
         errors: list[str] = []
         for key, smd in list(model.smds.items()):
             try:
-                is_ref = not getattr(smd, "is_animation", False)
                 model.smds[key] = _apply_hand_replacement(
-                    smd, self._bone_map, self._hands_smd, is_reference=is_ref
+                    smd, self._bone_map, self._hands_smd
                 )
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
