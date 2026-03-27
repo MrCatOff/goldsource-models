@@ -915,6 +915,13 @@ class ViewerPanel(QWidget):
         self._btn_export.clicked.connect(self._on_export_clicked)
         bone_btns.addWidget(self._btn_export)
 
+        self._btn_save_all = QPushButton("Save All")
+        self._btn_save_all.setEnabled(False)
+        self._btn_save_all.setToolTip("Overwrite all original SMD files for this model")
+        self._btn_save_all.setStyleSheet("font-weight: bold;")
+        self._btn_save_all.clicked.connect(self._on_save_all_clicked)
+        bone_btns.addWidget(self._btn_save_all)
+
         ll.addLayout(bone_btns)
 
         # ── Reference Hands group ─────────────────────────────────────────
@@ -1094,7 +1101,9 @@ class ViewerPanel(QWidget):
         self._viewport.set_smd(self._cur_smd)
         tex_dir = self._dirs.get(self._cur_model_name, "")
         self._viewport.set_texture_dir(tex_dir)
+        has_model_dir = bool(self._dirs.get(self._cur_model_name, ""))
         self._btn_export.setEnabled(self._cur_smd is not None)
+        self._btn_save_all.setEnabled(has_model_dir and model is not None)
         self._rebuild_hands_tree()
         # Re-apply the current animation selection on top of the new ref SMD
         self._on_anim_combo_changed()
@@ -1273,6 +1282,45 @@ class ViewerPanel(QWidget):
             QMessageBox.information(self, "Export SMD", f"Saved:\n{out_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export SMD", f"Failed to save:\n{exc}")
+
+    def _on_save_all_clicked(self) -> None:
+        model = next((m for m in self._models if m.name == self._cur_model_name), None)
+        if model is None:
+            return
+        model_dir = self._dirs.get(self._cur_model_name, "")
+        if not model_dir:
+            QMessageBox.warning(self, "Save All", "Model directory is unknown.")
+            return
+
+        n = len(model.smds)
+        ans = QMessageBox.question(
+            self, "Save All SMDs",
+            f"Overwrite all {n} original SMD file(s) in:\n{model_dir}\n\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        errors: list[str] = []
+        saved = 0
+        for key, smd in model.smds.items():
+            try:
+                smd.save(Path(model_dir) / (key + ".smd"))
+                saved += 1
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+
+        if errors:
+            QMessageBox.warning(
+                self, "Save All",
+                f"Saved {saved}/{n} file(s). Errors:\n" + "\n".join(errors),
+            )
+        else:
+            QMessageBox.information(
+                self, "Save All",
+                f"Saved {saved} SMD file(s) to:\n{model_dir}",
+            )
 
     def _on_bone_hovered(self, name: str, x: float, y: float, z: float) -> None:
         self._info_label.setText(
