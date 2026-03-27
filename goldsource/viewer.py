@@ -1869,28 +1869,6 @@ class ViewerPanel(QWidget):
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
 
-        # Update $attachment and $hbox bone names in the QC file if hands were applied.
-        qc_updated = False
-        if self._bone_map:
-            qc_files = list(Path(model_dir).glob("*.qc"))
-            for qc_path in qc_files:
-                try:
-                    qc = QC.from_file(str(qc_path))
-                    changed = False
-                    for att in qc.attachments:
-                        if att.bone in self._bone_map:
-                            att.bone = self._bone_map[att.bone]
-                            changed = True
-                    for hb in qc.hboxes:
-                        if hb.bone in self._bone_map:
-                            hb.bone = self._bone_map[hb.bone]
-                            changed = True
-                    if changed:
-                        qc.save(str(qc_path))
-                        qc_updated = True
-                except Exception as exc:
-                    errors.append(f"{qc_path.name}: {exc}")
-
         if errors:
             mb = QMessageBox(self)
             mb.setWindowTitle("Save All")
@@ -1899,10 +1877,10 @@ class ViewerPanel(QWidget):
             mb.setDetailedText("\n".join(errors))
             mb.exec()
         else:
-            msg = f"Saved {saved} SMD file(s) to:\n{model_dir}"
-            if qc_updated:
-                msg += "\n\nQC file updated ($attachment and $hbox bone names)."
-            QMessageBox.information(self, "Save All", msg)
+            QMessageBox.information(
+                self, "Save All",
+                f"Saved {saved} SMD file(s) to:\n{model_dir}",
+            )
             self.operationRecorded.emit(
                 f"Saved all {saved} SMD(s) to disk for '{self._cur_model_name}'",
                 "save_all",
@@ -2341,6 +2319,21 @@ class ViewerPanel(QWidget):
             name="hands",
             entries=[BodyGroupEntry(smd=hands_stem)],
         ))
+
+        # Update $attachment and $hbox bone names: weapon bone → hand bone
+        att_renamed: list[str] = []
+        hb_renamed:  list[str] = []
+        for att in qc.attachments:
+            if att.bone in self._bone_map:
+                new_name  = self._bone_map[att.bone]
+                att_renamed.append(f"{att.bone} → {new_name}")
+                att.bone  = new_name
+        for hb in qc.hboxes:
+            if hb.bone in self._bone_map:
+                new_name = self._bone_map[hb.bone]
+                hb_renamed.append(f"{hb.bone} → {new_name}")
+                hb.bone  = new_name
+
         qc.save(str(qc_path))
 
         lines = [
@@ -2351,5 +2344,7 @@ class ViewerPanel(QWidget):
             f"  Deleted SMDs:  {deleted_smds or 'none'}",
             f"  Deleted textures: {deleted_texs or 'none'}",
             f"  Added bodygroup 'hands' → {hands_stem}.smd",
+            f"  $attachment bones renamed: {att_renamed or 'none'}",
+            f"  $hbox bones renamed: {hb_renamed or 'none'}",
         ]
         return "\n".join(lines)
