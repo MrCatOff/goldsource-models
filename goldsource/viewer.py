@@ -1519,6 +1519,7 @@ class ViewerPanel(QWidget):
 
         self._btn_apply_hands.setEnabled(bool(self._bone_map))
         self._btn_clear_hands.setEnabled(bool(self._bone_map))
+        self._refresh_all_combos()
 
     def _auto_assign_parents(self, hand_node: "Node", weapon_name: str) -> None:
         """
@@ -1579,13 +1580,34 @@ class ViewerPanel(QWidget):
                 if idx >= 0:
                     combo.setCurrentIndex(idx)   # triggers signal → recurse
 
+    def _refresh_all_combos(self) -> None:
+        """Rebuild every combo's item list so already-used weapon bones
+        only appear in the combo that has them selected."""
+        if self._cur_smd is None:
+            return
+        all_weapon = sorted(n.name for n in self._cur_smd.nodes)
+        used = set(self._bone_map.keys())  # weapon names currently assigned
+
+        for combo in self._hand_combo_map.values():
+            current = combo.currentText()
+            available = ["(none)"] + [
+                w for w in all_weapon if w not in used or w == current
+            ]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(available)
+            idx = combo.findText(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
     def _on_clear_hands_map(self) -> None:
         """Reset all combo boxes to '(none)'."""
+        self._bone_map.clear()
+        self._refresh_all_combos()
         for combo in self._hand_combo_map.values():
             combo.blockSignals(True)
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
-        self._bone_map.clear()
         self._hands_status.setText("")
         self._btn_apply_hands.setEnabled(False)
         self._btn_clear_hands.setEnabled(False)
