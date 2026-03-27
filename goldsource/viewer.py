@@ -22,7 +22,8 @@ from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QCheckBox, QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
-    QHeaderView, QInputDialog,
+    QHeaderView, QInputDialog, QFileDialog, QGroupBox, QTableWidget,
+    QTableWidgetItem, QAbstractItemView,
 )
 
 try:
@@ -52,7 +53,7 @@ except Exception:
 
 from PyQt6.QtWidgets import QMessageBox
 
-from goldsource.smd import SMD
+from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +107,136 @@ def _delete_bone(smd: SMD, bone_name: str) -> bool:
     # Remove node
     smd.nodes = [n for n in smd.nodes if n.id != bid]
     return True
+
+
+# ---------------------------------------------------------------------------
+# Hand-replacement algorithm
+# ---------------------------------------------------------------------------
+
+def _apply_hand_replacement(
+    smd: SMD,
+    bone_map: dict[str, str],   # weapon_bone_name → hand_bone_name
+    hands_smd: SMD,
+    is_reference: bool,
+) -> SMD:
+    """
+    Return a *new* SMD where the bones named as keys in *bone_map* have been
+    replaced by the corresponding bones from *hands_smd*, while weapon-specific
+    bones (not in *bone_map*) are renumbered to IDs above the max hand ID.
+
+    For reference SMDs the master-hand transforms are used for hand bones.
+    For animation SMDs the original per-frame transforms are remapped.
+    """
+    import copy
+
+    hand_by_name = {n.name: n for n in hands_smd.nodes}
+    reverse_map  = {v: k for k, v in bone_map.items()}   # hand_name → weapon_name
+    max_hand_id  = max((n.id for n in hands_smd.nodes), default=-1)
+
+    # ── Build old-weapon-ID → new-ID mapping ─────────────────────────────
+    old_to_new: dict[int, int] = {}
+    for wp_name, hp_name in bone_map.items():
+        wp_node = next((n for n in smd.nodes if n.name == wp_name), None)
+        hp_node = hand_by_name.get(hp_name)
+        if wp_node and hp_node:
+            old_to_new[wp_node.id] = hp_node.id
+
+    # Topological sort of weapon-specific bones (parents before children)
+    weapon_specific = [n for n in smd.nodes if n.name not in bone_map]
+    wp_by_old = {n.id: n for n in weapon_specific}
+    weapon_ordered: list[Node] = []
+    visited: set[int] = set()
+
+    def _visit(n: Node) -> None:
+        if n.id in visited:
+            return
+        visited.add(n.id)
+        if n.parent_id in wp_by_old:
+            _visit(wp_by_old[n.parent_id])
+        weapon_ordered.append(n)
+
+    for n in weapon_specific:
+        _visit(n)
+
+    next_id = max_hand_id + 1
+    for n in weapon_ordered:
+        old_to_new[n.id] = next_id
+        next_id += 1
+
+    # ── New node list ─────────────────────────────────────────────────────
+    new_nodes: list[Node] = [
+        Node(id=hn.id, name=hn.name, parent_id=hn.parent_id)
+        for hn in hands_smd.nodes
+    ]
+    for n in weapon_ordered:
+        new_parent = old_to_new.get(n.parent_id, -1) if n.parent_id != -1 else -1
+        new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
+
+    # ── Skeleton frames ───────────────────────────────────────────────────
+    hand_bt0: dict[int, BoneTransform] = {}
+    if hands_smd.skeleton:
+        hand_bt0 = {bt.bone_id: bt for bt in hands_smd.skeleton[0].bones}
+
+    # Build per-frame lookup for old weapon bone IDs
+    new_frames: list[SkeletonFrame] = []
+    for frame in (smd.skeleton or []):
+        old_bt = {bt.bone_id: bt for bt in frame.bones}
+        new_bones: list[BoneTransform] = []
+
+        # Hand bones
+        for hn in hands_smd.nodes:
+            if is_reference and hn.id in hand_bt0:
+                src = hand_bt0[hn.id]
+                new_bones.append(BoneTransform(
+                    bone_id=hn.id,
+                    tx=src.tx, ty=src.ty, tz=src.tz,
+                    rx=src.rx, ry=src.ry, rz=src.rz,
+                ))
+            else:
+                # Animation SMD: map from the old weapon bone that corresponds
+                wp_name = reverse_map.get(hn.name, "")
+                wp_node = next((n for n in smd.nodes if n.name == wp_name), None)
+                src_bt  = old_bt.get(wp_node.id) if wp_node else None
+                if src_bt:
+                    new_bones.append(BoneTransform(
+                        bone_id=hn.id,
+                        tx=src_bt.tx, ty=src_bt.ty, tz=src_bt.tz,
+                        rx=src_bt.rx, ry=src_bt.ry, rz=src_bt.rz,
+                    ))
+                else:
+                    new_bones.append(BoneTransform(
+                        bone_id=hn.id, tx=0, ty=0, tz=0, rx=0, ry=0, rz=0,
+                    ))
+
+        # Weapon-specific bones
+        for n in weapon_ordered:
+            src_bt = old_bt.get(n.id)
+            if src_bt:
+                new_bones.append(BoneTransform(
+                    bone_id=old_to_new[n.id],
+                    tx=src_bt.tx, ty=src_bt.ty, tz=src_bt.tz,
+                    rx=src_bt.rx, ry=src_bt.ry, rz=src_bt.rz,
+                ))
+
+        new_frames.append(SkeletonFrame(time=frame.time, bones=new_bones))
+
+    # ── Triangles (remap vertex bone_ids) ────────────────────────────────
+    new_triangles = []
+    for tri in smd.triangles:
+        new_v = []
+        for v in tri.vertices:
+            nv = copy.copy(v)
+            nv.bone_id = old_to_new.get(v.bone_id, v.bone_id)
+            new_v.append(nv)
+        nt = copy.copy(tri)
+        nt.v0, nt.v1, nt.v2 = new_v[0], new_v[1], new_v[2]
+        new_triangles.append(nt)
+
+    result = copy.copy(smd)
+    result.nodes     = new_nodes
+    result.skeleton  = new_frames
+    result.triangles = new_triangles
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +745,11 @@ class ViewerPanel(QWidget):
         # Each entry is {"type": "rename", "old": str, "new": str}
         #             or {"type": "delete", "name": str}
         self._pending_ops: list[dict] = []
+        # Reference-hands state
+        self._hands_smd:      SMD | None           = None
+        self._hands_path:     str                  = ""
+        self._bone_map:       dict[str, str]       = {}  # weapon_name → hand_name
+        self._hand_combo_map: dict[int, QComboBox] = {}  # hand_bone_id → QComboBox
         self._setup_ui()
 
     # ── Setup ────────────────────────────────────────────────────────────
@@ -650,49 +786,89 @@ class ViewerPanel(QWidget):
         self._tree.itemDoubleClicked.connect(lambda item, _: self._rename(item))
         ll.addWidget(self._tree, 1)
 
-        bone_btns = QVBoxLayout()
-        bone_btns.setSpacing(3)
+        bone_btns = QHBoxLayout()
+        bone_btns.setSpacing(4)
 
-        row1 = QHBoxLayout()
         self._btn_rename = QPushButton("Rename")
         self._btn_rename.setEnabled(False)
         self._btn_rename.clicked.connect(self._on_rename_clicked)
-        row1.addWidget(self._btn_rename)
-        row1.addStretch()
-        bone_btns.addLayout(row1)
+        bone_btns.addWidget(self._btn_rename)
 
-        row2 = QHBoxLayout()
-        self._btn_delete = QPushButton("Delete Bone")
+        self._btn_delete = QPushButton("Delete")
         self._btn_delete.setEnabled(False)
         self._btn_delete.setStyleSheet("color: #e05555;")
+        self._btn_delete.setToolTip("Delete selected bone")
         self._btn_delete.clicked.connect(self._on_delete_clicked)
-        row2.addWidget(self._btn_delete)
-        row2.addStretch()
-        bone_btns.addLayout(row2)
+        bone_btns.addWidget(self._btn_delete)
 
-        row3 = QHBoxLayout()
         self._btn_apply_all = QPushButton("Apply to All")
         self._btn_apply_all.setEnabled(False)
         self._btn_apply_all.setToolTip(
             "Replay all pending renames / deletions on every SMD in this model"
         )
         self._btn_apply_all.clicked.connect(self._on_apply_all_clicked)
-        row3.addWidget(self._btn_apply_all)
-        row3.addStretch()
-        bone_btns.addLayout(row3)
+        bone_btns.addWidget(self._btn_apply_all)
 
-        row4 = QHBoxLayout()
-        self._btn_export = QPushButton("Export SMD")
+        self._btn_export = QPushButton("Export")
         self._btn_export.setEnabled(False)
+        self._btn_export.setToolTip("Export current SMD to disk")
         self._btn_export.clicked.connect(self._on_export_clicked)
-        row4.addWidget(self._btn_export)
-        row4.addStretch()
-        bone_btns.addLayout(row4)
+        bone_btns.addWidget(self._btn_export)
 
         ll.addLayout(bone_btns)
 
-        left.setMinimumWidth(220)
-        left.setMaximumWidth(380)
+        # ── Reference Hands group ─────────────────────────────────────────
+        hands_box = QGroupBox("Reference Hands")
+        hands_box.setCheckable(False)
+        hl = QVBoxLayout(hands_box)
+        hl.setContentsMargins(6, 6, 6, 6)
+        hl.setSpacing(4)
+
+        # Load button + path label
+        self._btn_load_hands = QPushButton("Load Hands SMD…")
+        self._btn_load_hands.clicked.connect(self._on_load_hands_smd)
+        hl.addWidget(self._btn_load_hands)
+        self._hands_path_label = QLabel("(none)")
+        self._hands_path_label.setStyleSheet("color: #888; font-size: 10px;")
+        self._hands_path_label.setWordWrap(True)
+        hl.addWidget(self._hands_path_label)
+
+        # Hand-bone tree with per-row weapon-bone dropdowns
+        self._hands_tree = QTreeWidget()
+        self._hands_tree.setColumnCount(2)
+        self._hands_tree.setHeaderLabels(["Hand Bone", "Weapon Bone"])
+        self._hands_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self._hands_tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._hands_tree.setMinimumHeight(140)
+        hl.addWidget(self._hands_tree, 1)
+
+        # Bottom row: status + buttons
+        self._hands_status = QLabel("")
+        self._hands_status.setStyleSheet("color: #888; font-size: 10px;")
+        self._hands_status.setWordWrap(True)
+        hl.addWidget(self._hands_status)
+
+        bottom_row = QHBoxLayout()
+        self._btn_clear_hands = QPushButton("Clear")
+        self._btn_clear_hands.setEnabled(False)
+        self._btn_clear_hands.clicked.connect(self._on_clear_hands_map)
+        bottom_row.addWidget(self._btn_clear_hands)
+
+        self._btn_apply_hands = QPushButton("Apply Hands to All SMDs")
+        self._btn_apply_hands.setEnabled(False)
+        self._btn_apply_hands.setStyleSheet(
+            "background-color: #2a6099; color: white; font-weight: bold;"
+        )
+        self._btn_apply_hands.clicked.connect(self._on_apply_hands)
+        bottom_row.addWidget(self._btn_apply_hands)
+        hl.addLayout(bottom_row)
+
+        ll.addWidget(hands_box)
+
+        left.setMinimumWidth(240)
+        left.setMaximumWidth(400)
         splitter.addWidget(left)
 
         # ── Right panel ──────────────────────────────────────────────────
@@ -775,6 +951,7 @@ class ViewerPanel(QWidget):
         tex_dir = self._dirs.get(self._cur_model_name, "")
         self._viewport.set_texture_dir(tex_dir)
         self._btn_export.setEnabled(self._cur_smd is not None)
+        self._rebuild_hands_tree()
 
     def _on_mesh_toggled(self, checked: bool) -> None:
         self._viewport.set_mesh_visible(checked)
@@ -968,3 +1145,213 @@ class ViewerPanel(QWidget):
         self._update_apply_button()
         self._rebuild_tree()
         self.bonesRenamed.emit()
+
+    # ── Reference Hands ───────────────────────────────────────────────────
+
+    def _on_load_hands_smd(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Reference Hands SMD", "", "SMD Files (*.smd);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            self._hands_smd  = SMD.from_file(path)
+            self._hands_path = path
+            self._hands_path_label.setText(Path(path).name)
+            self._rebuild_hands_tree()
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Hands SMD", str(exc))
+
+    def _rebuild_hands_tree(self) -> None:
+        """
+        Rebuild the hand-bone tree widget.  Each row shows a hand bone in
+        column 0 and a QComboBox of weapon-bone names (+ '(none)') in column 1.
+        Selecting a weapon bone auto-assigns children by name recursively.
+        """
+        self._hands_tree.clear()
+        self._hand_combo_map.clear()
+        self._bone_map.clear()
+        self._hands_status.setText("")
+        self._btn_apply_hands.setEnabled(False)
+        self._btn_clear_hands.setEnabled(False)
+
+        if self._hands_smd is None:
+            return
+
+        weapon_names = ["(none)"]
+        if self._cur_smd:
+            weapon_names += sorted(n.name for n in self._cur_smd.nodes)
+
+        # Build tree items (need parents before children → sort by id)
+        hand_items: dict[int, QTreeWidgetItem] = {}
+        for node in sorted(self._hands_smd.nodes, key=lambda n: n.id):
+            item = QTreeWidgetItem([node.name, ""])
+            combo = QComboBox()
+            combo.addItems(weapon_names)
+            combo.currentTextChanged.connect(
+                lambda text, n=node: self._on_hand_combo_changed(n, text)
+            )
+            self._hand_combo_map[node.id] = combo
+            hand_items[node.id] = item
+
+            if node.parent_id != -1 and node.parent_id in hand_items:
+                hand_items[node.parent_id].addChild(item)
+            else:
+                self._hands_tree.addTopLevelItem(item)
+
+            self._hands_tree.setItemWidget(item, 1, combo)
+
+        self._hands_tree.expandAll()
+
+    def _on_hand_combo_changed(self, hand_node: "Node", weapon_name: str) -> None:
+        """
+        Called when the user picks a weapon bone for *hand_node*.
+        Updates bone_map and auto-assigns children by matching names.
+        """
+        # Remove any old mapping for this hand bone
+        self._bone_map = {
+            wp: hp for wp, hp in self._bone_map.items()
+            if hp != hand_node.name
+        }
+
+        if weapon_name and weapon_name != "(none)":
+            self._bone_map[weapon_name] = hand_node.name
+            if self._cur_smd and self._hands_smd:
+                # Walk up both parent chains (handles non-matching names)
+                self._auto_assign_parents(hand_node, weapon_name)
+                # Walk down children by name (same-name rigs)
+                self._auto_assign_children(hand_node, weapon_name)
+
+        n = len(self._bone_map)
+        total_weapon = len(self._cur_smd.nodes) if self._cur_smd else 0
+        weapon_specific = total_weapon - n
+        if n:
+            self._hands_status.setText(
+                f"{n} mapped · {weapon_specific} weapon-specific"
+            )
+        else:
+            self._hands_status.setText("")
+
+        self._btn_apply_hands.setEnabled(bool(self._bone_map))
+        self._btn_clear_hands.setEnabled(bool(self._bone_map))
+
+    def _auto_assign_parents(self, hand_node: "Node", weapon_name: str) -> None:
+        """
+        Walk one level up both the hand-bone tree and the weapon-bone tree and
+        auto-select the weapon parent in the hand-parent's combo box (if it is
+        still '(none)').  Setting that combo triggers its own signal, which
+        calls this method again for the next level — propagating all the way to
+        the root without an explicit loop.
+        """
+        if self._cur_smd is None or self._hands_smd is None:
+            return
+
+        hand_by_id   = {n.id: n for n in self._hands_smd.nodes}
+        weapon_by_id = {n.id: n for n in self._cur_smd.nodes}
+        weapon_by_name = {n.name: n for n in self._cur_smd.nodes}
+
+        hand_parent   = hand_by_id.get(hand_node.parent_id)
+        weapon_node   = weapon_by_name.get(weapon_name)
+        if hand_parent is None or weapon_node is None:
+            return
+
+        weapon_parent = weapon_by_id.get(weapon_node.parent_id)
+        if weapon_parent is None:
+            return
+
+        combo = self._hand_combo_map.get(hand_parent.id)
+        if combo is not None and combo.currentText() == "(none)":
+            idx = combo.findText(weapon_parent.name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)   # triggers signal → next level
+
+    def _auto_assign_children(self, hand_node: "Node", weapon_name: str) -> None:
+        """
+        For the hand bone → weapon bone pair, walk their children in parallel
+        and auto-select matching weapon children (by name) in the tree combos.
+        Only fills combos that are still '(none)' to avoid overwriting user choices.
+        """
+        if self._cur_smd is None or self._hands_smd is None:
+            return
+
+        weapon_node = next(
+            (n for n in self._cur_smd.nodes if n.name == weapon_name), None
+        )
+        if weapon_node is None:
+            return
+
+        hand_children   = [n for n in self._hands_smd.nodes if n.parent_id == hand_node.id]
+        weapon_children = {
+            n.name: n for n in self._cur_smd.nodes if n.parent_id == weapon_node.id
+        }
+
+        for hc in hand_children:
+            combo = self._hand_combo_map.get(hc.id)
+            if combo is None or combo.currentText() != "(none)":
+                continue
+            if hc.name in weapon_children:
+                idx = combo.findText(weapon_children[hc.name].name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)   # triggers signal → recurse
+
+    def _on_clear_hands_map(self) -> None:
+        """Reset all combo boxes to '(none)'."""
+        for combo in self._hand_combo_map.values():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._bone_map.clear()
+        self._hands_status.setText("")
+        self._btn_apply_hands.setEnabled(False)
+        self._btn_clear_hands.setEnabled(False)
+
+    def _on_apply_hands(self) -> None:
+        if not self._bone_map or self._hands_smd is None:
+            return
+        model = next(
+            (m for m in self._models if m.name == self._cur_model_name), None
+        )
+        if model is None:
+            return
+
+        n_smds  = len(model.smds)
+        matched = len(self._bone_map)
+        ans = QMessageBox.question(
+            self,
+            "Apply Reference Hands",
+            f"Replace {matched} hand bone(s) across all {n_smds} SMD(s) in "
+            f"'{self._cur_model_name}'?\n\n"
+            "Weapon-specific bones will be renumbered to IDs above the last "
+            "hand bone ID.\n\n"
+            "This modifies the in-memory SMDs. Use 'Export SMD' to save them.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        errors: list[str] = []
+        for key, smd in list(model.smds.items()):
+            try:
+                is_ref = not getattr(smd, "is_animation", False)
+                model.smds[key] = _apply_hand_replacement(
+                    smd, self._bone_map, self._hands_smd, is_reference=is_ref
+                )
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+
+        self._on_smd_changed()
+        self._pending_ops.clear()
+        self._update_apply_button()
+        self.bonesRenamed.emit()
+
+        if errors:
+            QMessageBox.warning(
+                self, "Apply Hands — Errors",
+                "Some SMDs could not be updated:\n" + "\n".join(errors),
+            )
+        else:
+            QMessageBox.information(
+                self, "Apply Hands",
+                f"Done. {n_smds} SMD(s) updated in memory.\n"
+                "Use 'Export SMD' to write changes to disk.",
+            )

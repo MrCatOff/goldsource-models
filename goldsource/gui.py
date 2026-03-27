@@ -844,6 +844,247 @@ class _SeqRenamesPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Hands replacement panel
+# ---------------------------------------------------------------------------
+
+class _HandsPanel(QWidget):
+    """
+    Configure a master hands SMD whose bone IDs / transforms are injected into
+    every model during merge.  Also allows adjusting individual bone transforms
+    (finger-tip positioning) before the merge is triggered.
+    """
+
+    handsChanged = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._hand_smd: "SMD | None" = None
+        self._hand_path: str = ""
+        self._setup_ui()
+
+    # ── Build UI ────────────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        from PyQt6.QtWidgets import QCheckBox, QDoubleSpinBox, QFormLayout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # ── File selection ──────────────────────────────────────────────
+        grp_file = QGroupBox("Master Hands SMD File")
+        fl = QVBoxLayout(grp_file)
+
+        row_path = QHBoxLayout()
+        self._path_edit = QLineEdit()
+        self._path_edit.setReadOnly(True)
+        self._path_edit.setPlaceholderText("No file selected…")
+        btn_browse = QPushButton("Browse…")
+        btn_browse.setIcon(self.style().standardIcon(
+            __import__("PyQt6.QtWidgets", fromlist=["QStyle"]).QStyle.StandardPixmap.SP_FileIcon
+        ))
+        btn_browse.clicked.connect(self._on_browse)
+        row_path.addWidget(self._path_edit, 1)
+        row_path.addWidget(btn_browse)
+        fl.addLayout(row_path)
+
+        self._chk_enable = QCheckBox("Replace hands in all models during merge")
+        self._chk_enable.setEnabled(False)
+        self._chk_enable.toggled.connect(lambda _: self.handsChanged.emit())
+        fl.addWidget(self._chk_enable)
+
+        self._info_label = QLabel("No hands file loaded.")
+        self._info_label.setStyleSheet("color: #888; font-style: italic;")
+        fl.addWidget(self._info_label)
+        layout.addWidget(grp_file)
+
+        # ── Bone hierarchy + transform editor ───────────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: bone tree
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(QLabel("Bone hierarchy:"))
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Bone", "ID"])
+        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._tree.setAlternatingRowColors(True)
+        self._tree.itemSelectionChanged.connect(self._on_tree_selection)
+        ll.addWidget(self._tree, 1)
+
+        btn_save = QPushButton("Save Hand SMD")
+        btn_save.setToolTip("Write the current (possibly edited) transforms back to the SMD file")
+        btn_save.clicked.connect(self._on_save)
+        ll.addWidget(btn_save)
+        splitter.addWidget(left)
+
+        # Right: per-bone transform spinboxes
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 0, 0)
+        rl.addWidget(QLabel("Selected bone transform (local):"))
+
+        self._selected_bone_label = QLabel("—")
+        self._selected_bone_label.setStyleSheet("font-weight: bold;")
+        rl.addWidget(self._selected_bone_label)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._spins: dict[str, QDoubleSpinBox] = {}
+        for axis in ("tx", "ty", "tz", "rx", "ry", "rz"):
+            sb = QDoubleSpinBox()
+            sb.setRange(-9999.0, 9999.0)
+            sb.setDecimals(6)
+            sb.setSingleStep(0.01)
+            sb.setEnabled(False)
+            sb.valueChanged.connect(lambda v, a=axis: self._on_spin_changed(a, v))
+            self._spins[axis] = sb
+            form.addRow(axis.upper() + ":", sb)
+        rl.addLayout(form)
+        rl.addStretch()
+
+        info_xform = QLabel(
+            "TX/TY/TZ = local translation (units).\n"
+            "RX/RY/RZ = Euler rotation (radians).\n"
+            "Changes update the in-memory SMD; click\n"
+            "'Save Hand SMD' to write back to disk."
+        )
+        info_xform.setStyleSheet("color: #888; font-size: 11px;")
+        info_xform.setWordWrap(True)
+        rl.addWidget(info_xform)
+
+        splitter.addWidget(right)
+        splitter.setSizes([300, 200])
+        layout.addWidget(splitter, 1)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def get_hand_smd(self) -> "SMD | None":
+        """Return the loaded hand SMD if replacement is enabled, else None."""
+        if self._chk_enable.isEnabled() and self._chk_enable.isChecked():
+            return self._hand_smd
+        return None
+
+    def save_config(self) -> dict:
+        return {
+            "path": self._hand_path,
+            "enabled": self._chk_enable.isChecked(),
+        }
+
+    def load_config(self, data: dict) -> None:
+        path = data.get("path", "")
+        if path and Path(path).exists():
+            self._load_file(path)
+            self._chk_enable.setChecked(data.get("enabled", True))
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _load_file(self, path: str) -> None:
+        from goldsource.smd import SMD
+        try:
+            smd = SMD.from_file(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Error", str(exc))
+            return
+        self._hand_smd  = smd
+        self._hand_path = path
+        self._path_edit.setText(path)
+        self._chk_enable.setEnabled(True)
+        self._chk_enable.setChecked(True)
+        n_bones = len(smd.nodes)
+        n_frames = len(smd.skeleton)
+        self._info_label.setText(f"{n_bones} bones, {n_frames} skeleton frame(s)")
+        self._populate_tree(smd)
+        self.handsChanged.emit()
+
+    def _on_browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Master Hands SMD", "", "SMD Files (*.smd)"
+        )
+        if path:
+            self._load_file(path)
+
+    def _on_save(self) -> None:
+        if not self._hand_smd or not self._hand_path:
+            QMessageBox.warning(self, "Save", "No hands file loaded.")
+            return
+        try:
+            self._hand_smd.save(self._hand_path)
+            QMessageBox.information(self, "Save", f"Saved:\n{self._hand_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+
+    def _populate_tree(self, smd: "SMD") -> None:
+        self._tree.clear()
+        id_to_node = {n.id: n for n in smd.nodes}
+        children: dict[int, list[int]] = {n.id: [] for n in smd.nodes}
+        for n in smd.nodes:
+            if n.parent_id != -1:
+                children[n.parent_id].append(n.id)
+
+        def _add(node, parent_item=None) -> None:
+            item = QTreeWidgetItem([node.name, str(node.id)])
+            item.setData(0, Qt.ItemDataRole.UserRole, node.id)
+            if parent_item:
+                parent_item.addChild(item)
+            else:
+                self._tree.addTopLevelItem(item)
+            for cid in sorted(children[node.id], key=lambda i: id_to_node[i].name):
+                _add(id_to_node[cid], item)
+
+        for root in sorted(
+            (n for n in smd.nodes if n.parent_id == -1), key=lambda n: n.name
+        ):
+            _add(root)
+
+        self._tree.expandAll()
+
+    def _on_tree_selection(self) -> None:
+        items = self._tree.selectedItems()
+        if not items or not self._hand_smd:
+            self._selected_bone_label.setText("—")
+            for sb in self._spins.values():
+                sb.setEnabled(False)
+            return
+
+        bone_id = items[0].data(0, Qt.ItemDataRole.UserRole)
+        node = next((n for n in self._hand_smd.nodes if n.id == bone_id), None)
+        if node is None:
+            return
+        self._selected_bone_label.setText(f"{node.name}  (ID {node.id})")
+
+        # Find transform in skeleton frame 0
+        bt = None
+        if self._hand_smd.skeleton:
+            bt = next(
+                (b for b in self._hand_smd.skeleton[0].bones if b.bone_id == bone_id),
+                None,
+            )
+
+        self._block_spin = True
+        for axis, sb in self._spins.items():
+            sb.setEnabled(True)
+            sb.setValue(getattr(bt, axis) if bt else 0.0)
+        self._block_spin = False
+
+    def _on_spin_changed(self, axis: str, value: float) -> None:
+        if getattr(self, "_block_spin", False):
+            return
+        if not self._hand_smd or not self._hand_smd.skeleton:
+            return
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        bone_id = items[0].data(0, Qt.ItemDataRole.UserRole)
+        bt = next(
+            (b for b in self._hand_smd.skeleton[0].bones if b.bone_id == bone_id),
+            None,
+        )
+        if bt is not None:
+            setattr(bt, axis, value)
+
+
+# ---------------------------------------------------------------------------
 # Analysis panel (right)
 # ---------------------------------------------------------------------------
 
@@ -1261,10 +1502,12 @@ class MainWindow(QMainWindow):
         self._model_panel = _ModelListPanel()
         self._skins_panel = _SkinsPanel()
         self._seq_panel   = _SeqRenamesPanel()
+        self._hands_panel = _HandsPanel()
 
         self._left_tabs.addTab(self._model_panel, "Models")
         self._left_tabs.addTab(self._skins_panel, "Skins")
         self._left_tabs.addTab(self._seq_panel,   "Sequences")
+        self._left_tabs.addTab(self._hands_panel, "Hands")
 
         self._analysis_panel = _AnalysisPanel()
         inner_splitter.addWidget(self._left_tabs)
@@ -1283,6 +1526,7 @@ class MainWindow(QMainWindow):
         self._output_panel.analyzeRequested.connect(self._run_analysis)
         self._output_panel.mergeRequested.connect(self._on_merge_requested)
         self._viewer_panel.bonesRenamed.connect(self._on_bones_renamed)
+        self._hands_panel.handsChanged.connect(self._analysis_debounce.start)
 
         self.statusBar().showMessage("Ready. Add decompiled model directories to begin.")
 
@@ -1419,6 +1663,7 @@ class MainWindow(QMainWindow):
             sequence_renames=seq_renames,
             skin_variants=skin_variants,
             skin_slots=skin_slots,
+            hand_smd=self._hands_panel.get_hand_smd(),
         )
 
     def _on_merge_requested(self, modelname: str, output_dir: str) -> None:
@@ -1488,12 +1733,15 @@ class MainWindow(QMainWindow):
         slots = self._skins_panel.get_skin_slots()
         seq_renames = [[f, r] for f, r in self._seq_panel.get_renames()]
 
+        hands_cfg = self._hands_panel.save_config()
         return AppConfig(
             models=models_out,
             skin_slots=[SkinSlotSpec(name=s.name, assignments=s.assignments) for s in slots],
             sequence_renames=seq_renames,
             output_model_name=self._output_panel.model_name(),
             output_directory=self._output_panel.output_dir(),
+            hands_path=hands_cfg.get("path", ""),
+            hands_enabled=hands_cfg.get("enabled", False),
         )
 
     def _apply_app_config(self, cfg: AppConfig) -> None:
@@ -1522,6 +1770,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Config loaded — {len(cfg.models)} model(s) ready."
             )
+
+        self._hands_panel.load_config({
+            "path": cfg.hands_path,
+            "enabled": cfg.hands_enabled,
+        })
 
         self._model_panel.bulk_load_entries(
             entries,

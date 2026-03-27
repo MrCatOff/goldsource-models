@@ -69,7 +69,7 @@ from goldsource.qc import (
     BoneController,
     TextureGroup,
 )
-from goldsource.smd import SMD, Node, BoneTransform
+from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +299,10 @@ class MergeConfig:
     skin_variants: dict[str, list[SkinVariant]] = field(default_factory=dict)
     # Global skin slots (skin 0 = defaults is always prepended automatically)
     skin_slots: list[SkinSlot] = field(default_factory=list)
+    # Master hands SMD.  When set, every output SMD has its hand bones (matched
+    # by name) replaced with those from this file, preserving their exact IDs.
+    # Weapon-specific bones are re-assigned to IDs above the maximum hand ID.
+    hand_smd: SMD | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +456,16 @@ class ModelMerger:
             for smd_key, smd in model.smds.items():
                 out_key = f"{model.name}/{_norm_path(smd_key)}"
                 output_smds[out_key] = _rewrite_smd(smd, b_rmap, t_rmap)
+
+        # Apply hand replacement before Universal_Root injection so hand IDs
+        # are assigned consistently.  Reference SMDs get master hand transforms;
+        # animation SMDs keep their original per-frame transforms.
+        if config and config.hand_smd:
+            hand_smd = config.hand_smd
+            output_smds = {
+                k: _apply_hand_ids(v, hand_smd, is_reference=not v.is_animation)
+                for k, v in output_smds.items()
+            }
 
         # Inject Universal_Root into every output SMD so all bodygroup meshes
         # share a common top-level bone.
@@ -927,6 +941,132 @@ def _build_texturegroup(
         rows.append(row)
 
     return TextureGroup(name="skins", skins=rows)
+
+
+# ---------------------------------------------------------------------------
+# Internal: hand-replacement
+# ---------------------------------------------------------------------------
+
+def _apply_hand_ids(smd: SMD, hand_smd: SMD, is_reference: bool) -> SMD:
+    """
+    Integrate *hand_smd* bones into *smd* with their exact IDs preserved.
+
+    Algorithm
+    ---------
+    1.  Bones in *smd* whose names appear in *hand_smd* → assigned the ID from
+        *hand_smd*.  For reference SMDs their skeleton transforms are also
+        taken from *hand_smd* frame 0 (finger-tip positions etc.).
+        For animation SMDs the original per-frame transforms are kept.
+    2.  Weapon-specific bones (names NOT in *hand_smd*) → assigned sequential
+        IDs starting from ``max(hand_smd IDs) + 1``, in parent-first
+        (topological) order so studiomdl never sees a child before its parent.
+    3.  All hand bones from *hand_smd* are written into the output nodes list,
+        even if not all of them exist in the original *smd*.
+    4.  Vertex bone_ids and skeleton transform bone_ids are remapped throughout.
+    """
+    hand_by_name: dict[str, Node] = {n.name: n for n in hand_smd.nodes}
+    max_hand_id:  int = max((n.id for n in hand_smd.nodes), default=-1)
+
+    # Master hand transforms (frame 0) for reference SMD replacement
+    hand_bt_map: dict[int, BoneTransform] = (
+        {bt.bone_id: bt for bt in hand_smd.skeleton[0].bones}
+        if hand_smd.skeleton else {}
+    )
+
+    # ── old_id → new_id map for all bones in smd ─────────────────────────
+    old_to_new: dict[int, int] = {}
+    for node in smd.nodes:
+        if node.name in hand_by_name:
+            old_to_new[node.id] = hand_by_name[node.name].id
+        # weapon-specific bones handled below after topo-sort
+
+    # Topological sort of weapon-specific bones (parents before children)
+    weapon_raw = [n for n in smd.nodes if n.name not in hand_by_name]
+    weapon_by_old = {n.id: n for n in weapon_raw}
+    weapon_ordered: list[Node] = []
+    visited: set[int] = set()
+
+    def _visit(n: Node) -> None:
+        if n.id in visited:
+            return
+        visited.add(n.id)
+        if n.parent_id in weapon_by_old:
+            _visit(weapon_by_old[n.parent_id])
+        weapon_ordered.append(n)
+
+    for n in weapon_raw:
+        _visit(n)
+
+    next_id = max_hand_id + 1
+    for n in weapon_ordered:
+        old_to_new[n.id] = next_id
+        next_id += 1
+
+    # ── New nodes: all hand bones first, then weapon bones ────────────────
+    new_nodes: list[Node] = [
+        Node(id=hn.id, name=hn.name, parent_id=hn.parent_id)
+        for hn in hand_smd.nodes
+    ]
+    for n in weapon_ordered:
+        new_parent = old_to_new.get(n.parent_id, -1) if n.parent_id != -1 else -1
+        new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
+
+    # ── New skeleton ──────────────────────────────────────────────────────
+    new_skeleton = []
+    for frame in smd.skeleton:
+        orig = {bt.bone_id: bt for bt in frame.bones}
+        new_bones: list[BoneTransform] = []
+
+        # Hand bones
+        for hn in hand_smd.nodes:
+            if is_reference:
+                bt = hand_bt_map.get(hn.id)
+                if bt:
+                    new_bones.append(BoneTransform(
+                        bone_id=hn.id,
+                        tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                        rx=bt.rx, ry=bt.ry, rz=bt.rz,
+                    ))
+            else:
+                # Keep original anim transform if the bone existed in smd
+                orig_node = next((x for x in smd.nodes if x.name == hn.name), None)
+                obt = orig.get(orig_node.id) if orig_node else None
+                if obt:
+                    new_bones.append(BoneTransform(
+                        bone_id=hn.id,
+                        tx=obt.tx, ty=obt.ty, tz=obt.tz,
+                        rx=obt.rx, ry=obt.ry, rz=obt.rz,
+                    ))
+                else:
+                    bt = hand_bt_map.get(hn.id)
+                    if bt:
+                        new_bones.append(BoneTransform(
+                            bone_id=hn.id,
+                            tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                            rx=bt.rx, ry=bt.ry, rz=bt.rz,
+                        ))
+
+        # Weapon-specific bones
+        for n in weapon_ordered:
+            obt = orig.get(n.id)
+            if obt:
+                new_bones.append(BoneTransform(
+                    bone_id=old_to_new[n.id],
+                    tx=obt.tx, ty=obt.ty, tz=obt.tz,
+                    rx=obt.rx, ry=obt.ry, rz=obt.rz,
+                ))
+
+        new_skeleton.append(SkeletonFrame(time=frame.time, bones=new_bones))
+
+    # ── Remap vertex bone_ids ─────────────────────────────────────────────
+    new_smd = deepcopy(smd)
+    new_smd.nodes    = new_nodes
+    new_smd.skeleton = new_skeleton
+    for tri in new_smd.triangles:
+        for v in (tri.v0, tri.v1, tri.v2):
+            v.bone_id = old_to_new.get(v.bone_id, v.bone_id)
+
+    return new_smd
 
 
 # ---------------------------------------------------------------------------
