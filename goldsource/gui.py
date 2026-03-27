@@ -14,16 +14,17 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenuBar, QMessageBox, QProgressBar, QProgressDialog,
-    QPushButton, QSplitter, QStackedWidget, QStyle,
+    QPushButton, QSplitter, QSpinBox, QDoubleSpinBox, QStackedWidget, QStyle,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from goldsource.merger import ModelInput, MergeConfig, MergeReport, MergeResult, ModelMerger
+from goldsource.qc import QC, Sequence, SequenceEvent
 from goldsource.sanitize import sanitize_directory
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
@@ -1083,6 +1084,408 @@ class _AnalysisPanel(QWidget):
 # Output panel (bottom)
 # ---------------------------------------------------------------------------
 
+class _QCEditorPanel(QWidget):
+    """Tab for viewing and editing QC sequences directly on the source files."""
+
+    qcSaved = pyqtSignal(str)  # emitted with model name after saving
+
+    # ------------------------------------------------------------------ setup
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._dirs:      dict[str, str] = {}   # model_name → directory
+        self._qc:        QC | None      = None
+        self._qc_path:   Path | None    = None
+        self._cur_model: str            = ""
+        self._loading:   bool           = False  # suppress change signals during load
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        # Model selector
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Model:"))
+        self._model_combo = QComboBox()
+        self._model_combo.setMinimumWidth(160)
+        self._model_combo.currentTextChanged.connect(self._on_model_changed)
+        top.addWidget(self._model_combo, 1)
+        top.addStretch()
+        root.addLayout(top)
+
+        # Main splitter: sequence list | sequence details
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # --- Left: sequence list ---
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.addWidget(QLabel("Sequences"))
+        self._seq_list = QListWidget()
+        self._seq_list.currentRowChanged.connect(self._on_seq_selected)
+        lv.addWidget(self._seq_list, 1)
+
+        seq_btns = QHBoxLayout()
+        self._btn_add_seq = QPushButton("Add")
+        self._btn_del_seq = QPushButton("Delete")
+        self._btn_up      = QPushButton("↑")
+        self._btn_dn      = QPushButton("↓")
+        for b in (self._btn_up, self._btn_dn):
+            b.setFixedWidth(28)
+        self._btn_del_seq.setEnabled(False)
+        self._btn_up.setEnabled(False)
+        self._btn_dn.setEnabled(False)
+        self._btn_add_seq.clicked.connect(self._on_add_seq)
+        self._btn_del_seq.clicked.connect(self._on_del_seq)
+        self._btn_up.clicked.connect(self._on_move_up)
+        self._btn_dn.clicked.connect(self._on_move_dn)
+        for b in (self._btn_add_seq, self._btn_del_seq, self._btn_up, self._btn_dn):
+            seq_btns.addWidget(b)
+        seq_btns.addStretch()
+        lv.addLayout(seq_btns)
+        splitter.addWidget(left)
+
+        # --- Right: sequence details ---
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+
+        self._detail_group = QGroupBox("Sequence details")
+        self._detail_group.setEnabled(False)
+        dg = QVBoxLayout(self._detail_group)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("sequence name")
+        self._name_edit.editingFinished.connect(self._on_name_changed)
+        form.addRow("Name:", self._name_edit)
+
+        fps_row = QHBoxLayout()
+        self._fps_spin = QDoubleSpinBox()
+        self._fps_spin.setRange(1, 300)
+        self._fps_spin.setSingleStep(1)
+        self._fps_spin.setDecimals(2)
+        self._fps_spin.valueChanged.connect(self._on_detail_changed)
+        fps_row.addWidget(self._fps_spin)
+        self._loop_chk = QCheckBox("Loop")
+        self._loop_chk.stateChanged.connect(self._on_detail_changed)
+        fps_row.addWidget(self._loop_chk)
+        fps_row.addStretch()
+        form.addRow("FPS:", fps_row)
+
+        frame_row = QHBoxLayout()
+        self._frame_start = QSpinBox()
+        self._frame_start.setRange(-1, 99999)
+        self._frame_start.setSpecialValueText("—")  # -1 = not set
+        self._frame_start.valueChanged.connect(self._on_detail_changed)
+        self._frame_end = QSpinBox()
+        self._frame_end.setRange(-1, 99999)
+        self._frame_end.setSpecialValueText("—")
+        self._frame_end.valueChanged.connect(self._on_detail_changed)
+        frame_row.addWidget(QLabel("start"))
+        frame_row.addWidget(self._frame_start)
+        frame_row.addWidget(QLabel("end"))
+        frame_row.addWidget(self._frame_end)
+        frame_row.addStretch()
+        form.addRow("Frame range:", frame_row)
+
+        dg.addLayout(form)
+
+        # Events table
+        ev_label_row = QHBoxLayout()
+        ev_label_row.addWidget(QLabel("Events"))
+        ev_label_row.addStretch()
+        self._btn_add_ev = QPushButton("Add event")
+        self._btn_del_ev = QPushButton("Delete event")
+        self._btn_del_ev.setEnabled(False)
+        self._btn_add_ev.clicked.connect(self._on_add_event)
+        self._btn_del_ev.clicked.connect(self._on_del_event)
+        ev_label_row.addWidget(self._btn_add_ev)
+        ev_label_row.addWidget(self._btn_del_ev)
+        dg.addLayout(ev_label_row)
+
+        self._ev_table = QTableWidget(0, 3)
+        self._ev_table.setHorizontalHeaderLabels(["Type", "Frame", "Options"])
+        self._ev_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._ev_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._ev_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self._ev_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._ev_table.verticalHeader().setVisible(False)
+        self._ev_table.itemSelectionChanged.connect(
+            lambda: self._btn_del_ev.setEnabled(bool(self._ev_table.selectedItems()))
+        )
+        self._ev_table.itemChanged.connect(self._on_event_cell_changed)
+        dg.addWidget(self._ev_table, 1)
+
+        rv.addWidget(self._detail_group, 1)
+
+        # Save button
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        self._btn_save = QPushButton("Save to QC file")
+        self._btn_save.setEnabled(False)
+        self._btn_save.setStyleSheet(
+            "QPushButton { padding: 4px 16px; border-radius: 4px; }"
+            "QPushButton:enabled { background-color: #27ae60; color: white; font-weight: bold; }"
+            "QPushButton:enabled:hover { background-color: #2ecc71; }"
+        )
+        self._btn_save.clicked.connect(self._on_save)
+        save_row.addWidget(self._btn_save)
+        rv.addLayout(save_row)
+
+        splitter.addWidget(right)
+        splitter.setSizes([200, 500])
+        root.addWidget(splitter, 1)
+
+    # ------------------------------------------------------------------ public
+    def set_models(self, dirs: dict[str, str]) -> None:
+        """Update the model list. Called whenever loaded models change."""
+        prev = self._cur_model
+        self._dirs = dict(dirs)
+        self._loading = True
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        for name in dirs:
+            self._model_combo.addItem(name)
+        self._model_combo.blockSignals(False)
+        self._loading = False
+        # Restore previous selection if still present
+        idx = self._model_combo.findText(prev)
+        self._model_combo.setCurrentIndex(max(idx, 0) if self._model_combo.count() else -1)
+        if self._model_combo.count() == 0:
+            self._clear_editor()
+
+    # ------------------------------------------------------------------ slots
+    def _on_model_changed(self, name: str) -> None:
+        if self._loading or not name:
+            return
+        self._cur_model = name
+        self._load_qc(name)
+
+    def _load_qc(self, model_name: str) -> None:
+        directory = self._dirs.get(model_name, "")
+        if not directory:
+            self._clear_editor()
+            return
+        qc_files = list(Path(directory).glob("*.qc"))
+        if not qc_files:
+            self._clear_editor()
+            return
+        try:
+            self._qc_path = qc_files[0]
+            self._qc = QC.from_file(self._qc_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "QC Load Error", str(exc))
+            self._clear_editor()
+            return
+        self._refresh_seq_list(keep_row=0)
+        self._btn_save.setEnabled(True)
+
+    def _clear_editor(self) -> None:
+        self._qc = None
+        self._qc_path = None
+        self._seq_list.clear()
+        self._detail_group.setEnabled(False)
+        self._btn_save.setEnabled(False)
+        self._btn_del_seq.setEnabled(False)
+        self._btn_up.setEnabled(False)
+        self._btn_dn.setEnabled(False)
+
+    def _refresh_seq_list(self, keep_row: int = -1) -> None:
+        self._seq_list.blockSignals(True)
+        self._seq_list.clear()
+        if self._qc:
+            for seq in self._qc.sequences:
+                self._seq_list.addItem(seq.name)
+        self._seq_list.blockSignals(False)
+        row = min(keep_row, self._seq_list.count() - 1)
+        if row >= 0:
+            self._seq_list.setCurrentRow(row)
+        else:
+            self._on_seq_selected(-1)
+
+    def _on_seq_selected(self, row: int) -> None:
+        has = row >= 0 and self._qc is not None and row < len(self._qc.sequences)
+        self._detail_group.setEnabled(has)
+        self._btn_del_seq.setEnabled(has)
+        self._btn_up.setEnabled(has and row > 0)
+        self._btn_dn.setEnabled(has and row < len(self._qc.sequences) - 1)
+        if not has:
+            return
+        seq = self._qc.sequences[row]
+        self._loading = True
+        self._name_edit.setText(seq.name)
+        self._fps_spin.setValue(seq.fps if seq.fps is not None else 30.0)
+        self._loop_chk.setChecked(seq.loop)
+        self._frame_start.setValue(seq.frame_start if seq.frame_start is not None else -1)
+        self._frame_end.setValue(seq.frame_end if seq.frame_end is not None else -1)
+        self._rebuild_events(seq)
+        self._loading = False
+
+    def _rebuild_events(self, seq: Sequence) -> None:
+        self._ev_table.blockSignals(True)
+        self._ev_table.setRowCount(0)
+        for ev in seq.events:
+            self._append_event_row(ev.event_type, ev.frame, ev.options)
+        self._ev_table.blockSignals(False)
+
+    def _append_event_row(self, etype: int, frame: int, options: str) -> None:
+        row = self._ev_table.rowCount()
+        self._ev_table.insertRow(row)
+        self._ev_table.setItem(row, 0, QTableWidgetItem(str(etype)))
+        self._ev_table.setItem(row, 1, QTableWidgetItem(str(frame)))
+        self._ev_table.setItem(row, 2, QTableWidgetItem(options))
+
+    # --- detail edits ---
+    def _on_name_changed(self) -> None:
+        if self._loading or self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0 or row >= len(self._qc.sequences):
+            return
+        new_name = self._name_edit.text().strip()
+        if not new_name:
+            return
+        self._qc.sequences[row].name = new_name
+        item = self._seq_list.item(row)
+        if item:
+            item.setText(new_name)
+
+    def _on_detail_changed(self) -> None:
+        if self._loading or self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0 or row >= len(self._qc.sequences):
+            return
+        seq = self._qc.sequences[row]
+        seq.fps = self._fps_spin.value()
+        seq.loop = self._loop_chk.isChecked()
+        fs = self._frame_start.value()
+        fe = self._frame_end.value()
+        seq.frame_start = fs if fs >= 0 else None
+        seq.frame_end   = fe if fe >= 0 else None
+
+    def _on_event_cell_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading or self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0 or row >= len(self._qc.sequences):
+            return
+        self._flush_events_to_seq(row)
+
+    def _flush_events_to_seq(self, seq_row: int) -> None:
+        """Sync event table contents back into the Sequence object."""
+        seq = self._qc.sequences[seq_row]
+        events: list[SequenceEvent] = []
+        for r in range(self._ev_table.rowCount()):
+            try:
+                etype = int((self._ev_table.item(r, 0) or QTableWidgetItem("0")).text())
+                frame = int((self._ev_table.item(r, 1) or QTableWidgetItem("0")).text())
+                opts  = (self._ev_table.item(r, 2) or QTableWidgetItem("")).text()
+                events.append(SequenceEvent(event_type=etype, frame=frame, options=opts))
+            except ValueError:
+                pass
+        seq.events = events
+
+    # --- sequence list buttons ---
+    def _on_add_seq(self) -> None:
+        if self._qc is None:
+            return
+        name, ok = QInputDialog.getText(self, "New sequence", "Sequence name:")
+        if not ok or not name.strip():
+            return
+        self._qc.sequences.append(Sequence(name=name.strip(), fps=30.0))
+        self._refresh_seq_list(keep_row=len(self._qc.sequences) - 1)
+
+    def _on_del_seq(self) -> None:
+        if self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0 or row >= len(self._qc.sequences):
+            return
+        seq = self._qc.sequences[row]
+        ans = QMessageBox.question(
+            self, "Delete sequence",
+            f"Delete sequence '{seq.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del self._qc.sequences[row]
+        self._refresh_seq_list(keep_row=max(0, row - 1))
+
+    def _on_move_up(self) -> None:
+        if self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row <= 0:
+            return
+        seqs = self._qc.sequences
+        seqs[row - 1], seqs[row] = seqs[row], seqs[row - 1]
+        self._refresh_seq_list(keep_row=row - 1)
+
+    def _on_move_dn(self) -> None:
+        if self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0 or row >= len(self._qc.sequences) - 1:
+            return
+        seqs = self._qc.sequences
+        seqs[row], seqs[row + 1] = seqs[row + 1], seqs[row]
+        self._refresh_seq_list(keep_row=row + 1)
+
+    def _on_add_event(self) -> None:
+        if self._qc is None:
+            return
+        row = self._seq_list.currentRow()
+        if row < 0:
+            return
+        self._flush_events_to_seq(row)
+        self._qc.sequences[row].events.append(
+            SequenceEvent(event_type=5004, frame=0, options="")
+        )
+        self._rebuild_events(self._qc.sequences[row])
+
+    def _on_del_event(self) -> None:
+        if self._qc is None:
+            return
+        ev_row = self._ev_table.currentRow()
+        if ev_row < 0:
+            return
+        seq_row = self._seq_list.currentRow()
+        if seq_row < 0:
+            return
+        self._ev_table.removeRow(ev_row)
+        self._flush_events_to_seq(seq_row)
+
+    # --- save ---
+    def _on_save(self) -> None:
+        if self._qc is None or self._qc_path is None:
+            return
+        # Flush any in-progress event edits
+        seq_row = self._seq_list.currentRow()
+        if seq_row >= 0:
+            self._flush_events_to_seq(seq_row)
+        try:
+            self._qc.save(self._qc_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
+        QMessageBox.information(
+            self, "Saved",
+            f"QC file saved:\n{self._qc_path}",
+        )
+        self.qcSaved.emit(self._cur_model)
+
+
 class _OutputPanel(QGroupBox):
     analyzeRequested = pyqtSignal()
     mergeRequested   = pyqtSignal(str, str)   # modelname, output_dir
@@ -1312,6 +1715,10 @@ class MainWindow(QMainWindow):
         self._viewer_panel = ViewerPanel()
         self._main_tabs.addTab(self._viewer_panel, "Viewer")
 
+        # ── QC Editor tab ────────────────────────────────────────────────
+        self._qc_editor = _QCEditorPanel()
+        self._main_tabs.addTab(self._qc_editor, "QC Editor")
+
         # Top: left tabs + analysis
         inner_splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -1343,6 +1750,7 @@ class MainWindow(QMainWindow):
         self._output_panel.analyzeRequested.connect(self._run_analysis)
         self._output_panel.mergeRequested.connect(self._on_merge_requested)
         self._viewer_panel.bonesRenamed.connect(self._on_bones_renamed)
+        self._qc_editor.qcSaved.connect(self._on_qc_saved)
 
         self.statusBar().showMessage("Ready. Add decompiled model directories to begin.")
 
@@ -1388,6 +1796,7 @@ class MainWindow(QMainWindow):
         dirs   = self._model_panel.model_directories()
         self._skins_panel.update_models(models, dirs)
         self._viewer_panel.update_models(models, dirs)
+        self._qc_editor.set_models(dirs)
 
         if len(models) < 2:
             self._analysis_panel.show_placeholder()
@@ -1526,6 +1935,14 @@ class MainWindow(QMainWindow):
         """Triggered when the Viewer renames a bone in-place; re-run analysis."""
         self.statusBar().showMessage("Bone renamed — re-analysing…")
         self._analysis_debounce.start(200)
+
+    def _on_qc_saved(self, model_name: str) -> None:
+        """Reload a model after its QC file was edited and saved."""
+        dirs = self._model_panel.model_directories()
+        directory = dirs.get(model_name, "")
+        if directory:
+            self._model_panel._reload_directory(directory)
+            self.statusBar().showMessage(f"QC saved — reloading '{model_name}'…")
 
     # ------------------------------------------------------------------
     # Config serialisation
