@@ -235,6 +235,10 @@ class MergeResult:
     # Texture renames applied per model: model_name -> {original_name: new_name}
     renamed_textures: dict[str, dict[str, str]]
     report: MergeReport
+    # Ordered list of model names (same order as they were added to the merger)
+    model_names: list[str] = field(default_factory=list)
+    # Correct pev_body value per model (encodes all bodygroup selections via stride formula)
+    pev_body_map: dict[str, int] = field(default_factory=dict)
 
     def save(self, output_dir: str | Path) -> None:
         """
@@ -243,6 +247,7 @@ class MergeResult:
         - ``<output_dir>/<modelname>.qc``
         - ``<output_dir>/<model_name>/<smd_name>.smd``  (one subdirectory per source model)
         - ``<output_dir>/<texture>.BMP``                (flat texture directory)
+        - ``<output_dir>/models.ini``                   (per-model bodygroup + sequence index map)
         """
         base = Path(output_dir)
         base.mkdir(parents=True, exist_ok=True)
@@ -258,6 +263,33 @@ class MergeResult:
         # Textures
         for filename, data in self.textures.items():
             (base / filename).write_bytes(data)
+
+        # models.ini
+        (base / "models.ini").write_text(self._build_models_ini(), encoding="utf-8")
+
+    def _build_models_ini(self) -> str:
+        """Build INI content mapping each model to its pev_body value and animation indices."""
+        # sequences: per-model list of (final_name, index_in_merged_list)
+        seq_map: dict[str, list[tuple[str, int]]] = {}
+        for seq_idx, seq in enumerate(self.qc.sequences):
+            model_name = None
+            for p in seq.smd_paths:
+                if "/" in p:
+                    model_name = p.split("/")[0]
+                    break
+            if model_name:
+                seq_map.setdefault(model_name, []).append((seq.name, seq_idx))
+
+        sections: list[str] = []
+        for name in self.model_names:
+            lines = [f"[{name}]"]
+            if name in self.pev_body_map:
+                lines.append(f"pev_body = {self.pev_body_map[name]}")
+            for seq_name, seq_idx in seq_map.get(name, []):
+                lines.append(f"anim_{seq_name} = {seq_idx}")
+            sections.append("\n".join(lines))
+
+        return "\n\n".join(sections) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +489,7 @@ class ModelMerger:
         # share a common top-level bone.
         output_smds = {k: _inject_universal_root(v) for k, v in output_smds.items()}
 
-        merged_qc = _build_merged_qc(self._models, bone_maps, output_modelname, config)
+        merged_qc, pev_body_map = _build_merged_qc(self._models, bone_maps, output_modelname, config)
 
         # Build $texturegroup if skin slots are configured.
         if config and config.skin_slots:
@@ -488,6 +520,8 @@ class ModelMerger:
             renamed_bones={k: v for k, v in bone_maps.items() if v},
             renamed_textures={k: v for k, v in tex_plan.model_renames.items() if v},
             report=report,
+            model_names=[m.name for m in self._models],
+            pev_body_map=pev_body_map,
         )
 
     # ------------------------------------------------------------------
@@ -938,7 +972,7 @@ def _build_merged_qc(
     rename_maps: dict[str, dict[str, str]],
     output_modelname: str,
     config: MergeConfig | None = None,
-) -> QC:
+) -> tuple[QC, dict[str, int]]:
     base = models[0].qc
     merged = QC(
         modelname=output_modelname,
@@ -957,12 +991,21 @@ def _build_merged_qc(
         bg.name for m in models for bg in m.qc.bodygroups
     )
 
+    # pev_body encoding: sum over groups of (first_entry_index_for_model * stride)
+    # stride for group g = product of total entry counts of all prior groups.
+    pev_body: dict[str, int] = {m.name: 0 for m in models}
+    stride = 1
+
     for group_name in all_group_names:
         combined = BodyGroup(name=group_name)
+        entry_offset = 0
         for model in models:
             bg = model.qc.bodygroup_by_name(group_name)
+            # Record this model's first entry index in this group (contributes to pev_body)
+            pev_body[model.name] += entry_offset * stride
             if bg is None:
                 combined.entries.append(BodyGroupEntry(smd=""))  # blank slot
+                entry_offset += 1
             else:
                 for entry in bg.entries:
                     if entry.is_blank:
@@ -975,7 +1018,9 @@ def _build_merged_qc(
                             reverse=entry.reverse,
                             scale=entry.scale,
                         ))
+                entry_offset += len(bg.entries)
         merged.bodygroups.append(combined)
+        stride *= entry_offset  # total entries in this group
 
     # ---- attachments -------------------------------------------------------
     # GoldSource supports attachment IDs 0–3.  First model per ID wins; warn
@@ -1020,7 +1065,7 @@ def _build_merged_qc(
             seen_seq_names.add(out_seq.name)
             merged.sequences.append(out_seq)
 
-    return merged
+    return merged, pev_body
 
 
 # ---------------------------------------------------------------------------
