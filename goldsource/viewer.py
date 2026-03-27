@@ -1342,8 +1342,11 @@ class ViewerPanel(QWidget):
     can trigger re-analysis.
     """
 
-    bonesRenamed = pyqtSignal()
-    qcModified   = pyqtSignal(str)   # model_name whose QC was changed on disk
+    bonesRenamed       = pyqtSignal()
+    qcModified         = pyqtSignal(str)   # model_name whose QC was changed on disk
+    # Emitted after every successful operation: (description, op_type)
+    # MainWindow listens to record history.
+    operationRecorded  = pyqtSignal(str, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1584,6 +1587,23 @@ class ViewerPanel(QWidget):
         self._model_combo.blockSignals(False)
         self._on_model_changed()
 
+    def get_current_model_smds(self) -> tuple[str, dict]:
+        """Return (model_name, smds_dict) for the currently selected model."""
+        name  = self._cur_model_name
+        model = next((m for m in self._models if m.name == name), None)
+        return name, dict(model.smds) if model else {}
+
+    def restore_model_smds(self, model_name: str, smds: dict) -> None:
+        """Replace in-memory SMDs for *model_name* and refresh the viewer."""
+        model = next((m for m in self._models if m.name == model_name), None)
+        if model is None:
+            return
+        model.smds.clear()
+        model.smds.update(smds)
+        # If this is the currently displayed model, reload the view.
+        if model_name == self._cur_model_name:
+            self._on_model_changed()
+
     # ── Slots ─────────────────────────────────────────────────────────────
 
     def _on_model_changed(self) -> None:
@@ -1734,6 +1754,10 @@ class ViewerPanel(QWidget):
             self._rebuild_tree()
             self._viewport.set_smd(self._cur_smd)
             self.bonesRenamed.emit()
+            self.operationRecorded.emit(
+                f"Deleted bone '{bone_name}' in {self._ref_combo.currentText()}",
+                "delete",
+            )
 
     def _on_apply_all_clicked(self) -> None:
         if not self._pending_ops:
@@ -1780,9 +1804,14 @@ class ViewerPanel(QWidget):
                     _delete_bone(smd, op["name"])
             applied += 1
 
+        n_ops = len(self._pending_ops)
         self._pending_ops.clear()
         self._update_apply_button()
         self.bonesRenamed.emit()
+        self.operationRecorded.emit(
+            f"Applied {n_ops} op(s) to {applied} SMD(s) in '{self._cur_model_name}'",
+            "apply_all",
+        )
         QMessageBox.information(
             self, "Done",
             f"Changes applied to {applied} SMD(s).",
@@ -1874,6 +1903,10 @@ class ViewerPanel(QWidget):
             if qc_updated:
                 msg += "\n\nQC file updated ($attachment and $hbox bone names)."
             QMessageBox.information(self, "Save All", msg)
+            self.operationRecorded.emit(
+                f"Saved all {saved} SMD(s) to disk for '{self._cur_model_name}'",
+                "save_all",
+            )
 
     def _on_bone_hovered(self, name: str, x: float, y: float, z: float) -> None:
         self._info_label.setText(
@@ -1952,6 +1985,10 @@ class ViewerPanel(QWidget):
         self._update_apply_button()
         self._rebuild_tree()
         self.bonesRenamed.emit()
+        self.operationRecorded.emit(
+            f"Renamed bone '{old_name}' -> '{new_name}' in {self._ref_combo.currentText()}",
+            "rename",
+        )
 
     # ── Reference Hands ───────────────────────────────────────────────────
 
@@ -2198,6 +2235,12 @@ class ViewerPanel(QWidget):
         self._pending_ops.clear()
         self._update_apply_button()
         self.bonesRenamed.emit()
+        if not errors:
+            self.operationRecorded.emit(
+                f"Applied hands ({matched} bone(s) mapped) to all {n_smds} SMD(s) "
+                f"in '{self._cur_model_name}'",
+                "apply_hands",
+            )
         if qc_modified:
             self.qcModified.emit(self._cur_model_name)
 

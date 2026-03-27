@@ -30,6 +30,7 @@ from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
 )
 from goldsource.viewer import ViewerPanel, _SMDEditorViewport
+from goldsource.history import HistoryEntry, HistoryManager
 
 
 # ---------------------------------------------------------------------------
@@ -1632,6 +1633,96 @@ class _SMDEditorPanel(QWidget):
         )
 
 
+class _HistoryPanel(QWidget):
+    revertRequested = pyqtSignal(int)   # step_id
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+
+        self._list = QListWidget()
+        self._list.setAlternatingRowColors(True)
+        self._list.currentRowChanged.connect(self._on_row_changed)
+        root.addWidget(self._list, 3)
+
+        self._detail = QTextBrowser()
+        self._detail.setMaximumHeight(80)
+        self._detail.setPlaceholderText("Select an entry to see details…")
+        root.addWidget(self._detail)
+
+        btn_row = QHBoxLayout()
+        self._btn_revert = QPushButton("Revert to Selected Step")
+        self._btn_revert.setEnabled(False)
+        self._btn_revert.clicked.connect(self._on_revert_clicked)
+        self._btn_clear = QPushButton("Clear History")
+        self._btn_clear.clicked.connect(self._on_clear_clicked)
+        btn_row.addWidget(self._btn_revert)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_clear)
+        root.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    def refresh(self, entries: list) -> None:
+        """Repopulate the list from a list[HistoryEntry]."""
+        current_id = self._current_step_id()
+        self._list.blockSignals(True)
+        self._list.clear()
+        for e in entries:
+            label = f"[{e.timestamp}]  {e.description}  ({e.model_name})"
+            item  = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, e.step_id)
+            self._list.addItem(item)
+        self._list.blockSignals(False)
+        # Try to restore selection
+        for i in range(self._list.count()):
+            if self._list.item(i).data(Qt.ItemDataRole.UserRole) == current_id:
+                self._list.setCurrentRow(i)
+                break
+        else:
+            self._list.setCurrentRow(self._list.count() - 1)
+        self._btn_revert.setEnabled(self._list.currentRow() >= 0)
+
+    def _current_step_id(self) -> int | None:
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_row_changed(self, row: int) -> None:
+        self._btn_revert.setEnabled(row >= 0)
+        item = self._list.item(row)
+        if item is None:
+            self._detail.clear()
+            return
+        step_id = item.data(Qt.ItemDataRole.UserRole)
+        self._detail.setPlainText(f"Step ID: {step_id}\n{item.text()}")
+
+    def _on_revert_clicked(self) -> None:
+        step_id = self._current_step_id()
+        if step_id is None:
+            return
+        ans = QMessageBox.question(
+            self, "Revert",
+            f"Restore in-memory model state to step {step_id}?\n"
+            "Unsaved changes in the Viewer will be lost.",
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self.revertRequested.emit(step_id)
+
+    def _on_clear_clicked(self) -> None:
+        ans = QMessageBox.question(self, "Clear History", "Clear all history entries?")
+        if ans == QMessageBox.StandardButton.Yes:
+            self._list.clear()
+            self._detail.clear()
+            self._btn_revert.setEnabled(False)
+            # Signal the manager to clear — reuse revertRequested with -1 as sentinel
+            self.revertRequested.emit(-1)
+
+
 class _OutputPanel(QGroupBox):
     analyzeRequested = pyqtSignal()
     mergeRequested   = pyqtSignal(str, str)   # modelname, output_dir
@@ -1834,6 +1925,7 @@ class MainWindow(QMainWindow):
         self._analysis_debounce = QTimer(self)
         self._analysis_debounce.setSingleShot(True)
         self._analysis_debounce.timeout.connect(self._run_analysis)
+        self._history_manager = HistoryManager()
 
         self._setup_ui()
         self._setup_menu()
@@ -1869,6 +1961,10 @@ class MainWindow(QMainWindow):
         self._smd_editor = _SMDEditorPanel()
         self._main_tabs.addTab(self._smd_editor, "SMD Editor")
 
+        # ── Change History tab ───────────────────────────────────────────
+        self._history_panel = _HistoryPanel()
+        self._main_tabs.addTab(self._history_panel, "Change History")
+
         # Top: left tabs + analysis
         inner_splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -1901,7 +1997,9 @@ class MainWindow(QMainWindow):
         self._output_panel.mergeRequested.connect(self._on_merge_requested)
         self._viewer_panel.bonesRenamed.connect(self._on_bones_renamed)
         self._viewer_panel.qcModified.connect(self._qc_editor.reload_model)
+        self._viewer_panel.operationRecorded.connect(self._on_viewer_op_recorded)
         self._qc_editor.qcSaved.connect(self._on_qc_saved)
+        self._history_panel.revertRequested.connect(self._on_revert_requested)
 
         self.statusBar().showMessage("Ready. Add decompiled model directories to begin.")
 
@@ -2097,6 +2195,60 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"QC saved — reloading '{model_name}'…")
 
     # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def _on_viewer_op_recorded(self, description: str, op_type: str) -> None:
+        """Record a snapshot of the current model's SMDs into history."""
+        model_name, smds = self._viewer_panel.get_current_model_smds()
+        if not smds:
+            return
+        self._history_manager.record(description, op_type, model_name, smds)
+        self._history_panel.refresh(self._history_manager.get_entries())
+        self._save_history()
+
+    def _on_revert_requested(self, step_id: int) -> None:
+        if step_id == -1:
+            # Clear sentinel from _HistoryPanel._on_clear_clicked
+            self._history_manager.clear()
+            self._save_history()
+            return
+        try:
+            smds = self._history_manager.restore(step_id)
+        except KeyError as exc:
+            QMessageBox.warning(self, "Revert failed", str(exc))
+            return
+        entries = self._history_manager.get_entries()
+        entry   = next(e for e in entries if e.step_id == step_id)
+        self._viewer_panel.restore_model_smds(entry.model_name, smds)
+        self.statusBar().showMessage(
+            f"Reverted '{entry.model_name}' to step {step_id}: {entry.description}"
+        )
+
+    def _history_path(self) -> str | None:
+        if not self._config_path:
+            return None
+        p = Path(self._config_path)
+        return str(p.parent / (p.stem + "_history.json"))
+
+    def _save_history(self) -> None:
+        path = self._history_path()
+        if path:
+            try:
+                self._history_manager.save(path)
+            except Exception:
+                pass  # non-critical
+
+    def _load_history(self) -> None:
+        path = self._history_path()
+        if path and Path(path).exists():
+            try:
+                self._history_manager.load(path)
+                self._history_panel.refresh(self._history_manager.get_entries())
+            except Exception:
+                pass  # corrupted history is not fatal
+
+    # ------------------------------------------------------------------
     # Config serialisation
     # ------------------------------------------------------------------
 
@@ -2194,6 +2346,8 @@ class MainWindow(QMainWindow):
         self._config_path = path
         self.setWindowTitle(f"GoldSource Model Merger — {Path(path).name}")
         self._apply_app_config(cfg)
+        self._history_manager.clear()
+        self._load_history()
         self.statusBar().showMessage(f"Loaded config: {path}")
 
     def _on_save_config(self) -> None:
@@ -2202,6 +2356,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._build_app_config().save(self._config_path)
+            self._save_history()
             self.statusBar().showMessage(f"Saved: {self._config_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
@@ -2220,6 +2375,7 @@ class MainWindow(QMainWindow):
             self._build_app_config().save(path)
             self._config_path = path
             self.setWindowTitle(f"GoldSource Model Merger — {Path(path).name}")
+            self._save_history()
             self.statusBar().showMessage(f"Saved: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
