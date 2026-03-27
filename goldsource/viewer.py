@@ -976,7 +976,6 @@ class ViewerPanel(QWidget):
         ll.addWidget(hands_box)
 
         left.setMinimumWidth(240)
-        left.setMaximumWidth(400)
         splitter.addWidget(left)
 
         # ── Right panel ──────────────────────────────────────────────────
@@ -1042,7 +1041,16 @@ class ViewerPanel(QWidget):
 
         splitter.addWidget(right)
         splitter.setSizes([260, 700])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setChildrenCollapsible(False)
         root.addWidget(splitter)
+        # Enforce 50 % maximum on the side panel once the widget has a real size.
+        splitter.splitterMoved.connect(
+            lambda pos, idx, s=splitter: s.moveSplitter(
+                min(pos, s.width() // 2), idx
+            ) if pos > s.width() // 2 else None
+        )
 
     # ── Public API ────────────────────────────────────────────────────────
 

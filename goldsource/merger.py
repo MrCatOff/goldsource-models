@@ -278,7 +278,12 @@ class MergeResult:
                     model_name = p.split("/")[0]
                     break
             if model_name:
-                seq_map.setdefault(model_name, []).append((seq.name, seq_idx))
+                # Strip collision prefix "{model_name}__" added during merge
+                raw_name = seq.name
+                prefix = model_name + "__"
+                if raw_name.startswith(prefix):
+                    raw_name = raw_name[len(prefix):]
+                seq_map.setdefault(model_name, []).append((raw_name, seq_idx))
 
         sections: list[str] = []
         for name in self.model_names:

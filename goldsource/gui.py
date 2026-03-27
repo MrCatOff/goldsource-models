@@ -1262,6 +1262,10 @@ class _QCEditorPanel(QWidget):
         self._model_combo.setCurrentIndex(max(idx, 0) if self._model_combo.count() else -1)
         if self._model_combo.count() == 0:
             self._clear_editor()
+        else:
+            # setCurrentIndex won't emit currentTextChanged when the index
+            # was already 0, so force the load explicitly.
+            self._on_model_changed(self._model_combo.currentText())
 
     # ------------------------------------------------------------------ slots
     def _on_model_changed(self, name: str) -> None:
