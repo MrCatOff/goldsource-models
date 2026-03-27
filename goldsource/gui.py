@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from goldsource.merger import ModelInput, MergeConfig, MergeReport, MergeResult, ModelMerger
+from goldsource.sanitize import sanitize_directory
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
 )
@@ -170,10 +171,17 @@ class _ModelListPanel(QWidget):
             self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
         )
         self._btn_remove.setEnabled(False)
+        self._btn_sanitize = QPushButton("Sanitize Dir…")
+        self._btn_sanitize.setToolTip(
+            "Rename non-ASCII files in a directory to ASCII-safe names "
+            "and update all SMD/QC references."
+        )
         self._btn_add.clicked.connect(self._on_add)
         self._btn_remove.clicked.connect(self._on_remove)
+        self._btn_sanitize.clicked.connect(self._on_sanitize)
         btn_row.addWidget(self._btn_add)
         btn_row.addWidget(self._btn_remove)
+        btn_row.addWidget(self._btn_sanitize)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -330,6 +338,58 @@ class _ModelListPanel(QWidget):
         for row in rows:
             self._table.removeRow(row)
         self.modelsChanged.emit()
+
+    def _on_sanitize(self) -> None:
+        dirs = self.model_directories()
+        if not dirs:
+            QMessageBox.information(self, "Sanitize", "No models loaded.")
+            return
+
+        all_renamed: dict[str, dict[str, str]] = {}  # directory → rename map
+        errors: list[str] = []
+        for name, directory in dirs.items():
+            try:
+                renamed = sanitize_directory(directory)
+                if renamed:
+                    all_renamed[directory] = renamed
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+
+        if errors:
+            QMessageBox.critical(self, "Sanitize Error", "\n".join(errors))
+
+        if not all_renamed:
+            if not errors:
+                QMessageBox.information(
+                    self, "Sanitize", "No non-ASCII filenames found — nothing to do."
+                )
+            return
+
+        total = sum(len(v) for v in all_renamed.values())
+        lines: list[str] = []
+        for directory, renamed in all_renamed.items():
+            lines.append(Path(directory).name + ":")
+            lines.extend(f"  {old}  →  {new}" for old, new in renamed.items())
+        QMessageBox.information(
+            self, "Sanitize — Done",
+            f"Renamed {total} file(s):\n\n" + "\n".join(lines),
+        )
+
+        for directory in all_renamed:
+            self._reload_directory(directory)
+
+    def _reload_directory(self, directory: str) -> None:
+        """Reload any model whose source directory matches *directory*."""
+        norm = str(Path(directory).resolve())
+        for row in range(self._table.rowCount() - 1, -1, -1):
+            item = self._table.item(row, self._COL_NAME)
+            if not item:
+                continue
+            row_dir = item.data(Qt.ItemDataRole.UserRole + 1)
+            if row_dir and str(Path(row_dir).resolve()) == norm:
+                name = item.text()
+                self._table.removeRow(row)
+                self._start_load(name, directory, show_dialog=True)
 
     def model_directories(self) -> dict[str, str]:
         """Return {model_name: source_directory} for all loaded models."""
@@ -1067,8 +1127,8 @@ class _OutputPanel(QGroupBox):
         )
         self._btn_merge.setEnabled(False)
         self._btn_merge.setStyleSheet(
-            "QPushButton:enabled { background-color: #2980b9; color: white; "
-            "font-weight: bold; padding: 4px 16px; border-radius: 4px; }"
+            "QPushButton { padding: 4px 16px; border-radius: 4px; }"
+            "QPushButton:enabled { background-color: #2980b9; color: white; font-weight: bold; }"
             "QPushButton:enabled:hover { background-color: #3498db; }"
         )
         self._btn_merge.clicked.connect(self._on_merge_clicked)
