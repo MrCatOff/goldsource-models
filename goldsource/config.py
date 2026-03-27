@@ -63,9 +63,6 @@ class AppConfig:
     sequence_renames: list[list[str]] = field(default_factory=list)
     output_model_name: str = ""
     output_directory: str = ""
-    # Master hands SMD for ID-preserving bone replacement during merge
-    hands_path: str = ""
-    hands_enabled: bool = False
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -104,8 +101,6 @@ class AppConfig:
             "sequence_renames": self.sequence_renames,
             "output_model_name": self.output_model_name,
             "output_directory": self.output_directory,
-            "hands_path": self.hands_path,
-            "hands_enabled": self.hands_enabled,
         }
 
     @classmethod
@@ -146,8 +141,6 @@ class AppConfig:
             sequence_renames=d.get("sequence_renames", []),
             output_model_name=d.get("output_model_name", ""),
             output_directory=d.get("output_directory", ""),
-            hands_path=d.get("hands_path", ""),
-            hands_enabled=d.get("hands_enabled", False),
         )
 
     def save(self, path: str | Path) -> None:

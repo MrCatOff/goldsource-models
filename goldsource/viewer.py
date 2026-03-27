@@ -54,6 +54,7 @@ except Exception:
 from PyQt6.QtWidgets import QMessageBox
 
 from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame
+from goldsource.qc import QC
 
 
 # ---------------------------------------------------------------------------
@@ -1311,16 +1312,38 @@ class ViewerPanel(QWidget):
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
 
+        # Update $attachment and $hbox bone names in the QC file if hands were applied.
+        qc_updated = False
+        if self._bone_map:
+            qc_files = list(Path(model_dir).glob("*.qc"))
+            for qc_path in qc_files:
+                try:
+                    qc = QC.from_file(str(qc_path))
+                    changed = False
+                    for att in qc.attachments:
+                        if att.bone in self._bone_map:
+                            att.bone = self._bone_map[att.bone]
+                            changed = True
+                    for hb in qc.hboxes:
+                        if hb.bone in self._bone_map:
+                            hb.bone = self._bone_map[hb.bone]
+                            changed = True
+                    if changed:
+                        qc.save(str(qc_path))
+                        qc_updated = True
+                except Exception as exc:
+                    errors.append(f"{qc_path.name}: {exc}")
+
         if errors:
             QMessageBox.warning(
                 self, "Save All",
                 f"Saved {saved}/{n} file(s). Errors:\n" + "\n".join(errors),
             )
         else:
-            QMessageBox.information(
-                self, "Save All",
-                f"Saved {saved} SMD file(s) to:\n{model_dir}",
-            )
+            msg = f"Saved {saved} SMD file(s) to:\n{model_dir}"
+            if qc_updated:
+                msg += "\n\nQC file updated ($attachment and $hbox bone names)."
+            QMessageBox.information(self, "Save All", msg)
 
     def _on_bone_hovered(self, name: str, x: float, y: float, z: float) -> None:
         self._info_label.setText(
