@@ -12,7 +12,7 @@ from pathlib import Path
 from PyQt6.QtCore import (
     Qt, QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot,
 )
-from PyQt6.QtGui import QAction, QDesktopServices
+from PyQt6.QtGui import QAction, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -2394,11 +2394,22 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _app_icon() -> QIcon:
+    """Return the application icon, resolving the path for both dev and PyInstaller."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+    for name in ("512x512.png", "1024x1024.png", "512x512.ico", "512x512.icns"):
+        p = base / "assets" / name
+        if p.exists():
+            return QIcon(str(p))
+    return QIcon()
+
+
 def run() -> None:
     """Launch the application."""
     app = QApplication(sys.argv)
     app.setApplicationName("GoldSource Model Merger")
     app.setStyle("Fusion")
+    app.setWindowIcon(_app_icon())
 
     window = MainWindow()
     window.show()

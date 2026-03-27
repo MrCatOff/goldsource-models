@@ -9,7 +9,7 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('assets', 'assets')],
     hiddenimports=[
         'PyQt6.QtOpenGL',
         'PyQt6.QtOpenGLWidgets',
