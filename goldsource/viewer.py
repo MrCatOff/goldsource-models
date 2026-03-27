@@ -18,12 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QCheckBox, QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QInputDialog, QFileDialog, QGroupBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView,
+    QTableWidgetItem, QAbstractItemView, QSlider,
 )
 
 try:
@@ -258,15 +258,15 @@ def _euler_mat4(rx: float, ry: float, rz: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def compute_world_transforms(smd: SMD) -> dict[int, np.ndarray]:
+def compute_world_transforms(smd: SMD, frame_idx: int = 0) -> dict[int, np.ndarray]:
     """
-    Returns {bone_id: 4×4 world-space transform} using skeleton frame 0.
+    Returns {bone_id: 4×4 world-space transform} for the given skeleton frame.
     The translation column ([:3, 3]) gives the world-space bone origin.
     """
     if not smd.skeleton:
         return {n.id: np.eye(4) for n in smd.nodes}
 
-    frame = smd.skeleton[0]
+    frame = smd.skeleton[min(frame_idx, len(smd.skeleton) - 1)]
     bt_map = {bt.bone_id: bt for bt in frame.bones}
     id_to_node = {n.id: n for n in smd.nodes}
     cache: dict[int, np.ndarray] = {}
@@ -305,7 +305,11 @@ if _GL_OK:
 
         def __init__(self, parent: QWidget | None = None) -> None:
             super().__init__(parent)
-            self._smd: SMD | None = None
+            self._smd:          SMD | None = None   # reference / texture SMD
+            self._anim_smd:     SMD | None = None   # animation SMD
+            self._frame_idx:    int        = 0
+            self._skinned_verts:    list | None = None  # per-frame skinned positions (flat)
+            self._skinned_mat_tris: dict | None = None  # per-frame skinned mat_tris for textured draw
 
             # Geometry
             self._verts:       list[tuple[float, float, float]] = []
@@ -340,10 +344,31 @@ if _GL_OK:
         # ── Public API ───────────────────────────────────────────────────
 
         def set_smd(self, smd: SMD | None) -> None:
+            """Set the reference (texture/mesh) SMD."""
             self._smd = smd
-            self._build_geometry()
+            self._anim_smd = None
+            self._skinned_verts = None
+            self._skinned_mat_tris = None
+            self._frame_idx = 0
+            self._build_mesh()
+            self._build_skeleton(0)
             self._auto_frame()
             self._tex_dirty = True
+            self.update()
+
+        def set_anim_smd(self, smd: SMD | None) -> None:
+            """Set the animation SMD to play over the reference mesh."""
+            self._anim_smd = smd
+            self._frame_idx = 0
+            self._build_skeleton(0)
+            self._compute_skinned_verts(0)
+            self.update()
+
+        def set_frame(self, idx: int) -> None:
+            """Seek to *idx* and redraw skeleton + skinned mesh."""
+            self._frame_idx = idx
+            self._build_skeleton(idx)
+            self._compute_skinned_verts(idx)
             self.update()
 
         def set_texture_dir(self, directory: str) -> None:
@@ -373,21 +398,19 @@ if _GL_OK:
 
         # ── Geometry ─────────────────────────────────────────────────────
 
-        def _build_geometry(self) -> None:
+        def _build_mesh(self) -> None:
+            """Build static mesh geometry (triangles). Call once per SMD load."""
             self._verts, self._tris = [], []
             self._mat_tris = {}
-            self._bone_pos, self._bone_lines = {}, []
 
             if self._smd is None:
                 return
 
-            # Mesh
             for tri in self._smd.triangles:
                 base = len(self._verts)
                 for v in (tri.v0, tri.v1, tri.v2):
                     self._verts.append((v.x, v.y, v.z))
                 self._tris.append((base, base + 1, base + 2))
-                # Also store UV-aware data grouped by material
                 mat = tri.material
                 if mat not in self._mat_tris:
                     self._mat_tris[mat] = []
@@ -397,13 +420,84 @@ if _GL_OK:
                     (tri.v2.x, tri.v2.y, tri.v2.z, tri.v2.u, tri.v2.v),
                 ))
 
-            # Skeleton
-            world = compute_world_transforms(self._smd)
-            for bid, mat in world.items():
-                self._bone_pos[bid] = (float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3]))
+        def _build_skeleton(self, frame_idx: int) -> None:
+            """
+            Recompute bone positions for *frame_idx*.
+            When an animation SMD is set, bones are positioned using the anim
+            transforms (matched to ref bones by name); otherwise uses the ref SMD.
+            """
+            self._bone_pos, self._bone_lines = {}, []
+
+            if self._smd is None:
+                return
+
+            if self._anim_smd is not None:
+                anim_world  = compute_world_transforms(self._anim_smd, frame_idx)
+                anim_by_name = {n.name: n.id for n in self._anim_smd.nodes}
+                ref_bind    = compute_world_transforms(self._smd, 0)
+                for ref_node in self._smd.nodes:
+                    anim_bid = anim_by_name.get(ref_node.name)
+                    mat = anim_world.get(anim_bid) if anim_bid is not None else None
+                    if mat is None:
+                        mat = ref_bind.get(ref_node.id, np.eye(4))
+                    self._bone_pos[ref_node.id] = (
+                        float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3])
+                    )
+            else:
+                world = compute_world_transforms(self._smd, frame_idx)
+                for bid, mat in world.items():
+                    self._bone_pos[bid] = (float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3]))
+
             for node in self._smd.nodes:
-                if node.parent_id != -1 and node.parent_id in world:
+                if node.parent_id != -1 and node.parent_id in self._bone_pos:
                     self._bone_lines.append((node.parent_id, node.id))
+
+        def _compute_skinned_verts(self, frame_idx: int) -> None:
+            """
+            Compute skinned vertex positions using linear blend skinning.
+            Stores result in *_skinned_verts* (same length as *_verts*).
+            When no animation SMD is set, clears *_skinned_verts* so the bind
+            pose *_verts* are used directly.
+            """
+            if self._smd is None or self._anim_smd is None:
+                self._skinned_verts = None
+                return
+
+            ref_world   = compute_world_transforms(self._smd, 0)
+            anim_world  = compute_world_transforms(self._anim_smd, frame_idx)
+            anim_by_name = {n.name: n.id for n in self._anim_smd.nodes}
+
+            # Per-ref-bone skinning matrix: M_anim @ inv(M_bind)
+            skin: dict[int, np.ndarray] = {}
+            for ref_node in self._smd.nodes:
+                M_bind = ref_world.get(ref_node.id, np.eye(4))
+                try:
+                    M_inv = np.linalg.inv(M_bind)
+                except np.linalg.LinAlgError:
+                    M_inv = np.eye(4)
+                anim_bid = anim_by_name.get(ref_node.name)
+                M_anim = anim_world.get(anim_bid, M_bind) if anim_bid is not None else M_bind
+                skin[ref_node.id] = M_anim @ M_inv
+
+            skinned: list[tuple[float, float, float]] = []
+            skinned_mat_tris: dict[str, list] = {}
+            for tri in self._smd.triangles:
+                verts_xyz = []
+                for v in (tri.v0, tri.v1, tri.v2):
+                    M = skin.get(v.bone_id, np.eye(4))
+                    p = M @ np.array([v.x, v.y, v.z, 1.0], dtype=np.float64)
+                    verts_xyz.append((float(p[0]), float(p[1]), float(p[2])))
+                    skinned.append(verts_xyz[-1])
+                mat = tri.material
+                if mat not in skinned_mat_tris:
+                    skinned_mat_tris[mat] = []
+                skinned_mat_tris[mat].append((
+                    (verts_xyz[0][0], verts_xyz[0][1], verts_xyz[0][2], tri.v0.u, tri.v0.v),
+                    (verts_xyz[1][0], verts_xyz[1][1], verts_xyz[1][2], tri.v1.u, tri.v1.v),
+                    (verts_xyz[2][0], verts_xyz[2][1], verts_xyz[2][2], tri.v2.u, tri.v2.v),
+                ))
+            self._skinned_verts    = skinned
+            self._skinned_mat_tris = skinned_mat_tris
 
         def _auto_frame(self) -> None:
             pts = list(self._verts) or list(self._bone_pos.values())
@@ -532,12 +626,17 @@ if _GL_OK:
             if not self._tris:
                 return
 
-            if self._show_textures and self._mat_tris:
+            active_mat_tris = (
+                self._skinned_mat_tris
+                if self._skinned_mat_tris is not None
+                else self._mat_tris
+            )
+            if self._show_textures and active_mat_tris:
                 if self._tex_dirty:
                     self._load_textures()
                     self._tex_dirty = False
                 glEnable(GL_TEXTURE_2D)
-                for mat, tris_data in self._mat_tris.items():
+                for mat, tris_data in active_mat_tris.items():
                     tid = self._textures.get(mat)
                     if tid:
                         glBindTexture(GL_TEXTURE_2D, tid)
@@ -554,12 +653,13 @@ if _GL_OK:
                 glBindTexture(GL_TEXTURE_2D, 0)
                 glDisable(GL_TEXTURE_2D)
             else:
+                active = self._skinned_verts if self._skinned_verts is not None else self._verts
                 # Solid fill (semi-transparent)
                 glColor4f(0.55, 0.65, 0.80, 0.20)
                 glBegin(GL_TRIANGLES)
                 for a, b, c in self._tris:
                     for idx in (a, b, c):
-                        x, y, z = self._verts[idx]
+                        x, y, z = active[idx]
                         glVertex3f(x, y, z)
                 glEnd()
                 # Wireframe overlay
@@ -568,8 +668,8 @@ if _GL_OK:
                 glBegin(GL_LINES)
                 for a, b, c in self._tris:
                     for u, v in ((a, b), (b, c), (c, a)):
-                        x1, y1, z1 = self._verts[u]
-                        x2, y2, z2 = self._verts[v]
+                        x1, y1, z1 = active[u]
+                        x2, y2, z2 = active[v]
                         glVertex3f(x1, y1, z1)
                         glVertex3f(x2, y2, z2)
                 glEnd()
@@ -737,9 +837,10 @@ class ViewerPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._models:  list  = []          # list[ModelInput]
-        self._dirs:    dict[str, str] = {}
-        self._cur_smd: SMD | None = None
+        self._models:       list  = []          # list[ModelInput]
+        self._dirs:         dict[str, str] = {}
+        self._cur_smd:      SMD | None = None   # reference SMD
+        self._cur_anim_smd: SMD | None = None   # animation SMD
         self._cur_model_name: str = ""
         # Recorded ops not yet propagated to all SMDs.
         # Each entry is {"type": "rename", "old": str, "new": str}
@@ -771,10 +872,15 @@ class ViewerPanel(QWidget):
         self._model_combo.currentIndexChanged.connect(self._on_model_changed)
         ll.addWidget(self._model_combo)
 
-        ll.addWidget(QLabel("SMD:"))
-        self._smd_combo = QComboBox()
-        self._smd_combo.currentIndexChanged.connect(self._on_smd_changed)
-        ll.addWidget(self._smd_combo)
+        ll.addWidget(QLabel("Reference SMD (mesh / textures):"))
+        self._ref_combo = QComboBox()
+        self._ref_combo.currentIndexChanged.connect(self._on_ref_changed)
+        ll.addWidget(self._ref_combo)
+
+        ll.addWidget(QLabel("Animation SMD:"))
+        self._anim_combo = QComboBox()
+        self._anim_combo.currentIndexChanged.connect(self._on_anim_combo_changed)
+        ll.addWidget(self._anim_combo)
 
         ll.addWidget(QLabel("Bones:"))
         self._tree = QTreeWidget()
@@ -897,9 +1003,40 @@ class ViewerPanel(QWidget):
         self._viewport.boneUnhovered.connect(self._on_bone_unhovered)
         rl.addWidget(self._viewport, 1)
 
+        # ── Animation playback bar (hidden for reference SMDs) ───────────
+        self._anim_bar = QWidget()
+        abl = QHBoxLayout(self._anim_bar)
+        abl.setContentsMargins(4, 2, 4, 2)
+        abl.setSpacing(4)
+
+        self._btn_play = QPushButton("▶")
+        self._btn_play.setFixedWidth(32)
+        self._btn_play.setToolTip("Play / Pause")
+        self._btn_play.clicked.connect(self._on_play_pause)
+        abl.addWidget(self._btn_play)
+
+        self._anim_slider = QSlider(Qt.Orientation.Horizontal)
+        self._anim_slider.setMinimum(0)
+        self._anim_slider.setValue(0)
+        self._anim_slider.valueChanged.connect(self._on_frame_slider)
+        abl.addWidget(self._anim_slider, 1)
+
+        self._anim_label = QLabel("0 / 0")
+        self._anim_label.setFixedWidth(70)
+        abl.addWidget(self._anim_label)
+
+        self._anim_bar.setVisible(False)
+        rl.addWidget(self._anim_bar)
+
         self._info_label = QLabel("  Left-drag: orbit   Right-drag: pan   Scroll: zoom   Hover bone to inspect")
         self._info_label.setStyleSheet("color: #888; padding: 3px 6px; font-size: 11px;")
         rl.addWidget(self._info_label)
+
+        # Playback timer
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(33)   # ~30 fps
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+        self._anim_playing = False
 
         splitter.addWidget(right)
         splitter.setSizes([260, 700])
@@ -925,25 +1062,38 @@ class ViewerPanel(QWidget):
     # ── Slots ─────────────────────────────────────────────────────────────
 
     def _on_model_changed(self) -> None:
+        self._anim_timer.stop()
+        self._anim_playing = False
+        self._btn_play.setText("▶")
         name = self._model_combo.currentText()
         self._cur_model_name = name
         self._pending_ops.clear()
         self._update_apply_button()
         model = next((m for m in self._models if m.name == name), None)
+        keys  = sorted(model.smds.keys()) if model else []
 
-        prev = self._smd_combo.currentText()
-        self._smd_combo.blockSignals(True)
-        self._smd_combo.clear()
-        if model:
-            for key in sorted(model.smds.keys()):
-                self._smd_combo.addItem(key)
-        idx = self._smd_combo.findText(prev)
-        self._smd_combo.setCurrentIndex(max(0, idx))
-        self._smd_combo.blockSignals(False)
-        self._on_smd_changed()
+        prev_ref  = self._ref_combo.currentText()
+        prev_anim = self._anim_combo.currentText()
 
-    def _on_smd_changed(self) -> None:
-        key   = self._smd_combo.currentText()
+        self._ref_combo.blockSignals(True)
+        self._anim_combo.blockSignals(True)
+        self._ref_combo.clear()
+        self._anim_combo.clear()
+        self._anim_combo.addItem("(none)")
+        for key in keys:
+            self._ref_combo.addItem(key)
+            self._anim_combo.addItem(key)
+        self._ref_combo.setCurrentIndex(max(0, self._ref_combo.findText(prev_ref)))
+        anim_idx = self._anim_combo.findText(prev_anim)
+        self._anim_combo.setCurrentIndex(max(0, anim_idx))
+        self._ref_combo.blockSignals(False)
+        self._anim_combo.blockSignals(False)
+
+        self._on_ref_changed()
+
+    def _on_ref_changed(self) -> None:
+        """Called when the reference (mesh/texture) SMD selection changes."""
+        key   = self._ref_combo.currentText()
         model = next((m for m in self._models if m.name == self._cur_model_name), None)
         self._cur_smd = model.smds.get(key) if model else None
         self._rebuild_tree()
@@ -952,6 +1102,68 @@ class ViewerPanel(QWidget):
         self._viewport.set_texture_dir(tex_dir)
         self._btn_export.setEnabled(self._cur_smd is not None)
         self._rebuild_hands_tree()
+        # Re-apply the current animation selection on top of the new ref SMD
+        self._on_anim_combo_changed()
+
+    def _on_anim_combo_changed(self) -> None:
+        """Called when the animation SMD selection changes."""
+        self._anim_timer.stop()
+        self._anim_playing = False
+        self._btn_play.setText("▶")
+
+        key   = self._anim_combo.currentText()
+        model = next((m for m in self._models if m.name == self._cur_model_name), None)
+        self._cur_anim_smd = (
+            model.smds.get(key) if model and key != "(none)" else None
+        )
+        self._viewport.set_anim_smd(self._cur_anim_smd)
+        self._setup_anim_bar()
+
+    def _setup_anim_bar(self) -> None:
+        """Show / hide the animation playback bar based on the animation SMD."""
+        smd      = self._cur_anim_smd
+        n_frames = len(smd.skeleton) if smd else 0
+        is_anim  = n_frames > 1
+
+        self._anim_bar.setVisible(is_anim)
+        if is_anim:
+            self._anim_slider.blockSignals(True)
+            self._anim_slider.setMaximum(n_frames - 1)
+            self._anim_slider.setValue(0)
+            self._anim_slider.blockSignals(False)
+            self._anim_label.setText(f"0 / {n_frames - 1}")
+
+    def _on_play_pause(self) -> None:
+        if self._cur_smd is None:
+            return
+        self._anim_playing = not self._anim_playing
+        if self._anim_playing:
+            self._btn_play.setText("⏸")
+            self._anim_timer.start()
+        else:
+            self._btn_play.setText("▶")
+            self._anim_timer.stop()
+
+    def _on_anim_tick(self) -> None:
+        smd = self._cur_anim_smd
+        if smd is None:
+            return
+        n_frames = len(smd.skeleton)
+        cur = self._anim_slider.value()
+        nxt = (cur + 1) % n_frames
+        self._anim_slider.blockSignals(True)
+        self._anim_slider.setValue(nxt)
+        self._anim_slider.blockSignals(False)
+        self._anim_label.setText(f"{nxt} / {n_frames - 1}")
+        self._viewport.set_frame(nxt)
+
+    def _on_frame_slider(self, value: int) -> None:
+        smd = self._cur_anim_smd
+        if smd is None:
+            return
+        n_frames = len(smd.skeleton)
+        self._anim_label.setText(f"{value} / {n_frames - 1}")
+        self._viewport.set_frame(value)
 
     def _on_mesh_toggled(self, checked: bool) -> None:
         self._viewport.set_mesh_visible(checked)
@@ -1022,7 +1234,7 @@ class ViewerPanel(QWidget):
         if ans != QMessageBox.StandardButton.Yes:
             return
 
-        cur_key = self._smd_combo.currentText()
+        cur_key = self._ref_combo.currentText()
         applied = 0
         for key, smd in model.smds.items():
             if key == cur_key:
@@ -1056,7 +1268,7 @@ class ViewerPanel(QWidget):
     def _on_export_clicked(self) -> None:
         if self._cur_smd is None:
             return
-        smd_key = self._smd_combo.currentText()
+        smd_key = self._ref_combo.currentText()
         model_dir = self._dirs.get(self._cur_model_name, "")
         if not model_dir:
             QMessageBox.warning(self, "Export SMD", "Model directory is unknown.")
@@ -1339,7 +1551,7 @@ class ViewerPanel(QWidget):
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
 
-        self._on_smd_changed()
+        self._on_ref_changed()
         self._pending_ops.clear()
         self._update_apply_button()
         self.bonesRenamed.emit()
