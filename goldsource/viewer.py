@@ -14,6 +14,8 @@ Provides:
 from __future__ import annotations
 
 import math
+import re
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -54,7 +56,7 @@ except Exception:
 from PyQt6.QtWidgets import QMessageBox
 
 from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame
-from goldsource.qc import QC
+from goldsource.qc import QC, BodyGroup, BodyGroupEntry
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +233,108 @@ def _apply_hand_replacement(
     result.nodes     = new_nodes
     result.skeleton  = new_frames
     result.triangles = new_triangles
+    return result
+
+
+def _build_hands_body_smd(
+    hands_smd: SMD,
+    weapon_ref_smd: SMD,
+    bone_map: dict[str, str],   # weapon_name → hand_name
+) -> SMD:
+    """
+    Build a combined reference SMD suitable for a '$bodygroup hands' entry.
+
+    The result contains:
+    - The hand mesh triangles from *hands_smd*
+    - Hand bone nodes + bind-pose skeleton from *hands_smd*
+    - Weapon-specific bones (those not in *bone_map*) appended with the same
+      new IDs that _apply_hand_replacement would assign, and bind-pose
+      transforms taken from *weapon_ref_smd* frame 0.
+
+    This ensures the compiler sees a consistent bone hierarchy across all
+    SMDs in the merged model.
+    """
+    import copy
+
+    hand_by_name = {n.name: n for n in hands_smd.nodes}
+    max_hand_id  = max((n.id for n in hands_smd.nodes), default=-1)
+
+    # Map weapon-bone old-ID → new-ID for the matched (hand) bones
+    old_to_new: dict[int, int] = {}
+    for wp_name, hp_name in bone_map.items():
+        wp_node = next((n for n in weapon_ref_smd.nodes if n.name == wp_name), None)
+        hp_node = hand_by_name.get(hp_name)
+        if wp_node and hp_node:
+            old_to_new[wp_node.id] = hp_node.id
+
+    # Topological sort of weapon-specific bones
+    weapon_specific = [n for n in weapon_ref_smd.nodes if n.name not in bone_map]
+    wp_by_old       = {n.id: n for n in weapon_specific}
+    weapon_ordered: list[Node] = []
+    visited: set[int] = set()
+
+    def _visit(n: Node) -> None:
+        if n.id in visited:
+            return
+        visited.add(n.id)
+        if n.parent_id in wp_by_old:
+            _visit(wp_by_old[n.parent_id])
+        weapon_ordered.append(n)
+
+    for n in weapon_specific:
+        _visit(n)
+
+    next_id = max_hand_id + 1
+    for n in weapon_ordered:
+        old_to_new[n.id] = next_id
+        next_id += 1
+
+    # ── Nodes: hand bones first, weapon-specific after ────────────────
+    new_nodes: list[Node] = [
+        Node(id=hn.id, name=hn.name, parent_id=hn.parent_id)
+        for hn in hands_smd.nodes
+    ]
+    for n in weapon_ordered:
+        new_parent = old_to_new.get(n.parent_id, -1) if n.parent_id != -1 else -1
+        new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
+
+    # ── Skeleton frame 0 ─────────────────────────────────────────────
+    hand_bt  = {bt.bone_id: bt for bt in hands_smd.skeleton[0].bones} \
+               if hands_smd.skeleton else {}
+    wp_bt    = {bt.bone_id: bt for bt in weapon_ref_smd.skeleton[0].bones} \
+               if weapon_ref_smd.skeleton else {}
+
+    new_bones: list[BoneTransform] = []
+    for hn in hands_smd.nodes:
+        bt = hand_bt.get(hn.id)
+        if bt:
+            new_bones.append(BoneTransform(
+                bone_id=hn.id,
+                tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                rx=bt.rx, ry=bt.ry, rz=bt.rz,
+            ))
+        else:
+            new_bones.append(BoneTransform(
+                bone_id=hn.id, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0,
+            ))
+    for n in weapon_ordered:
+        bt = wp_bt.get(n.id)
+        nid = old_to_new[n.id]
+        if bt:
+            new_bones.append(BoneTransform(
+                bone_id=nid,
+                tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                rx=bt.rx, ry=bt.ry, rz=bt.rz,
+            ))
+        else:
+            new_bones.append(BoneTransform(
+                bone_id=nid, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0,
+            ))
+
+    result           = copy.copy(hands_smd)
+    result.nodes     = new_nodes
+    result.skeleton  = [SkeletonFrame(time=0, bones=new_bones)]
+    result.triangles = list(hands_smd.triangles)
     return result
 
 
@@ -1239,6 +1343,7 @@ class ViewerPanel(QWidget):
     """
 
     bonesRenamed = pyqtSignal()
+    qcModified   = pyqtSignal(str)   # model_name whose QC was changed on disk
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1647,12 +1752,17 @@ class ViewerPanel(QWidget):
         summary = "\n".join(lines)
         other_count = len(model.smds) - 1  # current SMD already has the changes
 
-        ans = QMessageBox.question(
-            self, "Apply to All SMDs",
+        mb = QMessageBox(self)
+        mb.setWindowTitle("Apply to All SMDs")
+        mb.setText(
             f"Apply {len(self._pending_ops)} pending change(s) to the other "
-            f"{other_count} SMD(s) in '{self._cur_model_name}'?\n\n{summary}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            f"{other_count} SMD(s) in '{self._cur_model_name}'?"
         )
+        mb.setDetailedText(summary)
+        mb.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        ans = mb.exec()
         if ans != QMessageBox.StandardButton.Yes:
             return
 
@@ -1753,10 +1863,12 @@ class ViewerPanel(QWidget):
                     errors.append(f"{qc_path.name}: {exc}")
 
         if errors:
-            QMessageBox.warning(
-                self, "Save All",
-                f"Saved {saved}/{n} file(s). Errors:\n" + "\n".join(errors),
-            )
+            mb = QMessageBox(self)
+            mb.setWindowTitle("Save All")
+            mb.setIcon(QMessageBox.Icon.Warning)
+            mb.setText(f"Saved {saved}/{n} file(s). {len(errors)} error(s) occurred.")
+            mb.setDetailedText("\n".join(errors))
+            mb.exec()
         else:
             msg = f"Saved {saved} SMD file(s) to:\n{model_dir}"
             if qc_updated:
@@ -2031,18 +2143,35 @@ class ViewerPanel(QWidget):
         if model is None:
             return
 
-        n_smds  = len(model.smds)
-        matched = len(self._bone_map)
-        ans = QMessageBox.question(
-            self,
-            "Apply Reference Hands",
+        # Capture original reference SMD BEFORE any modification
+        original_ref_smd = self._cur_smd
+
+        n_smds     = len(model.smds)
+        matched    = len(self._bone_map)
+        model_dir  = self._dirs.get(self._cur_model_name, "")
+
+        mb = QMessageBox(self)
+        mb.setWindowTitle("Apply Reference Hands")
+        mb.setText(
             f"Replace {matched} hand bone(s) across all {n_smds} SMD(s) in "
-            f"'{self._cur_model_name}'?\n\n"
-            "Weapon-specific bones will be renumbered to IDs above the last "
-            "hand bone ID.\n\n"
-            "This modifies the in-memory SMDs. Use 'Export SMD' to save them.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            f"'{self._cur_model_name}'?"
         )
+        mb.setInformativeText(
+            "Weapon SMDs are updated in memory — use 'Save All' to write them.\n"
+            "The model directory will also be updated on disk (see details)."
+        )
+        mb.setDetailedText(
+            "Weapon-specific bones will be renumbered to IDs above the last hand bone ID.\n\n"
+            "Disk operations:\n"
+            "  • Hands SMD (with weapon bones) copied to model directory\n"
+            "  • Hand textures copied to model directory\n"
+            "  • 'hand*' bodygroup(s) removed from QC + old SMD/texture files deleted\n"
+            "  • New 'hands' bodygroup added to QC"
+        )
+        mb.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        ans = mb.exec()
         if ans != QMessageBox.StandardButton.Yes:
             return
 
@@ -2055,19 +2184,129 @@ class ViewerPanel(QWidget):
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
 
+        # Post-apply file operations (only when no per-SMD errors)
+        disk_msg    = ""
+        qc_modified = False
+        if model_dir and original_ref_smd is not None and not errors:
+            try:
+                disk_msg    = self._post_apply_hands(model_dir, original_ref_smd)
+                qc_modified = True
+            except Exception as exc:
+                errors.append(f"Post-apply disk ops: {exc}")
+
         self._on_ref_changed()
         self._pending_ops.clear()
         self._update_apply_button()
         self.bonesRenamed.emit()
+        if qc_modified:
+            self.qcModified.emit(self._cur_model_name)
 
         if errors:
-            QMessageBox.warning(
-                self, "Apply Hands — Errors",
-                "Some SMDs could not be updated:\n" + "\n".join(errors),
-            )
+            mb = QMessageBox(self)
+            mb.setWindowTitle("Apply Hands — Errors")
+            mb.setIcon(QMessageBox.Icon.Warning)
+            mb.setText(f"{len(errors)} error(s) occurred.")
+            mb.setDetailedText("\n".join(errors))
+            mb.exec()
         else:
-            QMessageBox.information(
-                self, "Apply Hands",
-                f"Done. {n_smds} SMD(s) updated in memory.\n"
-                "Use 'Export SMD' to write changes to disk.",
+            mb = QMessageBox(self)
+            mb.setWindowTitle("Apply Hands")
+            mb.setIcon(QMessageBox.Icon.Information)
+            mb.setText(f"Done. {n_smds} SMD(s) updated in memory.")
+            mb.setInformativeText("Use 'Save All' to write the modified weapon SMDs to disk.")
+            if disk_msg:
+                mb.setDetailedText(disk_msg)
+            mb.exec()
+
+    def _post_apply_hands(self, model_dir: str, original_ref_smd: SMD) -> str:
+        """
+        Perform disk-side operations after hand replacement:
+        1. Build and write combined hands body SMD to model directory
+        2. Copy hand mesh textures to model directory
+        3. Update QC: remove 'hand*' bodygroups (deleting their files),
+           add new 'hands' bodygroup
+        Returns a short summary string.
+        """
+        model_path  = Path(model_dir)
+        hands_path  = Path(self._hands_path)
+        hands_stem  = hands_path.stem        # e.g. "male", "default"
+        hands_dir   = hands_path.parent
+
+        # 1. Build combined hands body SMD and save
+        hands_body     = _build_hands_body_smd(
+            self._hands_smd, original_ref_smd, self._bone_map
+        )
+        dest_smd_path  = model_path / f"{hands_stem}.smd"
+        hands_body.save(dest_smd_path)
+
+        # 2. Copy hand textures (BMP files used by the hands mesh)
+        hand_mats = {Path(tri.material).name for tri in self._hands_smd.triangles}
+        tex_copied: list[str] = []
+        for mat_name in hand_mats:
+            stem = Path(mat_name).stem
+            for candidate in [mat_name, stem + ".bmp", stem + ".BMP"]:
+                src = hands_dir / candidate
+                if src.exists():
+                    dest = model_path / candidate
+                    if not dest.exists() or src.read_bytes() != dest.read_bytes():
+                        shutil.copy2(str(src), str(dest))
+                        tex_copied.append(candidate)
+                    break
+
+        # 3. Update QC
+        qc_files = list(model_path.glob("*.qc"))
+        if not qc_files:
+            return (
+                f"Hands SMD written: {dest_smd_path.name}\n"
+                f"Textures copied: {len(tex_copied)}\n"
+                "No QC file found in model directory."
             )
+
+        qc_path = qc_files[0]
+        qc      = QC.from_file(str(qc_path))
+
+        _HAND_RE = re.compile(r'^hands?$', re.IGNORECASE)
+        old_bgs  = [bg for bg in qc.bodygroups if _HAND_RE.match(bg.name)]
+
+        deleted_smds: list[str] = []
+        deleted_texs: list[str] = []
+
+        for bg in old_bgs:
+            for entry in bg.entries:
+                if not entry.smd:
+                    continue
+                old_smd_path = model_path / f"{entry.smd}.smd"
+                if old_smd_path.exists():
+                    # Collect textures before deleting
+                    try:
+                        old_smd = SMD.from_file(str(old_smd_path))
+                        for tri in old_smd.triangles:
+                            tex_stem = Path(tri.material).stem
+                            for fname in [tri.material, tex_stem + ".bmp", tex_stem + ".BMP"]:
+                                tex_p = model_path / Path(fname).name
+                                if tex_p.exists():
+                                    tex_p.unlink()
+                                    deleted_texs.append(tex_p.name)
+                    except Exception:
+                        pass
+                    old_smd_path.unlink()
+                    deleted_smds.append(old_smd_path.name)
+
+        # Remove old hand bodygroups, append new one
+        qc.bodygroups = [bg for bg in qc.bodygroups if not _HAND_RE.match(bg.name)]
+        qc.bodygroups.append(BodyGroup(
+            name="hands",
+            entries=[BodyGroupEntry(smd=hands_stem)],
+        ))
+        qc.save(str(qc_path))
+
+        lines = [
+            f"Hands SMD written: {dest_smd_path.name}",
+            f"Textures copied:   {', '.join(tex_copied) if tex_copied else 'none'}",
+            f"QC updated ({qc_path.name}):",
+            f"  Removed bodygroup(s): {[bg.name for bg in old_bgs] or 'none'}",
+            f"  Deleted SMDs:  {deleted_smds or 'none'}",
+            f"  Deleted textures: {deleted_texs or 'none'}",
+            f"  Added bodygroup 'hands' → {hands_stem}.smd",
+        ]
+        return "\n".join(lines)

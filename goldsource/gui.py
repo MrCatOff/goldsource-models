@@ -1489,6 +1489,11 @@ class _QCEditorPanel(QWidget):
         )
         self.qcSaved.emit(self._cur_model)
 
+    def reload_model(self, name: str) -> None:
+        """Force-reload the QC for *name* if it is the currently selected model."""
+        if self._model_combo.currentText() == name:
+            self._on_model_changed(name)
+
 
 # ---------------------------------------------------------------------------
 # SMD Editor panel
@@ -1895,6 +1900,7 @@ class MainWindow(QMainWindow):
         self._output_panel.analyzeRequested.connect(self._run_analysis)
         self._output_panel.mergeRequested.connect(self._on_merge_requested)
         self._viewer_panel.bonesRenamed.connect(self._on_bones_renamed)
+        self._viewer_panel.qcModified.connect(self._qc_editor.reload_model)
         self._qc_editor.qcSaved.connect(self._on_qc_saved)
 
         self.statusBar().showMessage("Ready. Add decompiled model directories to begin.")
