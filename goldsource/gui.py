@@ -1497,6 +1497,70 @@ class _QCEditorPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Triangle edit dialog
+# ---------------------------------------------------------------------------
+
+class _TriangleEditDialog(QDialog):
+    """Dialog for editing a single SMD triangle's material and vertices."""
+
+    _VERTEX_COLS = ["bone_id", "x", "y", "z", "nx", "ny", "nz", "u", "v"]
+
+    def __init__(self, tri, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Triangle")
+        self.setMinimumWidth(640)
+        self._tri = tri          # Triangle dataclass (mutated on accept)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Material
+        mat_row = QHBoxLayout()
+        mat_row.addWidget(QLabel("Material:"))
+        self._mat_edit = QLineEdit(self._tri.material)
+        mat_row.addWidget(self._mat_edit, 1)
+        layout.addLayout(mat_row)
+
+        # Vertex table
+        self._table = QTableWidget(3, len(self._VERTEX_COLS))
+        self._table.setHorizontalHeaderLabels(self._VERTEX_COLS)
+        self._table.setVerticalHeaderLabels(["v0", "v1", "v2"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+
+        for row, vtx in enumerate([self._tri.v0, self._tri.v1, self._tri.v2]):
+            for col, field in enumerate(self._VERTEX_COLS):
+                val = getattr(vtx, field)
+                self._table.setItem(row, col, QTableWidgetItem(str(val)))
+
+        layout.addWidget(self._table)
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _on_accept(self) -> None:
+        self._tri.material = self._mat_edit.text().strip()
+        for row, vtx in enumerate([self._tri.v0, self._tri.v1, self._tri.v2]):
+            for col, field in enumerate(self._VERTEX_COLS):
+                item = self._table.item(row, col)
+                text = item.text().strip() if item else "0"
+                try:
+                    if field == "bone_id":
+                        setattr(vtx, field, int(text))
+                    else:
+                        setattr(vtx, field, float(text))
+                except ValueError:
+                    pass  # keep original value on parse error
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # SMD Editor panel
 # ---------------------------------------------------------------------------
 
@@ -1537,9 +1601,41 @@ class _SMDEditorPanel(QWidget):
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
+        # ── Texture override row ──────────────────────────────────────────
+        tex_row = QHBoxLayout()
+        tex_row.addWidget(QLabel("Override texture:"))
+
+        self._orig_mat_combo = QComboBox()
+        self._orig_mat_combo.setMinimumWidth(160)
+        self._orig_mat_combo.setPlaceholderText("(original material)")
+        tex_row.addWidget(self._orig_mat_combo)
+
+        tex_row.addWidget(QLabel("→"))
+
+        self._override_path_edit = QLineEdit()
+        self._override_path_edit.setReadOnly(True)
+        self._override_path_edit.setPlaceholderText("Browse for replacement image…")
+        self._override_path_edit.setMinimumWidth(180)
+        tex_row.addWidget(self._override_path_edit, 1)
+
+        btn_browse_tex = QPushButton("Browse…")
+        btn_browse_tex.clicked.connect(self._on_browse_override_tex)
+        tex_row.addWidget(btn_browse_tex)
+
+        btn_apply_tex = QPushButton("Apply")
+        btn_apply_tex.clicked.connect(self._on_apply_tex_override)
+        tex_row.addWidget(btn_apply_tex)
+
+        btn_clear_tex = QPushButton("Clear All")
+        btn_clear_tex.clicked.connect(self._on_clear_tex_overrides)
+        tex_row.addWidget(btn_clear_tex)
+
+        layout.addLayout(tex_row)
+
         # ── Viewport ─────────────────────────────────────────────────────
         self._viewport = _SMDEditorViewport()
         self._viewport.triangleSelected.connect(self._on_triangle_selected)
+        self._viewport.triangleDoubleClicked.connect(self._on_triangle_double_clicked)
         layout.addWidget(self._viewport, 1)
 
         # ── Info bar ─────────────────────────────────────────────────────
@@ -1577,6 +1673,7 @@ class _SMDEditorPanel(QWidget):
         # Clear viewport — user selects SMD explicitly to avoid blocking the UI
         self._cur_smd = None
         self._viewport.set_smd(None)
+        self._orig_mat_combo.clear()
         count = self._smd_combo.count()
         self._info_label.setText(
             f"{count} SMD file(s) found. Select one from the dropdown above."
@@ -1585,6 +1682,7 @@ class _SMDEditorPanel(QWidget):
 
     def _on_smd_changed(self, index: int) -> None:
         self._cur_smd = None
+        self._orig_mat_combo.clear()
         if index < 0 or self._smd_combo.count() == 0:
             self._viewport.set_smd(None)
             self._info_label.setText("No SMD selected.")
@@ -1604,10 +1702,12 @@ class _SMDEditorPanel(QWidget):
             self._cur_smd = smd
             tex_dir = str(Path(path).parent)
             self._viewport.set_smd(smd, tex_dir)
+            # Populate material override combo
+            self._orig_mat_combo.addItems(self._viewport.materials())
             self._info_label.setText(
                 f"Loaded {len(smd.triangles)} triangles. "
                 "Left-drag to orbit  |  Right-drag to pan  |  Scroll to zoom  |  "
-                "Click to select a triangle."
+                "Click to select  |  Double-click to edit."
             )
         except Exception as exc:
             self._viewport.set_smd(None)
@@ -1616,8 +1716,30 @@ class _SMDEditorPanel(QWidget):
     def _on_textures_toggled(self, checked: bool) -> None:
         self._viewport.set_textures_visible(checked)
 
+    def _on_browse_override_tex(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select replacement texture",
+            "",
+            "Images (*.bmp *.png *.jpg *.jpeg *.tga);;All files (*)",
+        )
+        if path:
+            self._override_path_edit.setText(path)
+
+    def _on_apply_tex_override(self) -> None:
+        orig = self._orig_mat_combo.currentText()
+        path = self._override_path_edit.text().strip()
+        if not orig or not path:
+            return
+        self._viewport.set_tex_override(orig, path)
+        # Make sure textures are shown
+        if not self._chk_tex.isChecked():
+            self._chk_tex.setChecked(True)
+
+    def _on_clear_tex_overrides(self) -> None:
+        self._viewport.clear_all_tex_overrides()
+        self._override_path_edit.clear()
+
     def _on_triangle_selected(self, idx: int) -> None:
-        from goldsource.smd import SMD as _SMD
         if self._cur_smd is None:
             return
         smd = self._cur_smd  # type: ignore[assignment]
@@ -1631,6 +1753,18 @@ class _SMDEditorPanel(QWidget):
             f"V1 ({v1.x:.3f}, {v1.y:.3f}, {v1.z:.3f})  "
             f"V2 ({v2.x:.3f}, {v2.y:.3f}, {v2.z:.3f})"
         )
+
+    def _on_triangle_double_clicked(self, idx: int) -> None:
+        if self._cur_smd is None:
+            return
+        smd = self._cur_smd  # type: ignore[assignment]
+        if idx >= len(smd.triangles):
+            return
+        dlg = _TriangleEditDialog(smd.triangles[idx], parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Triangle was mutated in-place; rebuild viewport geometry
+            self._viewport.rebuild_from_smd()
+            self._on_triangle_selected(idx)
 
 
 class _HistoryPanel(QWidget):

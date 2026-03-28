@@ -929,7 +929,8 @@ if _GL_OK:
     class _SMDEditorViewport(QOpenGLWidget):
         """Orbit 3-D viewport for the SMD Editor — triangle picking and highlight."""
 
-        triangleSelected = pyqtSignal(int)  # emits SMD triangle index
+        triangleSelected       = pyqtSignal(int)  # emits SMD triangle index
+        triangleDoubleClicked  = pyqtSignal(int)  # emits SMD triangle index
 
         def __init__(self, parent: QWidget | None = None) -> None:
             super().__init__(parent)
@@ -938,6 +939,7 @@ if _GL_OK:
             # [{idx, mat, v: [(x,y,z,u,v)×3]}]
             self._tris_data:    list       = []
             self._textures:     dict[str, int] = {}
+            self._tex_overrides: dict[str, str] = {}  # orig_mat → file_path
             self._tex_dirty:    bool       = True
             self._show_textures: bool      = False
             self._selected_tri: int | None = None
@@ -959,6 +961,7 @@ if _GL_OK:
             self._selected_tri = None
             self._tris_data    = []
             self._tex_dirty    = True
+            self._tex_overrides.clear()
             self._free_textures()
             if smd:
                 self._build_tris()
@@ -973,6 +976,35 @@ if _GL_OK:
 
         def set_selected(self, tri_idx: int | None) -> None:
             self._selected_tri = tri_idx
+            self.update()
+
+        def set_tex_override(self, orig_mat: str, file_path: str) -> None:
+            """Display *file_path* wherever *orig_mat* is used."""
+            self._tex_overrides[orig_mat] = file_path
+            self._tex_dirty = True
+            self.update()
+
+        def clear_tex_override(self, orig_mat: str) -> None:
+            self._tex_overrides.pop(orig_mat, None)
+            self._tex_dirty = True
+            self.update()
+
+        def clear_all_tex_overrides(self) -> None:
+            self._tex_overrides.clear()
+            self._tex_dirty = True
+            self.update()
+
+        def materials(self) -> list[str]:
+            """Return a sorted, deduplicated list of material names in the current SMD."""
+            return sorted({d['mat'] for d in self._tris_data})
+
+        def rebuild_from_smd(self) -> None:
+            """Re-read triangle geometry from the current SMD (call after editing)."""
+            self._tris_data = []
+            self._tex_dirty = True
+            if self._smd:
+                self._build_tris()
+                self._auto_frame()
             self.update()
 
         # ── Geometry ─────────────────────────────────────────────────────
@@ -1022,26 +1054,20 @@ if _GL_OK:
 
         def _load_textures(self) -> None:
             self._free_textures()
-            if not self._tex_dir or not self._tris_data:
+            if not self._tris_data:
                 return
             try:
                 from PIL import Image
             except ImportError:
                 return
-            tex_dir = Path(self._tex_dir)
-            if not tex_dir.is_dir():
-                return
+
+            tex_dir = Path(self._tex_dir) if self._tex_dir else None
             dir_files: dict[str, Path] = {}
-            for f in tex_dir.iterdir():
-                dir_files[f.name.lower()] = f
-            mats = {d['mat'] for d in self._tris_data}
-            for mat in mats:
-                fname = Path(mat).name
-                if not fname.lower().endswith(".bmp"):
-                    fname = fname + ".bmp"
-                fpath = dir_files.get(fname.lower())
-                if fpath is None:
-                    continue
+            if tex_dir and tex_dir.is_dir():
+                for f in tex_dir.iterdir():
+                    dir_files[f.name.lower()] = f
+
+            def _load_img(fpath: Path) -> int | None:
                 try:
                     img  = Image.open(fpath).convert("RGBA")
                     img  = img.transpose(Image.FLIP_TOP_BOTTOM)
@@ -1054,9 +1080,29 @@ if _GL_OK:
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                                  GL_RGBA, GL_UNSIGNED_BYTE, data)
                     glBindTexture(GL_TEXTURE_2D, 0)
-                    self._textures[mat] = tid
+                    return tid
                 except Exception:
-                    pass
+                    return None
+
+            mats = {d['mat'] for d in self._tris_data}
+            for mat in mats:
+                # Check for a user-specified override first
+                override = self._tex_overrides.get(mat)
+                if override:
+                    tid = _load_img(Path(override))
+                    if tid is not None:
+                        self._textures[mat] = tid
+                    continue
+                # Fall back to auto-discovery in tex_dir
+                fname = Path(mat).name
+                if not fname.lower().endswith(".bmp"):
+                    fname = fname + ".bmp"
+                fpath = dir_files.get(fname.lower())
+                if fpath is None:
+                    continue
+                tid = _load_img(fpath)
+                if tid is not None:
+                    self._textures[mat] = tid
 
         # ── OpenGL callbacks ─────────────────────────────────────────────
 
@@ -1195,6 +1241,14 @@ if _GL_OK:
             self._last_mouse = event.pos()
             self._drag_btn   = event.button()
 
+        def mouseDoubleClickEvent(self, event) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                idx = self._pick_triangle(event.pos().x(), event.pos().y())
+                if idx is not None:
+                    self._selected_tri = idx
+                    self.triangleDoubleClicked.emit(idx)
+                    self.update()
+
         def mouseReleaseEvent(self, event) -> None:
             self._last_mouse = None
             self._drag_btn   = None
@@ -1312,7 +1366,8 @@ if _GL_OK:
 
 else:
     class _SMDEditorViewport(QLabel):  # type: ignore[no-redef]
-        triangleSelected = pyqtSignal(int)
+        triangleSelected      = pyqtSignal(int)
+        triangleDoubleClicked = pyqtSignal(int)
 
         def __init__(self, parent: QWidget | None = None) -> None:
             super().__init__(
@@ -1325,6 +1380,21 @@ else:
             pass
 
         def set_textures_visible(self, visible: bool) -> None:
+            pass
+
+        def set_tex_override(self, orig_mat: str, file_path: str) -> None:
+            pass
+
+        def clear_tex_override(self, orig_mat: str) -> None:
+            pass
+
+        def clear_all_tex_overrides(self) -> None:
+            pass
+
+        def materials(self) -> list[str]:
+            return []
+
+        def rebuild_from_smd(self) -> None:
             pass
 
         def set_selected(self, tri_idx: int | None) -> None:
