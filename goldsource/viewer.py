@@ -63,13 +63,40 @@ from goldsource.qc import QC, BodyGroup, BodyGroupEntry
 # Bone-editing helpers (operate on SMD in-place)
 # ---------------------------------------------------------------------------
 
+def _collect_descendants(smd: SMD, bone_name: str) -> list[str]:
+    """
+    Return all descendant bone names of *bone_name* in leaf-first order
+    (so that deleting them in sequence is safe).
+    """
+    name_to_id  = {n.name: n.id for n in smd.nodes}
+    id_to_name  = {n.id: n.name for n in smd.nodes}
+    children_of: dict[int, list[int]] = {}
+    for n in smd.nodes:
+        children_of.setdefault(n.parent_id, []).append(n.id)
+
+    root_id = name_to_id.get(bone_name)
+    if root_id is None:
+        return []
+
+    # BFS to collect all descendants (excluding the root itself)
+    result_ids: list[int] = []
+    queue = list(children_of.get(root_id, []))
+    while queue:
+        bid = queue.pop(0)
+        result_ids.append(bid)
+        queue.extend(children_of.get(bid, []))
+
+    # Reverse so leaves come first
+    result_ids.reverse()
+    return [id_to_name[i] for i in result_ids if i in id_to_name]
+
+
 def _delete_bone(smd: SMD, bone_name: str) -> bool:
     """
     Remove the bone with *bone_name* from *smd* in-place.
 
+    - Triangles that have any vertex referencing the bone are removed.
     - Child bones are re-parented to the deleted bone's parent.
-    - Vertices referencing the bone are reassigned to the parent bone
-      (or to bone 0 when the deleted bone is a root).
     - All skeleton frame transforms for the bone are removed.
 
     Returns True if the bone was found and removed, False otherwise.
@@ -78,30 +105,19 @@ def _delete_bone(smd: SMD, bone_name: str) -> bool:
     if node is None:
         return False
 
-    bid            = node.id
-    parent_bid     = node.parent_id  # -1 for root bones
+    bid        = node.id
+    parent_bid = node.parent_id  # -1 for root bones
 
-    # Choose the bone id to reassign orphaned vertices to
-    if parent_bid != -1:
-        reassign_to = parent_bid
-    else:
-        # Deleted bone was a root — find another root or fall back to 0
-        other_root = next(
-            (n.id for n in smd.nodes if n.parent_id == -1 and n.id != bid),
-            0,
-        )
-        reassign_to = other_root
+    # Remove any triangle that has at least one vertex on this bone
+    smd.triangles = [
+        tri for tri in smd.triangles
+        if not any(v.bone_id == bid for v in (tri.v0, tri.v1, tri.v2))
+    ]
 
     # Re-parent direct children
     for n in smd.nodes:
         if n.parent_id == bid:
             n.parent_id = parent_bid
-
-    # Re-assign vertices
-    for tri in smd.triangles:
-        for v in (tri.v0, tri.v1, tri.v2):
-            if v.bone_id == bid:
-                v.bone_id = reassign_to
 
     # Remove skeleton transforms
     for frame in smd.skeleton:
@@ -1809,23 +1825,59 @@ class ViewerPanel(QWidget):
         items = self._tree.selectedItems()
         if not items or self._cur_smd is None:
             return
-        bone_name = items[0].text(0)
-        ans = QMessageBox.question(
-            self, "Delete Bone",
-            f"Delete bone '{bone_name}' from the current SMD?\n\n"
-            "Use 'Apply to All' to propagate this to all SMDs in the model.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        bone_name   = items[0].text(0)
+        descendants = _collect_descendants(self._cur_smd, bone_name)
+
+        # Build confirmation message
+        if descendants:
+            detail = "Also deleting children (leaf-first):\n" + "\n".join(
+                f"  • {n}" for n in descendants
+            )
+            msg = (
+                f"Delete bone '{bone_name}' and its {len(descendants)} "
+                f"descendant(s) from the current SMD?\n\n"
+                "Use 'Apply to All' to propagate to all SMDs in the model."
+            )
+        else:
+            detail = None
+            msg = (
+                f"Delete bone '{bone_name}' from the current SMD?\n\n"
+                "Use 'Apply to All' to propagate this to all SMDs in the model."
+            )
+
+        mb = QMessageBox(self)
+        mb.setWindowTitle("Delete Bone")
+        mb.setIcon(QMessageBox.Icon.Question)
+        mb.setText(msg)
+        if detail:
+            mb.setDetailedText(detail)
+        mb.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if ans != QMessageBox.StandardButton.Yes:
+        if mb.exec() != QMessageBox.StandardButton.Yes:
             return
+
+        # Delete descendants first (leaf-first order), then the selected bone
+        deleted: list[str] = []
+        for name in descendants:
+            if _delete_bone(self._cur_smd, name):
+                self._pending_ops.append({"type": "delete", "name": name})
+                deleted.append(name)
         if _delete_bone(self._cur_smd, bone_name):
             self._pending_ops.append({"type": "delete", "name": bone_name})
+            deleted.append(bone_name)
+
+        if deleted:
             self._update_apply_button()
             self._rebuild_tree()
             self._viewport.set_smd(self._cur_smd)
             self.bonesRenamed.emit()
+            desc = (
+                f"Deleted bone '{bone_name}' + {len(deleted)-1} child(ren)"
+                if len(deleted) > 1 else f"Deleted bone '{bone_name}'"
+            )
             self.operationRecorded.emit(
-                f"Deleted bone '{bone_name}' in {self._ref_combo.currentText()}",
+                f"{desc} in {self._ref_combo.currentText()}",
                 "delete",
             )
 

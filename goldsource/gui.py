@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from goldsource.merger import ModelInput, MergeConfig, MergeReport, MergeResult, ModelMerger
-from goldsource.qc import QC, Sequence, SequenceEvent
+from goldsource.qc import QC, Sequence, SequenceEvent, BodyGroup, BodyGroupEntry
 from goldsource.sanitize import sanitize_directory
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
@@ -1114,7 +1114,15 @@ class _QCEditorPanel(QWidget):
         top.addStretch()
         root.addLayout(top)
 
-        # Main splitter: sequence list | sequence details
+        # Tab widget: Sequences | Bodygroups
+        self._tabs = QTabWidget()
+        root.addWidget(self._tabs, 1)
+
+        # ── Sequences tab ────────────────────────────────────────────────
+        seq_widget = QWidget()
+        seq_root   = QVBoxLayout(seq_widget)
+        seq_root.setContentsMargins(0, 4, 0, 0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # --- Left: sequence list ---
@@ -1227,8 +1235,92 @@ class _QCEditorPanel(QWidget):
         dg.addWidget(self._ev_table, 1)
 
         rv.addWidget(self._detail_group, 1)
+        splitter.addWidget(right)
+        splitter.setSizes([200, 500])
+        seq_root.addWidget(splitter, 1)
+        self._tabs.addTab(seq_widget, "Sequences")
 
-        # Save button
+        # ── Bodygroups tab ───────────────────────────────────────────────
+        bg_widget = QWidget()
+        bg_root   = QVBoxLayout(bg_widget)
+        bg_root.setContentsMargins(0, 4, 0, 0)
+
+        bg_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: bodygroup list
+        bg_left  = QWidget()
+        bg_lv    = QVBoxLayout(bg_left)
+        bg_lv.setContentsMargins(0, 0, 0, 0)
+        bg_lv.addWidget(QLabel("Bodygroups"))
+        self._bg_list = QListWidget()
+        self._bg_list.currentRowChanged.connect(self._on_bg_selected)
+        bg_lv.addWidget(self._bg_list, 1)
+
+        bg_list_btns = QHBoxLayout()
+        self._btn_bg_add    = QPushButton("Add")
+        self._btn_bg_del    = QPushButton("Delete")
+        self._btn_bg_rename = QPushButton("Rename")
+        self._btn_bg_del.setEnabled(False)
+        self._btn_bg_rename.setEnabled(False)
+        self._btn_bg_add.clicked.connect(self._on_bg_add)
+        self._btn_bg_del.clicked.connect(self._on_bg_del)
+        self._btn_bg_rename.clicked.connect(self._on_bg_rename)
+        for b in (self._btn_bg_add, self._btn_bg_del, self._btn_bg_rename):
+            bg_list_btns.addWidget(b)
+        bg_list_btns.addStretch()
+        bg_lv.addLayout(bg_list_btns)
+        bg_splitter.addWidget(bg_left)
+
+        # Right: entries for the selected bodygroup
+        bg_right = QWidget()
+        bg_rv    = QVBoxLayout(bg_right)
+        bg_rv.setContentsMargins(0, 0, 0, 0)
+
+        self._bg_entries_group = QGroupBox("Entries")
+        self._bg_entries_group.setEnabled(False)
+        beg = QVBoxLayout(self._bg_entries_group)
+
+        entry_btn_row = QHBoxLayout()
+        self._btn_entry_add = QPushButton("Add entry")
+        self._btn_entry_del = QPushButton("Delete entry")
+        self._btn_entry_up  = QPushButton("↑")
+        self._btn_entry_dn  = QPushButton("↓")
+        self._btn_entry_del.setEnabled(False)
+        for b in (self._btn_entry_up, self._btn_entry_dn):
+            b.setFixedWidth(28)
+        self._btn_entry_add.clicked.connect(self._on_entry_add)
+        self._btn_entry_del.clicked.connect(self._on_entry_del)
+        self._btn_entry_up.clicked.connect(self._on_entry_up)
+        self._btn_entry_dn.clicked.connect(self._on_entry_dn)
+        for b in (self._btn_entry_add, self._btn_entry_del,
+                  self._btn_entry_up, self._btn_entry_dn):
+            entry_btn_row.addWidget(b)
+        entry_btn_row.addStretch()
+        beg.addLayout(entry_btn_row)
+
+        # Columns: SMD (editable), Blank (checkbox), Reverse (checkbox), Scale
+        self._entry_table = QTableWidget(0, 4)
+        self._entry_table.setHorizontalHeaderLabels(["SMD file (no ext)", "Blank", "Reverse", "Scale"])
+        self._entry_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for col in (1, 2, 3):
+            self._entry_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self._entry_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._entry_table.verticalHeader().setVisible(False)
+        self._entry_table.itemSelectionChanged.connect(self._on_entry_selection_changed)
+        self._entry_table.itemChanged.connect(self._on_entry_cell_changed)
+        beg.addWidget(self._entry_table, 1)
+
+        bg_rv.addWidget(self._bg_entries_group, 1)
+        bg_splitter.addWidget(bg_right)
+        bg_splitter.setSizes([200, 500])
+        bg_root.addWidget(bg_splitter, 1)
+        self._tabs.addTab(bg_widget, "Bodygroups")
+
+        # ── Shared Save button (below tabs) ─────────────────────────────
         save_row = QHBoxLayout()
         save_row.addStretch()
         self._btn_save = QPushButton("Save to QC file")
@@ -1240,11 +1332,7 @@ class _QCEditorPanel(QWidget):
         )
         self._btn_save.clicked.connect(self._on_save)
         save_row.addWidget(self._btn_save)
-        rv.addLayout(save_row)
-
-        splitter.addWidget(right)
-        splitter.setSizes([200, 500])
-        root.addWidget(splitter, 1)
+        root.addLayout(save_row)
 
     # ------------------------------------------------------------------ public
     def set_models(self, dirs: dict[str, str]) -> None:
@@ -1292,6 +1380,7 @@ class _QCEditorPanel(QWidget):
             self._clear_editor()
             return
         self._refresh_seq_list(keep_row=0)
+        self._refresh_bg_list(keep_row=0)
         self._btn_save.setEnabled(True)
 
     def _clear_editor(self) -> None:
@@ -1303,6 +1392,11 @@ class _QCEditorPanel(QWidget):
         self._btn_del_seq.setEnabled(False)
         self._btn_up.setEnabled(False)
         self._btn_dn.setEnabled(False)
+        self._bg_list.clear()
+        self._entry_table.setRowCount(0)
+        self._bg_entries_group.setEnabled(False)
+        self._btn_bg_del.setEnabled(False)
+        self._btn_bg_rename.setEnabled(False)
 
     def _refresh_seq_list(self, keep_row: int = -1) -> None:
         self._seq_list.blockSignals(True)
@@ -1471,14 +1565,216 @@ class _QCEditorPanel(QWidget):
         self._ev_table.removeRow(ev_row)
         self._flush_events_to_seq(seq_row)
 
+    # ── Bodygroup helpers ─────────────────────────────────────────────────
+
+    def _refresh_bg_list(self, keep_row: int = -1) -> None:
+        self._bg_list.blockSignals(True)
+        self._bg_list.clear()
+        if self._qc:
+            for bg in self._qc.bodygroups:
+                self._bg_list.addItem(bg.name)
+        self._bg_list.blockSignals(False)
+        row = min(keep_row, self._bg_list.count() - 1)
+        if row >= 0:
+            self._bg_list.setCurrentRow(row)
+        else:
+            self._on_bg_selected(-1)
+
+    def _on_bg_selected(self, row: int) -> None:
+        has = row >= 0 and self._qc is not None and row < len(self._qc.bodygroups)
+        self._bg_entries_group.setEnabled(has)
+        self._btn_bg_del.setEnabled(has)
+        self._btn_bg_rename.setEnabled(has)
+        self._entry_table.blockSignals(True)
+        self._entry_table.setRowCount(0)
+        self._entry_table.blockSignals(False)
+        if not has:
+            return
+        bg = self._qc.bodygroups[row]
+        self._bg_entries_group.setTitle(f"Entries — {bg.name}")
+        self._loading = True
+        self._entry_table.blockSignals(True)
+        for entry in bg.entries:
+            self._append_entry_row(entry.smd, entry.reverse, entry.scale)
+        self._entry_table.blockSignals(False)
+        self._loading = False
+
+    def _append_entry_row(self, smd: str, reverse: bool, scale) -> None:
+        row = self._entry_table.rowCount()
+        self._entry_table.insertRow(row)
+
+        smd_item = QTableWidgetItem(smd)
+        self._entry_table.setItem(row, 0, smd_item)
+
+        blank_item = QTableWidgetItem()
+        blank_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        blank_item.setCheckState(
+            Qt.CheckState.Checked if smd == "" else Qt.CheckState.Unchecked
+        )
+        self._entry_table.setItem(row, 1, blank_item)
+
+        rev_item = QTableWidgetItem()
+        rev_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        rev_item.setCheckState(
+            Qt.CheckState.Checked if reverse else Qt.CheckState.Unchecked
+        )
+        self._entry_table.setItem(row, 2, rev_item)
+
+        scale_item = QTableWidgetItem("" if scale is None else str(scale))
+        self._entry_table.setItem(row, 3, scale_item)
+
+    def _flush_entries_to_bg(self, bg_row: int) -> None:
+        if self._qc is None or bg_row < 0 or bg_row >= len(self._qc.bodygroups):
+            return
+        bg = self._qc.bodygroups[bg_row]
+        entries: list = []
+        for r in range(self._entry_table.rowCount()):
+            blank_item = self._entry_table.item(r, 1)
+            is_blank   = (blank_item is not None and
+                          blank_item.checkState() == Qt.CheckState.Checked)
+            smd_text   = "" if is_blank else (
+                (self._entry_table.item(r, 0) or QTableWidgetItem("")).text().strip()
+            )
+            rev_item   = self._entry_table.item(r, 2)
+            reverse    = (rev_item is not None and
+                          rev_item.checkState() == Qt.CheckState.Checked)
+            scale_text = (self._entry_table.item(r, 3) or QTableWidgetItem("")).text().strip()
+            try:
+                scale: float | None = float(scale_text) if scale_text else None
+            except ValueError:
+                scale = None
+            entries.append(BodyGroupEntry(smd=smd_text, reverse=reverse, scale=scale))
+        bg.entries = entries
+
+    def _on_entry_cell_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading:
+            return
+        row = self._bg_list.currentRow()
+        if row >= 0:
+            self._flush_entries_to_bg(row)
+
+    def _on_entry_selection_changed(self) -> None:
+        has = bool(self._entry_table.selectedItems())
+        self._btn_entry_del.setEnabled(has)
+
+    def _on_bg_add(self) -> None:
+        if self._qc is None:
+            return
+        name, ok = QInputDialog.getText(self, "New bodygroup", "Bodygroup name:")
+        if not ok or not name.strip():
+            return
+        self._qc.bodygroups.append(BodyGroup(name=name.strip(), entries=[]))
+        self._refresh_bg_list(keep_row=len(self._qc.bodygroups) - 1)
+
+    def _on_bg_del(self) -> None:
+        if self._qc is None:
+            return
+        row = self._bg_list.currentRow()
+        if row < 0 or row >= len(self._qc.bodygroups):
+            return
+        bg = self._qc.bodygroups[row]
+        ans = QMessageBox.question(
+            self, "Delete bodygroup",
+            f"Delete bodygroup '{bg.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del self._qc.bodygroups[row]
+        self._refresh_bg_list(keep_row=max(0, row - 1))
+
+    def _on_bg_rename(self) -> None:
+        if self._qc is None:
+            return
+        row = self._bg_list.currentRow()
+        if row < 0 or row >= len(self._qc.bodygroups):
+            return
+        bg = self._qc.bodygroups[row]
+        name, ok = QInputDialog.getText(
+            self, "Rename bodygroup", "New name:", text=bg.name
+        )
+        if not ok or not name.strip() or name.strip() == bg.name:
+            return
+        bg.name = name.strip()
+        self._bg_list.item(row).setText(bg.name)
+        self._bg_entries_group.setTitle(f"Entries — {bg.name}")
+
+    def _on_entry_add(self) -> None:
+        if self._qc is None:
+            return
+        bg_row = self._bg_list.currentRow()
+        if bg_row < 0:
+            return
+        self._flush_entries_to_bg(bg_row)
+        self._qc.bodygroups[bg_row].entries.append(
+            BodyGroupEntry(smd="", reverse=False, scale=None)
+        )
+        self._loading = True
+        self._entry_table.blockSignals(True)
+        self._append_entry_row("", False, None)
+        self._entry_table.blockSignals(False)
+        self._loading = False
+        self._entry_table.setCurrentCell(self._entry_table.rowCount() - 1, 0)
+
+    def _on_entry_del(self) -> None:
+        if self._qc is None:
+            return
+        entry_row = self._entry_table.currentRow()
+        if entry_row < 0:
+            return
+        bg_row = self._bg_list.currentRow()
+        if bg_row < 0:
+            return
+        self._entry_table.removeRow(entry_row)
+        self._flush_entries_to_bg(bg_row)
+
+    def _on_entry_up(self) -> None:
+        bg_row    = self._bg_list.currentRow()
+        entry_row = self._entry_table.currentRow()
+        if bg_row < 0 or entry_row <= 0 or self._qc is None:
+            return
+        self._flush_entries_to_bg(bg_row)
+        entries = self._qc.bodygroups[bg_row].entries
+        entries[entry_row - 1], entries[entry_row] = entries[entry_row], entries[entry_row - 1]
+        self._loading = True
+        self._entry_table.blockSignals(True)
+        self._entry_table.setRowCount(0)
+        for e in entries:
+            self._append_entry_row(e.smd, e.reverse, e.scale)
+        self._entry_table.blockSignals(False)
+        self._loading = False
+        self._entry_table.setCurrentCell(entry_row - 1, 0)
+
+    def _on_entry_dn(self) -> None:
+        bg_row    = self._bg_list.currentRow()
+        entry_row = self._entry_table.currentRow()
+        if self._qc is None or bg_row < 0:
+            return
+        entries = self._qc.bodygroups[bg_row].entries
+        if entry_row < 0 or entry_row >= len(entries) - 1:
+            return
+        self._flush_entries_to_bg(bg_row)
+        entries[entry_row], entries[entry_row + 1] = entries[entry_row + 1], entries[entry_row]
+        self._loading = True
+        self._entry_table.blockSignals(True)
+        self._entry_table.setRowCount(0)
+        for e in entries:
+            self._append_entry_row(e.smd, e.reverse, e.scale)
+        self._entry_table.blockSignals(False)
+        self._loading = False
+        self._entry_table.setCurrentCell(entry_row + 1, 0)
+
     # --- save ---
     def _on_save(self) -> None:
         if self._qc is None or self._qc_path is None:
             return
-        # Flush any in-progress event edits
+        # Flush any in-progress edits
         seq_row = self._seq_list.currentRow()
         if seq_row >= 0:
             self._flush_events_to_seq(seq_row)
+        bg_row = self._bg_list.currentRow()
+        if bg_row >= 0:
+            self._flush_entries_to_bg(bg_row)
         try:
             self._qc.save(self._qc_path)
         except Exception as exc:
