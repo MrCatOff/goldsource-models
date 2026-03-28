@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QCheckBox, QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QInputDialog, QFileDialog, QGroupBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QSlider,
+    QTableWidgetItem, QAbstractItemView, QSlider, QTabWidget,
 )
 
 try:
@@ -351,6 +351,127 @@ def _build_hands_body_smd(
     result.nodes     = new_nodes
     result.skeleton  = [SkeletonFrame(time=0, bones=new_bones)]
     result.triangles = list(hands_smd.triangles)
+    return result
+
+
+def _build_pw_body_smd(
+    pw_smd: SMD,
+    weapon_ref_smd: SMD,
+    pw_to_weapon: dict[str, str],   # pw_bone_name → weapon_bone_name
+) -> SMD:
+    """
+    Build a combined reference SMD for a P-weapon bodygroup entry.
+
+    Structure mirrors _build_hands_body_smd, but ALL skeleton transforms
+    come from *weapon_ref_smd* (the original weapon bind-pose) — not from
+    *pw_smd* — so the compiler sees the weapon's own bone positions.
+
+    pw_to_weapon maps each p-weapon bone name to the weapon bone it replaces.
+    Weapon bones not covered by the map are appended as weapon-specific bones
+    with new IDs above the last p-weapon bone ID.
+    """
+    import copy
+
+    pw_by_name  = {n.name: n for n in pw_smd.nodes}
+    wp_by_name  = {n.name: n for n in weapon_ref_smd.nodes}
+    max_pw_id   = max((n.id for n in pw_smd.nodes), default=-1)
+
+    # pw_node_id → new output ID  (mapped pw bones get the weapon bone's ID)
+    old_to_new: dict[int, int] = {}
+    for pw_name, wp_name in pw_to_weapon.items():
+        pw_node = pw_by_name.get(pw_name)
+        wp_node = wp_by_name.get(wp_name)
+        if pw_node and wp_node:
+            old_to_new[pw_node.id] = wp_node.id
+
+    # Weapon-specific bones: weapon bones not covered by the map
+    covered_wp_names = set(pw_to_weapon.values())
+    weapon_specific  = [n for n in weapon_ref_smd.nodes if n.name not in covered_wp_names]
+    wp_by_old        = {n.id: n for n in weapon_specific}
+    weapon_ordered: list[Node] = []
+    visited: set[int] = set()
+
+    def _visit(n: Node) -> None:
+        if n.id in visited:
+            return
+        visited.add(n.id)
+        if n.parent_id in wp_by_old:
+            _visit(wp_by_old[n.parent_id])
+        weapon_ordered.append(n)
+
+    for n in weapon_specific:
+        _visit(n)
+
+    next_id = max_pw_id + 1
+    for n in weapon_ordered:
+        old_to_new[n.id] = next_id
+        next_id += 1
+
+    # ── Nodes: pw bones first (with mapped IDs), weapon-specific after ────
+    pw_wp_id: dict[int, int] = {}   # pw_node_id → output id (already in old_to_new for mapped)
+    new_nodes: list[Node] = []
+    for pn in sorted(pw_smd.nodes, key=lambda x: x.id):
+        out_id     = old_to_new.get(pn.id, pn.id)
+        out_parent = old_to_new.get(pn.parent_id, pn.parent_id) if pn.parent_id != -1 else -1
+        new_nodes.append(Node(id=out_id, name=pn.name, parent_id=out_parent))
+        pw_wp_id[pn.id] = out_id
+
+    for n in weapon_ordered:
+        new_parent = old_to_new.get(n.parent_id, -1) if n.parent_id != -1 else -1
+        new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
+
+    # ── Skeleton frame 0: ALL transforms from weapon_ref_smd ──────────────
+    wp_bt = {bt.bone_id: bt for bt in weapon_ref_smd.skeleton[0].bones} \
+            if weapon_ref_smd.skeleton else {}
+
+    # Build a lookup: weapon_bone_name → transform
+    wp_name_to_bt = {n.name: wp_bt.get(n.id) for n in weapon_ref_smd.nodes}
+
+    new_bones: list[BoneTransform] = []
+    for pn in sorted(pw_smd.nodes, key=lambda x: x.id):
+        out_id  = pw_wp_id[pn.id]
+        # Find the weapon bone this pw bone maps to (if any)
+        wp_name = pw_to_weapon.get(pn.name)
+        bt      = wp_name_to_bt.get(wp_name) if wp_name else None
+        if bt:
+            new_bones.append(BoneTransform(
+                bone_id=out_id,
+                tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                rx=bt.rx, ry=bt.ry, rz=bt.rz,
+            ))
+        else:
+            new_bones.append(BoneTransform(
+                bone_id=out_id, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0,
+            ))
+
+    for n in weapon_ordered:
+        bt  = wp_bt.get(n.id)
+        nid = old_to_new[n.id]
+        if bt:
+            new_bones.append(BoneTransform(
+                bone_id=nid,
+                tx=bt.tx, ty=bt.ty, tz=bt.tz,
+                rx=bt.rx, ry=bt.ry, rz=bt.rz,
+            ))
+        else:
+            new_bones.append(BoneTransform(
+                bone_id=nid, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0,
+            ))
+
+    # ── Triangles: pw_smd mesh with remapped bone IDs ─────────────────────
+    new_triangles = []
+    for tri in pw_smd.triangles:
+        nt = copy.copy(tri)
+        for attr in ('v0', 'v1', 'v2'):
+            v  = copy.copy(getattr(tri, attr))
+            v.bone_id = pw_wp_id.get(v.bone_id, v.bone_id)
+            setattr(nt, attr, v)
+        new_triangles.append(nt)
+
+    result           = copy.copy(pw_smd)
+    result.nodes     = new_nodes
+    result.skeleton  = [SkeletonFrame(time=0, bones=new_bones)]
+    result.triangles = new_triangles
     return result
 
 
@@ -1450,6 +1571,11 @@ class ViewerPanel(QWidget):
         self._hands_path:     str                  = ""
         self._bone_map:       dict[str, str]       = {}  # weapon_name → hand_name
         self._hand_combo_map: dict[int, QComboBox] = {}  # hand_bone_id → QComboBox
+        # P-weapon state
+        self._pw_smd:         SMD | None           = None
+        self._pw_path:        str                  = ""
+        self._pw_bone_map:    dict[str, str]       = {}  # pw_bone_name → weapon_bone_name
+        self._pw_combo_map:   dict[int, QComboBox] = {}  # pw_bone_id → QComboBox
         self._setup_ui()
 
     # ── Setup ────────────────────────────────────────────────────────────
@@ -1529,14 +1655,16 @@ class ViewerPanel(QWidget):
 
         ll.addLayout(bone_btns)
 
-        # ── Reference Hands group ─────────────────────────────────────────
-        hands_box = QGroupBox("Reference Hands")
-        hands_box.setCheckable(False)
-        hl = QVBoxLayout(hands_box)
+        # ── Hands / P Weapon tab widget ───────────────────────────────────
+        hp_tabs = QTabWidget()
+        hp_tabs.setTabPosition(QTabWidget.TabPosition.North)
+
+        # ── Hands tab ────────────────────────────────────────────────────
+        hands_widget = QWidget()
+        hl = QVBoxLayout(hands_widget)
         hl.setContentsMargins(6, 6, 6, 6)
         hl.setSpacing(4)
 
-        # Load button + path label
         self._btn_load_hands = QPushButton("Load Hands SMD…")
         self._btn_load_hands.clicked.connect(self._on_load_hands_smd)
         hl.addWidget(self._btn_load_hands)
@@ -1545,39 +1673,90 @@ class ViewerPanel(QWidget):
         self._hands_path_label.setWordWrap(True)
         hl.addWidget(self._hands_path_label)
 
-        # Hand-bone tree with per-row weapon-bone dropdowns
         self._hands_tree = QTreeWidget()
         self._hands_tree.setColumnCount(2)
         self._hands_tree.setHeaderLabels(["Hand Bone", "Weapon Bone"])
-        self._hands_tree.header().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        self._hands_tree.header().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
-        self._hands_tree.setMinimumHeight(140)
+        self._hands_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._hands_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._hands_tree.setMinimumHeight(120)
         hl.addWidget(self._hands_tree, 1)
 
-        # Bottom row: status + buttons
         self._hands_status = QLabel("")
         self._hands_status.setStyleSheet("color: #888; font-size: 10px;")
         self._hands_status.setWordWrap(True)
         hl.addWidget(self._hands_status)
 
-        bottom_row = QHBoxLayout()
+        hands_btn_row = QHBoxLayout()
         self._btn_clear_hands = QPushButton("Clear")
         self._btn_clear_hands.setEnabled(False)
         self._btn_clear_hands.clicked.connect(self._on_clear_hands_map)
-        bottom_row.addWidget(self._btn_clear_hands)
-
+        hands_btn_row.addWidget(self._btn_clear_hands)
         self._btn_apply_hands = QPushButton("Apply Hands to All SMDs")
         self._btn_apply_hands.setEnabled(False)
         self._btn_apply_hands.setStyleSheet(
             "background-color: #2a6099; color: white; font-weight: bold;"
         )
         self._btn_apply_hands.clicked.connect(self._on_apply_hands)
-        bottom_row.addWidget(self._btn_apply_hands)
-        hl.addLayout(bottom_row)
+        hands_btn_row.addWidget(self._btn_apply_hands)
+        hl.addLayout(hands_btn_row)
 
-        ll.addWidget(hands_box)
+        hp_tabs.addTab(hands_widget, "Hands")
+
+        # ── P Weapon tab ─────────────────────────────────────────────────
+        pw_widget = QWidget()
+        pl = QVBoxLayout(pw_widget)
+        pl.setContentsMargins(6, 6, 6, 6)
+        pl.setSpacing(4)
+
+        self._btn_load_pw = QPushButton("Load P Weapon SMD…")
+        self._btn_load_pw.clicked.connect(self._on_load_pw_smd)
+        pl.addWidget(self._btn_load_pw)
+        _DEFAULT_PW = Path("storage/player_p_weapons/weapon.smd")
+        self._pw_path_label = QLabel(
+            str(_DEFAULT_PW) if _DEFAULT_PW.exists() else "(none)"
+        )
+        self._pw_path_label.setStyleSheet("color: #888; font-size: 10px;")
+        self._pw_path_label.setWordWrap(True)
+        pl.addWidget(self._pw_path_label)
+
+        self._pw_tree = QTreeWidget()
+        self._pw_tree.setColumnCount(2)
+        self._pw_tree.setHeaderLabels(["P Weapon Bone", "Weapon Bone"])
+        self._pw_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._pw_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._pw_tree.setMinimumHeight(120)
+        pl.addWidget(self._pw_tree, 1)
+
+        self._pw_status = QLabel("")
+        self._pw_status.setStyleSheet("color: #888; font-size: 10px;")
+        self._pw_status.setWordWrap(True)
+        pl.addWidget(self._pw_status)
+
+        pw_btn_row = QHBoxLayout()
+        self._btn_clear_pw = QPushButton("Clear")
+        self._btn_clear_pw.setEnabled(False)
+        self._btn_clear_pw.clicked.connect(self._on_clear_pw_map)
+        pw_btn_row.addWidget(self._btn_clear_pw)
+        self._btn_apply_pw = QPushButton("Apply P Weapon to All SMDs")
+        self._btn_apply_pw.setEnabled(False)
+        self._btn_apply_pw.setStyleSheet(
+            "background-color: #5a3a99; color: white; font-weight: bold;"
+        )
+        self._btn_apply_pw.clicked.connect(self._on_apply_pw)
+        pw_btn_row.addWidget(self._btn_apply_pw)
+        pl.addLayout(pw_btn_row)
+
+        hp_tabs.addTab(pw_widget, "P Weapon")
+
+        ll.addWidget(hp_tabs)
+
+        # Auto-load default p_weapon SMD if it exists
+        if _DEFAULT_PW.exists():
+            try:
+                self._pw_smd  = SMD.from_file(str(_DEFAULT_PW))
+                self._pw_path = str(_DEFAULT_PW)
+            except Exception:
+                pass
 
         left.setMinimumWidth(240)
         splitter.addWidget(left)
@@ -1735,6 +1914,7 @@ class ViewerPanel(QWidget):
         self._btn_export.setEnabled(self._cur_smd is not None)
         self._btn_save_all.setEnabled(has_model_dir and model is not None)
         self._rebuild_hands_tree()
+        self._rebuild_pw_tree()
         # Re-apply the current animation selection on top of the new ref SMD
         self._on_anim_combo_changed()
 
@@ -2360,6 +2540,296 @@ class ViewerPanel(QWidget):
             if disk_msg:
                 mb.setDetailedText(disk_msg)
             mb.exec()
+
+    # ── P Weapon ──────────────────────────────────────────────────────────
+
+    def _on_load_pw_smd(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load P Weapon SMD",
+            self._pw_path or "storage/player_p_weapons",
+            "SMD Files (*.smd);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._pw_smd  = SMD.from_file(path)
+            self._pw_path = path
+            self._pw_path_label.setText(Path(path).name)
+            self._rebuild_pw_tree()
+        except Exception as exc:
+            QMessageBox.critical(self, "Load P Weapon SMD", str(exc))
+
+    def _rebuild_pw_tree(self) -> None:
+        self._pw_tree.clear()
+        self._pw_combo_map.clear()
+        self._pw_bone_map.clear()
+        self._pw_status.setText("")
+        self._btn_apply_pw.setEnabled(False)
+        self._btn_clear_pw.setEnabled(False)
+
+        if self._pw_smd is None:
+            return
+
+        weapon_names = ["(none)"]
+        if self._cur_smd:
+            weapon_names += sorted(n.name for n in self._cur_smd.nodes)
+
+        pw_items: dict[int, QTreeWidgetItem] = {}
+        for node in sorted(self._pw_smd.nodes, key=lambda n: n.id):
+            item  = QTreeWidgetItem([node.name, ""])
+            combo = QComboBox()
+            combo.addItems(weapon_names)
+            combo.currentTextChanged.connect(
+                lambda text, n=node: self._on_pw_combo_changed(n, text)
+            )
+            self._pw_combo_map[node.id] = combo
+            pw_items[node.id] = item
+
+            if node.parent_id != -1 and node.parent_id in pw_items:
+                pw_items[node.parent_id].addChild(item)
+            else:
+                self._pw_tree.addTopLevelItem(item)
+
+            self._pw_tree.setItemWidget(item, 1, combo)
+
+        self._pw_tree.expandAll()
+
+    def _on_pw_combo_changed(self, pw_node: "Node", weapon_name: str) -> None:
+        """Manual-only mapping — no auto-assign of children or parents."""
+        # Remove any previous mapping for this pw bone
+        self._pw_bone_map = {
+            p: w for p, w in self._pw_bone_map.items()
+            if p != pw_node.name
+        }
+        if weapon_name and weapon_name != "(none)":
+            self._pw_bone_map[pw_node.name] = weapon_name
+
+        self._refresh_pw_combos()
+        n = len(self._pw_bone_map)
+        if n:
+            total_wp = len(self._cur_smd.nodes) if self._cur_smd else 0
+            self._pw_status.setText(
+                f"{n} mapped · {total_wp - n} weapon-specific"
+            )
+        else:
+            self._pw_status.setText("")
+        self._btn_apply_pw.setEnabled(bool(self._pw_bone_map))
+        self._btn_clear_pw.setEnabled(bool(self._pw_bone_map))
+
+    def _refresh_pw_combos(self) -> None:
+        if self._cur_smd is None:
+            return
+        all_weapon = sorted(n.name for n in self._cur_smd.nodes)
+        used = set(self._pw_bone_map.values())  # weapon names already assigned
+
+        for combo in self._pw_combo_map.values():
+            current = combo.currentText()
+            available = ["(none)"] + [
+                w for w in all_weapon if w not in used or w == current
+            ]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(available)
+            idx = combo.findText(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+    def _on_clear_pw_map(self) -> None:
+        self._pw_bone_map.clear()
+        for combo in self._pw_combo_map.values():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._pw_status.setText("")
+        self._btn_apply_pw.setEnabled(False)
+        self._btn_clear_pw.setEnabled(False)
+
+    def _on_apply_pw(self) -> None:
+        if not self._pw_bone_map or self._pw_smd is None:
+            return
+        model = next(
+            (m for m in self._models if m.name == self._cur_model_name), None
+        )
+        if model is None:
+            return
+
+        original_ref_smd = self._cur_smd
+        n_smds   = len(model.smds)
+        matched  = len(self._pw_bone_map)
+        model_dir = self._dirs.get(self._cur_model_name, "")
+
+        # Reverse map for _apply_hand_replacement: weapon_name → pw_name
+        reversed_map = {wp: pw for pw, wp in self._pw_bone_map.items()}
+
+        mb = QMessageBox(self)
+        mb.setWindowTitle("Apply P Weapon")
+        mb.setText(
+            f"Replace {matched} bone(s) across all {n_smds} SMD(s) in "
+            f"'{self._cur_model_name}'?"
+        )
+        mb.setInformativeText(
+            "SMDs are updated in memory — use 'Save All' to write them.\n"
+            "Disk operations will also update the model directory."
+        )
+        # Unassigned weapon bones: weapon bones not covered by the map
+        if self._cur_smd:
+            unassigned = [
+                n.name for n in self._cur_smd.nodes
+                if n.name not in reversed_map
+            ]
+        else:
+            unassigned = []
+
+        detail = (
+            "All skeleton positions come from the original weapon bind-pose.\n"
+            f"Unassigned weapon bones ({len(unassigned)}) will be DELETED "
+            "(along with their triangles).\n\n"
+            "Disk operations:\n"
+            "  • P-weapon SMD written to model directory\n"
+            "  • P-weapon textures copied to model directory\n"
+            "  • New 'p_weapon' bodygroup added to QC"
+        )
+        if unassigned:
+            detail += "\n\nBones to delete:\n" + "\n".join(f"  • {b}" for b in unassigned)
+        mb.setDetailedText(detail)
+        mb.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if mb.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        errors: list[str] = []
+        for key, smd in list(model.smds.items()):
+            try:
+                new_smd = _apply_hand_replacement(smd, reversed_map, self._pw_smd)
+                # Delete all unassigned (weapon-specific) bones and their triangles
+                for bone_name in unassigned:
+                    _delete_bone(new_smd, bone_name)
+                model.smds[key] = new_smd
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+
+        disk_msg    = ""
+        qc_modified = False
+        if model_dir and original_ref_smd is not None and not errors:
+            try:
+                disk_msg    = self._post_apply_pw(model_dir, original_ref_smd)
+                qc_modified = True
+            except Exception as exc:
+                errors.append(f"Post-apply disk ops: {exc}")
+
+        self._on_ref_changed()
+        self._pending_ops.clear()
+        self._update_apply_button()
+        self.bonesRenamed.emit()
+
+        if not errors:
+            self.operationRecorded.emit(
+                f"Applied p-weapon ({matched} bone(s) mapped) to all {n_smds} SMD(s) "
+                f"in '{self._cur_model_name}'",
+                "apply_pw",
+            )
+        if qc_modified:
+            self.qcModified.emit(self._cur_model_name)
+
+        if errors:
+            mb2 = QMessageBox(self)
+            mb2.setWindowTitle("Apply P Weapon — Errors")
+            mb2.setIcon(QMessageBox.Icon.Warning)
+            mb2.setText(f"{len(errors)} error(s) occurred.")
+            mb2.setDetailedText("\n".join(errors))
+            mb2.exec()
+        else:
+            mb2 = QMessageBox(self)
+            mb2.setWindowTitle("Apply P Weapon")
+            mb2.setIcon(QMessageBox.Icon.Information)
+            mb2.setText(f"Done. {n_smds} SMD(s) updated in memory.")
+            mb2.setInformativeText("Use 'Save All' to write the modified SMDs to disk.")
+            if disk_msg:
+                mb2.setDetailedText(disk_msg)
+            mb2.exec()
+
+    def _post_apply_pw(self, model_dir: str, original_ref_smd: SMD) -> str:
+        """
+        Disk-side operations after p-weapon replacement:
+        1. Build and write combined p-weapon body SMD (weapon skeleton positions)
+        2. Copy p-weapon textures to model directory
+        3. Update QC: add 'p_weapon' bodygroup
+        Returns a short summary string.
+        """
+        model_path = Path(model_dir)
+        pw_path    = Path(self._pw_path)
+        pw_stem    = pw_path.stem
+        pw_dir     = pw_path.parent
+
+        # 1. Build combined p-weapon body SMD
+        pw_body       = _build_pw_body_smd(
+            self._pw_smd, original_ref_smd, self._pw_bone_map
+        )
+        dest_smd_path = model_path / f"{pw_stem}.smd"
+        pw_body.save(dest_smd_path)
+
+        # 2. Copy p-weapon textures
+        pw_mats = {Path(tri.material).name for tri in self._pw_smd.triangles}
+        tex_copied: list[str] = []
+        for mat_name in pw_mats:
+            stem = Path(mat_name).stem
+            for candidate in [mat_name, stem + ".bmp", stem + ".BMP"]:
+                src = pw_dir / candidate
+                if src.exists():
+                    dest = model_path / candidate
+                    if not dest.exists() or src.read_bytes() != dest.read_bytes():
+                        shutil.copy2(str(src), str(dest))
+                        tex_copied.append(candidate)
+                    break
+
+        # 3. Update QC — add 'p_weapon' bodygroup if not already present
+        qc_files = list(model_path.glob("*.qc"))
+        if not qc_files:
+            return (
+                f"P-weapon SMD written: {dest_smd_path.name}\n"
+                f"Textures copied: {len(tex_copied)}\n"
+                "No QC file found in model directory."
+            )
+
+        qc_path = qc_files[0]
+        qc      = QC.from_file(str(qc_path))
+
+        # Update $attachment / $hbox bone names using reversed map
+        reversed_map = {wp: pw for pw, wp in self._pw_bone_map.items()}
+        att_renamed: list[str] = []
+        hb_renamed:  list[str] = []
+        for att in qc.attachments:
+            if att.bone in reversed_map:
+                new_name = reversed_map[att.bone]
+                att_renamed.append(f"{att.bone} → {new_name}")
+                att.bone = new_name
+        for hb in qc.hboxes:
+            if hb.bone in reversed_map:
+                new_name = reversed_map[hb.bone]
+                hb_renamed.append(f"{hb.bone} → {new_name}")
+                hb.bone = new_name
+
+        # Add bodygroup only if not already present
+        bg_added = False
+        if not any(bg.name == "p_weapon" for bg in qc.bodygroups):
+            qc.bodygroups.append(BodyGroup(
+                name="p_weapon",
+                entries=[BodyGroupEntry(smd=pw_stem)],
+            ))
+            bg_added = True
+
+        qc.save(str(qc_path))
+
+        lines = [
+            f"P-weapon SMD written: {dest_smd_path.name}",
+            f"Textures copied:      {', '.join(tex_copied) if tex_copied else 'none'}",
+            f"QC updated ({qc_path.name}):",
+            f"  $attachment bones renamed: {att_renamed or 'none'}",
+            f"  $hbox bones renamed: {hb_renamed or 'none'}",
+            f"  Added 'p_weapon' bodygroup: {'yes' if bg_added else 'already present'}",
+        ]
+        return "\n".join(lines)
 
     def _post_apply_hands(self, model_dir: str, original_ref_smd: SMD) -> str:
         """
