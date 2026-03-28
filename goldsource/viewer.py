@@ -2661,6 +2661,16 @@ class ViewerPanel(QWidget):
         # Reverse map for _apply_hand_replacement: weapon_name → pw_name
         reversed_map = {wp: pw for pw, wp in self._pw_bone_map.items()}
 
+        # Auto-match weapon bones that share a name with pw_smd bones.
+        # Without this, shared bones (Bip01, flash, …) are treated as
+        # "weapon-specific" and duplicated in the output — and then deleted
+        # as unassigned, stripping the parent chain from Bip01 P Weapon.
+        if self._pw_smd and self._cur_smd:
+            pw_bone_names = {n.name for n in self._pw_smd.nodes}
+            for n in self._cur_smd.nodes:
+                if n.name not in reversed_map and n.name in pw_bone_names:
+                    reversed_map[n.name] = n.name  # weapon_name → same pw_name
+
         mb = QMessageBox(self)
         mb.setWindowTitle("Apply P Weapon")
         mb.setText(
@@ -2671,7 +2681,8 @@ class ViewerPanel(QWidget):
             "SMDs are updated in memory — use 'Save All' to write them.\n"
             "Disk operations will also update the model directory."
         )
-        # Unassigned weapon bones: weapon bones not covered by the map
+        # Unassigned weapon bones: weapon bones not covered by any mapping
+        # (explicit user map OR implicit name match with pw_smd)
         if self._cur_smd:
             unassigned = [
                 n.name for n in self._cur_smd.nodes
