@@ -245,13 +245,44 @@ def _apply_hand_replacement(
 
         new_frames.append(SkeletonFrame(time=frame.time, bones=new_bones))
 
-    # ── Triangles (remap vertex bone_ids) ────────────────────────────────
+    # ── Triangles (remap vertex bone_ids + reposition to new bind-pose) ──
+    # Vertex positions in reference SMDs are world-space bind-pose coords.
+    # When the bind-pose skeleton changes (mapped bones get pw_smd transforms,
+    # weapon-specific bones' parent chains change), vertex positions must be
+    # transformed: v_new = M_new[new_bid] @ inv(M_old[old_bid]) @ v_old.
+    vertex_xform: dict[int, np.ndarray] = {}  # old_bone_id → 4×4 matrix
+    if smd.triangles and smd.skeleton and new_frames:
+        M_old = compute_world_transforms(smd, 0)
+        # Build a temporary SMD with the new hierarchy + new bind-pose to
+        # compute the new world transforms via the same helper.
+        temp = copy.copy(smd)
+        temp.nodes    = new_nodes
+        temp.skeleton = [new_frames[0]]
+        M_new = compute_world_transforms(temp, 0)
+        for old_id, new_id in old_to_new.items():
+            M_o = M_old.get(old_id, np.eye(4))
+            M_n = M_new.get(new_id, np.eye(4))
+            T = M_n @ np.linalg.inv(M_o)
+            # Only store if the transform is non-trivial (avoids float noise
+            # for identity cases, though applying identity is harmless).
+            vertex_xform[old_id] = T
+
     new_triangles = []
     for tri in smd.triangles:
         new_v = []
         for v in tri.vertices:
             nv = copy.copy(v)
             nv.bone_id = old_to_new.get(v.bone_id, v.bone_id)
+            T = vertex_xform.get(v.bone_id)
+            if T is not None:
+                pos = T @ np.array([v.x, v.y, v.z, 1.0], dtype=np.float64)
+                nv.x, nv.y, nv.z = float(pos[0]), float(pos[1]), float(pos[2])
+                R = T[:3, :3]
+                n = R @ np.array([v.nx, v.ny, v.nz], dtype=np.float64)
+                norm = np.linalg.norm(n)
+                if norm > 1e-9:
+                    n /= norm
+                nv.nx, nv.ny, nv.nz = float(n[0]), float(n[1]), float(n[2])
             new_v.append(nv)
         nt = copy.copy(tri)
         nt.v0, nt.v1, nt.v2 = new_v[0], new_v[1], new_v[2]
