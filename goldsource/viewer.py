@@ -632,6 +632,56 @@ def _rotate_bone_in_smd(
                     bt_child.tz = float(t_new[2])
 
 
+def _translate_bone_in_smd(
+    smd: SMD,
+    bone_name: str,
+    dtx: float,
+    dty: float,
+    dtz: float,
+) -> None:
+    """
+    Translate *bone_name* in-place by (dtx, dty, dtz) world-space units.
+
+    For reference SMDs (has triangles):
+      - Vertex positions of triangles skinned to the bone are shifted.
+
+    For all SMDs (including animation-only):
+      - The bone's local skeleton translation is updated in every frame so
+        the world-space shift is preserved.  Children are unaffected (they
+        move with the parent automatically).
+    """
+    node = smd.node_by_name(bone_name)
+    if node is None or not smd.skeleton:
+        return
+
+    bid       = node.id
+    parent_id = node.parent_id
+    world0    = compute_world_transforms(smd, 0)
+    M_par0    = world0.get(parent_id, np.eye(4)) if parent_id != -1 else np.eye(4)
+    R_par0    = M_par0[:3, :3]
+
+    delta_world = np.array([dtx, dty, dtz], dtype=np.float64)
+    delta_local = R_par0.T @ delta_world   # convert world delta to parent-local
+
+    # Shift vertex positions (reference SMDs only)
+    if smd.triangles:
+        for tri in smd.triangles:
+            for v in (tri.v0, tri.v1, tri.v2):
+                if v.bone_id == bid:
+                    v.x += float(delta_world[0])
+                    v.y += float(delta_world[1])
+                    v.z += float(delta_world[2])
+
+    # Update local translation in every skeleton frame
+    for frame in smd.skeleton:
+        bt_map = {bt.bone_id: bt for bt in frame.bones}
+        bt = bt_map.get(bid)
+        if bt is not None:
+            bt.tx += float(delta_local[0])
+            bt.ty += float(delta_local[1])
+            bt.tz += float(delta_local[2])
+
+
 def _euler_mat4(rx: float, ry: float, rz: float) -> np.ndarray:
     """
     4×4 matrix from ZYX Euler angles (radians) — GoldSource SMD convention.
@@ -2047,18 +2097,25 @@ class ViewerPanel(QWidget):
         self._pw_status.setWordWrap(True)
         pl.addWidget(self._pw_status)
 
-        # ── Bone rotation section ──────────────────────────────────────────
-        rot_box = QGroupBox("Rotate Selected Bone (degrees)")
+        # ── Bone transform section ─────────────────────────────────────────
+        rot_box = QGroupBox("Transform Selected Bone")
         rot_layout = QVBoxLayout(rot_box)
         rot_layout.setContentsMargins(6, 4, 6, 4)
         rot_layout.setSpacing(3)
 
+        # Bone selector (persists after Apply so user doesn't lose selection)
+        bone_sel_row = QHBoxLayout()
+        bone_sel_row.setSpacing(4)
+        bone_sel_row.addWidget(QLabel("Bone:"))
+        self._pw_bone_select_combo = QComboBox()
+        self._pw_bone_select_combo.setToolTip("Select bone to transform")
+        bone_sel_row.addWidget(self._pw_bone_select_combo, 1)
+        rot_layout.addLayout(bone_sel_row)
+
+        # Rotate row
         rot_axes_row = QHBoxLayout()
         rot_axes_row.setSpacing(4)
-        self._pw_rot_label = QLabel("(select a bone in the tree above)")
-        self._pw_rot_label.setStyleSheet("color: #888; font-size: 10px;")
-        rot_layout.addWidget(self._pw_rot_label)
-
+        rot_axes_row.addWidget(QLabel("Rot:"))
         for axis in ("RX", "RY", "RZ"):
             rot_axes_row.addWidget(QLabel(axis + ":"))
             spin = QDoubleSpinBox()
@@ -2070,9 +2127,27 @@ class ViewerPanel(QWidget):
             spin.setFixedWidth(72)
             setattr(self, f"_pw_rot_{axis.lower()}", spin)
             rot_axes_row.addWidget(spin)
+        rot_axes_row.addStretch()
         rot_layout.addLayout(rot_axes_row)
 
-        self._btn_apply_rot = QPushButton("Apply Rotation to All SMDs")
+        # Move row
+        move_axes_row = QHBoxLayout()
+        move_axes_row.setSpacing(4)
+        move_axes_row.addWidget(QLabel("Move:"))
+        for axis in ("TX", "TY", "TZ"):
+            move_axes_row.addWidget(QLabel(axis + ":"))
+            spin = QDoubleSpinBox()
+            spin.setRange(-9999.0, 9999.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.1)
+            spin.setValue(0.0)
+            spin.setFixedWidth(72)
+            setattr(self, f"_pw_rot_{axis.lower()}", spin)
+            move_axes_row.addWidget(spin)
+        move_axes_row.addStretch()
+        rot_layout.addLayout(move_axes_row)
+
+        self._btn_apply_rot = QPushButton("Apply to All SMDs")
         self._btn_apply_rot.clicked.connect(self._on_apply_bone_rotation)
         rot_layout.addWidget(self._btn_apply_rot)
 
@@ -2150,7 +2225,7 @@ class ViewerPanel(QWidget):
         overlay_bar.addWidget(self._overlay_anim_combo, 1)
         rl.addLayout(overlay_bar)
 
-        # Overlay offset row
+        # Overlay offset + align row (combined)
         ov_offset_bar = QHBoxLayout()
         ov_offset_bar.setContentsMargins(4, 0, 4, 2)
         ov_offset_bar.setSpacing(4)
@@ -2171,29 +2246,23 @@ class ViewerPanel(QWidget):
         ov_reset_btn.setFixedWidth(44)
         ov_reset_btn.clicked.connect(self._on_overlay_offset_reset)
         ov_offset_bar.addWidget(ov_reset_btn)
-        ov_offset_bar.addStretch()
-        rl.addLayout(ov_offset_bar)
-
-        # Overlay bone-alignment row
-        ov_align_bar = QHBoxLayout()
-        ov_align_bar.setContentsMargins(4, 0, 4, 2)
-        ov_align_bar.setSpacing(4)
-        ov_align_bar.addWidget(QLabel("Align:"))
+        # Separator
+        ov_offset_bar.addSpacing(8)
+        ov_offset_bar.addWidget(QLabel("Align:"))
         self._ov_align_bone_combo = QComboBox()
-        self._ov_align_bone_combo.setMinimumWidth(110)
+        self._ov_align_bone_combo.setMinimumWidth(100)
         self._ov_align_bone_combo.setToolTip("Overlay bone to align from")
-        ov_align_bar.addWidget(self._ov_align_bone_combo, 1)
-        ov_align_bar.addWidget(QLabel("→"))
+        ov_offset_bar.addWidget(self._ov_align_bone_combo, 1)
+        ov_offset_bar.addWidget(QLabel("→"))
         self._main_align_bone_combo = QComboBox()
-        self._main_align_bone_combo.setMinimumWidth(110)
+        self._main_align_bone_combo.setMinimumWidth(100)
         self._main_align_bone_combo.setToolTip("Main model bone to align to")
-        ov_align_bar.addWidget(self._main_align_bone_combo, 1)
+        ov_offset_bar.addWidget(self._main_align_bone_combo, 1)
         ov_align_set_btn = QPushButton("Set Offset")
         ov_align_set_btn.setFixedWidth(68)
         ov_align_set_btn.clicked.connect(self._on_align_bones_clicked)
-        ov_align_bar.addWidget(ov_align_set_btn)
-        ov_align_bar.addStretch()
-        rl.addLayout(ov_align_bar)
+        ov_offset_bar.addWidget(ov_align_set_btn)
+        rl.addLayout(ov_offset_bar)
 
         self._viewport = _SMDViewport()
         self._viewport.boneHovered.connect(self._on_bone_hovered)
@@ -2341,6 +2410,7 @@ class ViewerPanel(QWidget):
         self._rebuild_hands_tree()
         self._rebuild_pw_tree()
         self._refresh_main_align_bone_combo()
+        self._refresh_pw_bone_select_combo()
         # Re-apply the current animation selection on top of the new ref SMD
         self._on_anim_combo_changed()
 
@@ -2560,9 +2630,9 @@ class ViewerPanel(QWidget):
             self._viewport.set_selected_bone(bid)
             self._viewport.highlight_bone(bid)
             bone_name = items[0].text(0)
-            self._pw_rot_label.setText(f"Bone: {bone_name}")
-        else:
-            self._pw_rot_label.setText("(select a bone in the tree above)")
+            idx = self._pw_bone_select_combo.findText(bone_name)
+            if idx >= 0:
+                self._pw_bone_select_combo.setCurrentIndex(idx)
 
     def _on_rename_clicked(self) -> None:
         items = self._tree.selectedItems()
@@ -3212,12 +3282,25 @@ class ViewerPanel(QWidget):
         self._btn_apply_pw.setEnabled(False)
         self._btn_clear_pw.setEnabled(False)
 
+    def _refresh_pw_bone_select_combo(self) -> None:
+        """Populate the bone selector in the Transform box from the current SMD."""
+        prev = self._pw_bone_select_combo.currentText()
+        self._pw_bone_select_combo.blockSignals(True)
+        self._pw_bone_select_combo.clear()
+        if self._cur_smd:
+            for node in sorted(self._cur_smd.nodes, key=lambda n: n.id):
+                self._pw_bone_select_combo.addItem(node.name)
+        idx = self._pw_bone_select_combo.findText(prev)
+        if idx >= 0:
+            self._pw_bone_select_combo.setCurrentIndex(idx)
+        self._pw_bone_select_combo.blockSignals(False)
+
     def _on_apply_bone_rotation(self) -> None:
-        """Rotate the selected bone's geometry and skeleton in all SMDs."""
-        items = self._tree.selectedItems()
-        if not items:
-            QMessageBox.warning(self, "Rotate Bone",
-                                "No bone selected. Select a bone in the tree first.")
+        """Rotate and/or translate the selected bone in all SMDs."""
+        bone_name = self._pw_bone_select_combo.currentText()
+        if not bone_name:
+            QMessageBox.warning(self, "Transform Bone",
+                                "No bone selected. Choose a bone from the 'Bone' combo.")
             return
         model = next(
             (m for m in self._models if m.name == self._cur_model_name), None
@@ -3225,28 +3308,38 @@ class ViewerPanel(QWidget):
         if model is None:
             return
 
-        bone_name = items[0].text(0)
         drx = math.radians(self._pw_rot_rx.value())
         dry = math.radians(self._pw_rot_ry.value())
         drz = math.radians(self._pw_rot_rz.value())
+        dtx = self._pw_rot_tx.value()
+        dty = self._pw_rot_ty.value()
+        dtz = self._pw_rot_tz.value()
 
-        if drx == 0.0 and dry == 0.0 and drz == 0.0:
+        if drx == 0.0 and dry == 0.0 and drz == 0.0 and dtx == 0.0 and dty == 0.0 and dtz == 0.0:
             return
 
         n_modified = 0
         for smd in model.smds.values():
             if smd.node_by_name(bone_name) is None:
                 continue
-            _rotate_bone_in_smd(smd, bone_name, drx, dry, drz)
+            if drx != 0.0 or dry != 0.0 or drz != 0.0:
+                _rotate_bone_in_smd(smd, bone_name, drx, dry, drz)
+            if dtx != 0.0 or dty != 0.0 or dtz != 0.0:
+                _translate_bone_in_smd(smd, bone_name, dtx, dty, dtz)
             n_modified += 1
 
         if n_modified:
             self._on_ref_changed()   # refresh viewport
+            parts = []
+            if drx != 0.0 or dry != 0.0 or drz != 0.0:
+                parts.append(
+                    f"rot ({math.degrees(drx):.2f}°, {math.degrees(dry):.2f}°, {math.degrees(drz):.2f}°)"
+                )
+            if dtx != 0.0 or dty != 0.0 or dtz != 0.0:
+                parts.append(f"move ({dtx:.3f}, {dty:.3f}, {dtz:.3f})")
             self.operationRecorded.emit(
-                f"Rotated bone '{bone_name}' by "
-                f"({math.degrees(drx):.2f}°, {math.degrees(dry):.2f}°, "
-                f"{math.degrees(drz):.2f}°) across {n_modified} SMD(s)",
-                "rotate_bone",
+                f"Transformed bone '{bone_name}': {', '.join(parts)} across {n_modified} SMD(s)",
+                "transform_bone",
             )
 
     def _on_apply_pw(self) -> None:
