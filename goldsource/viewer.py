@@ -33,7 +33,7 @@ try:
     from OpenGL.GL import (
         glClear, glClearColor, glEnable, glDisable,
         glBegin, glEnd, glVertex3f, glColor4f, glPointSize, glLineWidth,
-        glMatrixMode, glLoadIdentity, glViewport,
+        glMatrixMode, glLoadIdentity, glViewport, glPushMatrix, glPopMatrix, glTranslatef,
         glGetDoublev, glGetIntegerv,
         GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
         GL_DEPTH_TEST, GL_BLEND, GL_POINT_SMOOTH, GL_LINE_SMOOTH,
@@ -676,10 +676,42 @@ if _GL_OK:
             self._hovered_bone:  int | None = None
             self._selected_bone: int | None = None
 
+            # Overlay geometry (second model shown semi-transparent)
+            self._overlay_smd:          SMD | None = None
+            self._overlay_anim_smd:     SMD | None = None
+            self._overlay_verts:        list[tuple[float, float, float]] = []
+            self._overlay_tris:         list[tuple[int, int, int]]       = []
+            self._overlay_skinned_verts: list | None = None
+            self._overlay_bone_pos:     dict[int, tuple[float, float, float]] = {}
+            self._overlay_bone_lines:   list[tuple[int, int]]       = []
+            self._overlay_offset:       tuple[float, float, float]  = (0.0, 0.0, 0.0)
+
             self.setMouseTracking(True)
             self.setMinimumSize(300, 300)
 
         # ── Public API ───────────────────────────────────────────────────
+
+        def set_overlay_smd(self, smd: SMD | None) -> None:
+            """Set a second (overlay) SMD rendered in a distinct colour."""
+            self._overlay_smd = smd
+            self._overlay_skinned_verts = None
+            self._build_overlay_mesh()
+            if self._overlay_anim_smd is not None:
+                self._compute_overlay_skinned_verts()
+            self.update()
+
+        def set_overlay_anim_smd(self, smd: SMD | None) -> None:
+            """Set the animation SMD for the overlay model."""
+            self._overlay_anim_smd = smd
+            self._overlay_skinned_verts = None
+            self._build_overlay_skeleton(0)
+            if smd is not None and self._overlay_smd is not None:
+                self._compute_overlay_skinned_verts()
+            self.update()
+
+        def set_overlay_offset(self, ox: float, oy: float, oz: float) -> None:
+            self._overlay_offset = (ox, oy, oz)
+            self.update()
 
         def set_smd(self, smd: SMD | None) -> None:
             """Set the reference (texture/mesh) SMD."""
@@ -757,6 +789,70 @@ if _GL_OK:
                     (tri.v1.x, tri.v1.y, tri.v1.z, tri.v1.u, tri.v1.v),
                     (tri.v2.x, tri.v2.y, tri.v2.z, tri.v2.u, tri.v2.v),
                 ))
+
+        def _build_overlay_mesh(self) -> None:
+            """Build geometry cache for the overlay (second) SMD."""
+            self._overlay_verts, self._overlay_tris = [], []
+            if self._overlay_smd is None:
+                self._overlay_bone_pos, self._overlay_bone_lines = {}, []
+                return
+            for tri in self._overlay_smd.triangles:
+                base = len(self._overlay_verts)
+                for v in (tri.v0, tri.v1, tri.v2):
+                    self._overlay_verts.append((v.x, v.y, v.z))
+                self._overlay_tris.append((base, base + 1, base + 2))
+            self._build_overlay_skeleton(0)
+
+        def _build_overlay_skeleton(self, frame_idx: int) -> None:
+            """Recompute overlay bone positions for *frame_idx*."""
+            self._overlay_bone_pos, self._overlay_bone_lines = {}, []
+            if self._overlay_smd is None:
+                return
+            if self._overlay_anim_smd is not None:
+                anim_world   = compute_world_transforms(self._overlay_anim_smd, frame_idx)
+                anim_by_name = {n.name: n.id for n in self._overlay_anim_smd.nodes}
+                ref_bind     = compute_world_transforms(self._overlay_smd, 0)
+                for ref_node in self._overlay_smd.nodes:
+                    anim_bid = anim_by_name.get(ref_node.name)
+                    mat = anim_world.get(anim_bid) if anim_bid is not None else None
+                    if mat is None:
+                        mat = ref_bind.get(ref_node.id, np.eye(4))
+                    self._overlay_bone_pos[ref_node.id] = (
+                        float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3])
+                    )
+            else:
+                world = compute_world_transforms(self._overlay_smd, 0)
+                for bid, mat in world.items():
+                    self._overlay_bone_pos[bid] = (float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3]))
+            for node in self._overlay_smd.nodes:
+                if node.parent_id != -1 and node.parent_id in self._overlay_bone_pos:
+                    self._overlay_bone_lines.append((node.parent_id, node.id))
+
+        def _compute_overlay_skinned_verts(self, frame_idx: int = 0) -> None:
+            """Compute skinned vertex positions for the overlay using LBS."""
+            if self._overlay_smd is None or self._overlay_anim_smd is None:
+                self._overlay_skinned_verts = None
+                return
+            ref_world    = compute_world_transforms(self._overlay_smd, 0)
+            anim_world   = compute_world_transforms(self._overlay_anim_smd, frame_idx)
+            anim_by_name = {n.name: n.id for n in self._overlay_anim_smd.nodes}
+            skin: dict[int, np.ndarray] = {}
+            for ref_node in self._overlay_smd.nodes:
+                M_bind = ref_world.get(ref_node.id, np.eye(4))
+                try:
+                    M_inv = np.linalg.inv(M_bind)
+                except np.linalg.LinAlgError:
+                    M_inv = np.eye(4)
+                anim_bid = anim_by_name.get(ref_node.name)
+                M_anim = anim_world.get(anim_bid, M_bind) if anim_bid is not None else M_bind
+                skin[ref_node.id] = M_anim @ M_inv
+            skinned: list[tuple[float, float, float]] = []
+            for tri in self._overlay_smd.triangles:
+                for v in (tri.v0, tri.v1, tri.v2):
+                    M = skin.get(v.bone_id, np.eye(4))
+                    p = M @ np.array([v.x, v.y, v.z, 1.0], dtype=np.float64)
+                    skinned.append((float(p[0]), float(p[1]), float(p[2])))
+            self._overlay_skinned_verts = skinned
 
         def _build_skeleton(self, frame_idx: int) -> None:
             """
@@ -933,6 +1029,8 @@ if _GL_OK:
             if self._show_mesh:
                 self._draw_mesh()
             self._draw_skeleton()
+            if self._overlay_smd is not None:
+                self._draw_overlay()
 
         # ── Camera helpers ───────────────────────────────────────────────
 
@@ -1040,6 +1138,56 @@ if _GL_OK:
                     glColor4f(0.10, 0.75, 1.00, 1.0)  # cyan
                 glVertex3f(x, y, z)
             glEnd()
+
+        def _draw_overlay(self) -> None:
+            """Draw the overlay (second) SMD in a distinct orange colour."""
+            ox, oy, oz = self._overlay_offset
+            glPushMatrix()
+            glTranslatef(ox, oy, oz)
+            # Solid fill
+            if self._overlay_tris:
+                active = (
+                    self._overlay_skinned_verts
+                    if self._overlay_skinned_verts is not None
+                    else self._overlay_verts
+                )
+                glColor4f(1.0, 0.55, 0.10, 0.18)
+                glBegin(GL_TRIANGLES)
+                for a, b, c in self._overlay_tris:
+                    for idx in (a, b, c):
+                        x, y, z = active[idx]
+                        glVertex3f(x, y, z)
+                glEnd()
+                # Wireframe
+                glColor4f(1.0, 0.65, 0.20, 0.45)
+                glLineWidth(0.6)
+                glBegin(GL_LINES)
+                for a, b, c in self._overlay_tris:
+                    for u, v in ((a, b), (b, c), (c, a)):
+                        x1, y1, z1 = active[u]
+                        x2, y2, z2 = active[v]
+                        glVertex3f(x1, y1, z1)
+                        glVertex3f(x2, y2, z2)
+                glEnd()
+            # Skeleton
+            if self._overlay_bone_lines:
+                glLineWidth(2.0)
+                glColor4f(1.0, 0.80, 0.10, 1.0)
+                glBegin(GL_LINES)
+                for pid, cid in self._overlay_bone_lines:
+                    if pid in self._overlay_bone_pos and cid in self._overlay_bone_pos:
+                        px, py, pz = self._overlay_bone_pos[pid]
+                        cx, cy, cz = self._overlay_bone_pos[cid]
+                        glVertex3f(px, py, pz)
+                        glVertex3f(cx, cy, cz)
+                glEnd()
+                glPointSize(7.0)
+                glColor4f(1.0, 0.75, 0.15, 1.0)
+                glBegin(GL_POINTS)
+                for x, y, z in self._overlay_bone_pos.values():
+                    glVertex3f(x, y, z)
+                glEnd()
+            glPopMatrix()
 
         # ── Mouse interaction ────────────────────────────────────────────
 
@@ -1151,6 +1299,15 @@ else:
             self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         def set_smd(self, smd: SMD | None) -> None:
+            pass
+
+        def set_overlay_smd(self, smd: SMD | None) -> None:
+            pass
+
+        def set_overlay_anim_smd(self, smd: SMD | None) -> None:
+            pass
+
+        def set_overlay_offset(self, ox: float, oy: float, oz: float) -> None:
             pass
 
         def set_selected_bone(self, bone_id: int | None) -> None:
@@ -1678,6 +1835,8 @@ class ViewerPanel(QWidget):
         self._pw_path:        str                  = ""
         self._pw_bone_map:    dict[str, str]       = {}  # pw_bone_name → weapon_bone_name
         self._pw_combo_map:   dict[int, QComboBox] = {}  # pw_bone_id → QComboBox
+        # Overlay state
+        self._overlay_smd:    SMD | None           = None  # loaded overlay SMD
         self._setup_ui()
 
     # ── Setup ────────────────────────────────────────────────────────────
@@ -1915,6 +2074,52 @@ class ViewerPanel(QWidget):
         toolbar.addStretch()
         rl.addLayout(toolbar)
 
+        # Overlay toolbar
+        overlay_bar = QHBoxLayout()
+        overlay_bar.setContentsMargins(4, 0, 4, 2)
+        overlay_bar.setSpacing(4)
+        self._chk_overlay = QCheckBox("Overlay:")
+        self._chk_overlay.setChecked(False)
+        self._chk_overlay.toggled.connect(self._on_overlay_toggled)
+        overlay_bar.addWidget(self._chk_overlay)
+        self._overlay_model_combo = QComboBox()
+        self._overlay_model_combo.setMinimumWidth(100)
+        self._overlay_model_combo.currentIndexChanged.connect(self._on_overlay_model_changed)
+        overlay_bar.addWidget(self._overlay_model_combo, 1)
+        self._overlay_ref_combo = QComboBox()
+        self._overlay_ref_combo.setMinimumWidth(90)
+        self._overlay_ref_combo.currentIndexChanged.connect(self._on_overlay_ref_changed)
+        overlay_bar.addWidget(self._overlay_ref_combo, 1)
+        self._overlay_anim_combo = QComboBox()
+        self._overlay_anim_combo.setMinimumWidth(90)
+        self._overlay_anim_combo.currentIndexChanged.connect(self._on_overlay_anim_changed)
+        overlay_bar.addWidget(self._overlay_anim_combo, 1)
+        rl.addLayout(overlay_bar)
+
+        # Overlay offset row
+        ov_offset_bar = QHBoxLayout()
+        ov_offset_bar.setContentsMargins(4, 0, 4, 2)
+        ov_offset_bar.setSpacing(4)
+        ov_offset_bar.addWidget(QLabel("Offset:"))
+        self._overlay_offset_spins: list[QDoubleSpinBox] = []
+        for axis in ("X", "Y", "Z"):
+            ov_offset_bar.addWidget(QLabel(axis))
+            spin = QDoubleSpinBox()
+            spin.setRange(-9999.0, 9999.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(1.0)
+            spin.setValue(0.0)
+            spin.setFixedWidth(68)
+            spin.valueChanged.connect(self._on_overlay_offset_changed)
+            ov_offset_bar.addWidget(spin)
+            self._overlay_offset_spins.append(spin)
+        ov_reset_btn = QPushButton("Reset")
+        ov_reset_btn.setFixedWidth(44)
+        ov_reset_btn.clicked.connect(self._on_overlay_offset_reset)
+        ov_offset_bar.addWidget(ov_reset_btn)
+        ov_offset_bar.addStretch()
+        rl.addLayout(ov_offset_bar)
+
         self._viewport = _SMDViewport()
         self._viewport.boneHovered.connect(self._on_bone_hovered)
         self._viewport.boneUnhovered.connect(self._on_bone_unhovered)
@@ -1984,6 +2189,18 @@ class ViewerPanel(QWidget):
         self._model_combo.setCurrentIndex(max(0, idx))
         self._model_combo.blockSignals(False)
         self._on_model_changed()
+
+        # Keep overlay model combo in sync
+        prev_ov = self._overlay_model_combo.currentText()
+        self._overlay_model_combo.blockSignals(True)
+        self._overlay_model_combo.clear()
+        self._overlay_model_combo.addItem("(none)")
+        for m in models:
+            self._overlay_model_combo.addItem(m.name)
+        ov_idx = self._overlay_model_combo.findText(prev_ov)
+        self._overlay_model_combo.setCurrentIndex(max(0, ov_idx))
+        self._overlay_model_combo.blockSignals(False)
+        self._refresh_overlay_ref_combo()
 
     def get_current_model_smds(self) -> tuple[str, dict]:
         """Return (model_name, smds_dict) for the currently selected model."""
@@ -2116,6 +2333,75 @@ class ViewerPanel(QWidget):
 
     def _on_textures_toggled(self, checked: bool) -> None:
         self._viewport.set_textures_visible(checked)
+
+    # ── Overlay handlers ─────────────────────────────────────────────────
+
+    def _on_overlay_toggled(self, checked: bool) -> None:
+        self._viewport.set_overlay_smd(self._overlay_smd if checked else None)
+
+    def _refresh_overlay_ref_combo(self) -> None:
+        """Populate overlay ref + anim combos from the selected overlay model."""
+        idx = self._overlay_model_combo.currentIndex()
+        keys: list[str] = []
+        if idx >= 1:
+            keys = list(self._models[idx - 1].smds.keys())
+
+        self._overlay_ref_combo.blockSignals(True)
+        self._overlay_ref_combo.clear()
+        for k in keys:
+            self._overlay_ref_combo.addItem(k)
+        self._overlay_ref_combo.blockSignals(False)
+
+        self._overlay_anim_combo.blockSignals(True)
+        self._overlay_anim_combo.clear()
+        self._overlay_anim_combo.addItem("(none)")
+        for k in keys:
+            self._overlay_anim_combo.addItem(k)
+        self._overlay_anim_combo.blockSignals(False)
+
+        self._on_overlay_ref_changed()
+
+    def _on_overlay_model_changed(self) -> None:
+        self._refresh_overlay_ref_combo()
+
+    def _on_overlay_ref_changed(self) -> None:
+        idx_model = self._overlay_model_combo.currentIndex()
+        ref_name  = self._overlay_ref_combo.currentText()
+        if idx_model >= 1 and ref_name:
+            model = self._models[idx_model - 1]
+            self._overlay_smd = model.smds.get(ref_name)
+        else:
+            self._overlay_smd = None
+        if self._chk_overlay.isChecked():
+            self._viewport.set_overlay_smd(self._overlay_smd)
+        # Reset anim selection to (none) when ref changes
+        self._overlay_anim_combo.blockSignals(True)
+        self._overlay_anim_combo.setCurrentIndex(0)
+        self._overlay_anim_combo.blockSignals(False)
+        self._viewport.set_overlay_anim_smd(None)
+
+    def _on_overlay_anim_changed(self) -> None:
+        idx_model = self._overlay_model_combo.currentIndex()
+        anim_name = self._overlay_anim_combo.currentText()
+        if idx_model >= 1 and anim_name and anim_name != "(none)":
+            model = self._models[idx_model - 1]
+            anim_smd = model.smds.get(anim_name)
+        else:
+            anim_smd = None
+        self._viewport.set_overlay_anim_smd(anim_smd)
+
+    def _on_overlay_offset_changed(self) -> None:
+        ox = self._overlay_offset_spins[0].value()
+        oy = self._overlay_offset_spins[1].value()
+        oz = self._overlay_offset_spins[2].value()
+        self._viewport.set_overlay_offset(ox, oy, oz)
+
+    def _on_overlay_offset_reset(self) -> None:
+        for spin in self._overlay_offset_spins:
+            spin.blockSignals(True)
+            spin.setValue(0.0)
+            spin.blockSignals(False)
+        self._viewport.set_overlay_offset(0.0, 0.0, 0.0)
 
     def _on_selection_changed(self) -> None:
         items = self._tree.selectedItems()
@@ -2869,8 +3155,8 @@ class ViewerPanel(QWidget):
             "All skeleton positions come from the original weapon bind-pose.\n"
             f"Unassigned weapon bones ({len(unassigned)}) will be DELETED "
             "(along with their triangles).\n\n"
-            "Disk operations:\n"
-            "  • P-weapon SMD written to model directory\n"
+            "In-memory: combined p-weapon body SMD added to model SMDs.\n"
+            "Disk operations (if model dir is set):\n"
             "  • P-weapon textures copied to model directory\n"
             "  • New 'p_weapon' bodygroup added to QC"
         )
@@ -2893,6 +3179,18 @@ class ViewerPanel(QWidget):
                 model.smds[key] = new_smd
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
+
+        # Add the combined p-weapon body SMD to model.smds in memory
+        # (no disk write — "Save All" will persist it alongside the other SMDs)
+        if original_ref_smd is not None and not errors:
+            try:
+                pw_stem  = Path(self._pw_path).stem
+                pw_body  = _build_pw_body_smd(
+                    self._pw_smd, original_ref_smd, self._pw_bone_map
+                )
+                model.smds[pw_stem] = pw_body
+            except Exception as exc:
+                errors.append(f"Build p-weapon body SMD: {exc}")
 
         disk_msg    = ""
         qc_modified = False
@@ -2937,9 +3235,10 @@ class ViewerPanel(QWidget):
     def _post_apply_pw(self, model_dir: str, original_ref_smd: SMD) -> str:
         """
         Disk-side operations after p-weapon replacement:
-        1. Build and write combined p-weapon body SMD (weapon skeleton positions)
-        2. Copy p-weapon textures to model directory
-        3. Update QC: add 'p_weapon' bodygroup
+        1. Copy p-weapon textures to model directory
+        2. Update QC: add 'p_weapon' bodygroup
+        The combined p-weapon body SMD is added to model.smds in memory (not
+        written here); "Save All" will persist it alongside the other SMDs.
         Returns a short summary string.
         """
         model_path = Path(model_dir)
@@ -2947,14 +3246,7 @@ class ViewerPanel(QWidget):
         pw_stem    = pw_path.stem
         pw_dir     = pw_path.parent
 
-        # 1. Build combined p-weapon body SMD
-        pw_body       = _build_pw_body_smd(
-            self._pw_smd, original_ref_smd, self._pw_bone_map
-        )
-        dest_smd_path = model_path / f"{pw_stem}.smd"
-        pw_body.save(dest_smd_path)
-
-        # 2. Copy p-weapon textures
+        # 1. Copy p-weapon textures
         pw_mats = {Path(tri.material).name for tri in self._pw_smd.triangles}
         tex_copied: list[str] = []
         for mat_name in pw_mats:
@@ -2972,7 +3264,7 @@ class ViewerPanel(QWidget):
         qc_files = list(model_path.glob("*.qc"))
         if not qc_files:
             return (
-                f"P-weapon SMD written: {dest_smd_path.name}\n"
+                f"P-weapon body SMD added to memory as '{pw_stem}'\n"
                 f"Textures copied: {len(tex_copied)}\n"
                 "No QC file found in model directory."
             )
@@ -3007,7 +3299,7 @@ class ViewerPanel(QWidget):
         qc.save(str(qc_path))
 
         lines = [
-            f"P-weapon SMD written: {dest_smd_path.name}",
+            f"P-weapon body SMD added to memory as '{pw_stem}' (save with 'Save All')",
             f"Textures copied:      {', '.join(tex_copied) if tex_copied else 'none'}",
             f"QC updated ({qc_path.name}):",
             f"  $attachment bones renamed: {att_renamed or 'none'}",
