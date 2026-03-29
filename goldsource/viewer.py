@@ -2171,6 +2171,27 @@ class ViewerPanel(QWidget):
         ov_offset_bar.addStretch()
         rl.addLayout(ov_offset_bar)
 
+        # Overlay bone-alignment row
+        ov_align_bar = QHBoxLayout()
+        ov_align_bar.setContentsMargins(4, 0, 4, 2)
+        ov_align_bar.setSpacing(4)
+        ov_align_bar.addWidget(QLabel("Align:"))
+        self._ov_align_bone_combo = QComboBox()
+        self._ov_align_bone_combo.setMinimumWidth(110)
+        self._ov_align_bone_combo.setToolTip("Overlay bone to align from")
+        ov_align_bar.addWidget(self._ov_align_bone_combo, 1)
+        ov_align_bar.addWidget(QLabel("→"))
+        self._main_align_bone_combo = QComboBox()
+        self._main_align_bone_combo.setMinimumWidth(110)
+        self._main_align_bone_combo.setToolTip("Main model bone to align to")
+        ov_align_bar.addWidget(self._main_align_bone_combo, 1)
+        ov_align_set_btn = QPushButton("Set Offset")
+        ov_align_set_btn.setFixedWidth(68)
+        ov_align_set_btn.clicked.connect(self._on_align_bones_clicked)
+        ov_align_bar.addWidget(ov_align_set_btn)
+        ov_align_bar.addStretch()
+        rl.addLayout(ov_align_bar)
+
         self._viewport = _SMDViewport()
         self._viewport.boneHovered.connect(self._on_bone_hovered)
         self._viewport.boneUnhovered.connect(self._on_bone_unhovered)
@@ -2316,6 +2337,7 @@ class ViewerPanel(QWidget):
         self._btn_save_all.setEnabled(has_model_dir and model is not None)
         self._rebuild_hands_tree()
         self._rebuild_pw_tree()
+        self._refresh_main_align_bone_combo()
         # Re-apply the current animation selection on top of the new ref SMD
         self._on_anim_combo_changed()
 
@@ -2430,6 +2452,7 @@ class ViewerPanel(QWidget):
         self._overlay_anim_combo.setCurrentIndex(0)
         self._overlay_anim_combo.blockSignals(False)
         self._viewport.set_overlay_anim_smd(None)
+        self._refresh_overlay_align_bone_combo()
 
     def _on_overlay_anim_changed(self) -> None:
         idx_model = self._overlay_model_combo.currentIndex()
@@ -2453,6 +2476,46 @@ class ViewerPanel(QWidget):
             spin.setValue(0.0)
             spin.blockSignals(False)
         self._viewport.set_overlay_offset(0.0, 0.0, 0.0)
+
+    def _refresh_overlay_align_bone_combo(self) -> None:
+        self._ov_align_bone_combo.blockSignals(True)
+        self._ov_align_bone_combo.clear()
+        if self._overlay_smd:
+            for node in sorted(self._overlay_smd.nodes, key=lambda n: n.id):
+                self._ov_align_bone_combo.addItem(node.name)
+        self._ov_align_bone_combo.blockSignals(False)
+
+    def _refresh_main_align_bone_combo(self) -> None:
+        self._main_align_bone_combo.blockSignals(True)
+        self._main_align_bone_combo.clear()
+        if self._cur_smd:
+            for node in sorted(self._cur_smd.nodes, key=lambda n: n.id):
+                self._main_align_bone_combo.addItem(node.name)
+        self._main_align_bone_combo.blockSignals(False)
+
+    def _on_align_bones_clicked(self) -> None:
+        overlay_bone = self._ov_align_bone_combo.currentText()
+        main_bone    = self._main_align_bone_combo.currentText()
+        if not overlay_bone or not main_bone:
+            return
+        if self._overlay_smd is None or self._cur_smd is None:
+            return
+        ov_world   = compute_world_transforms(self._overlay_smd, 0)
+        main_world = compute_world_transforms(self._cur_smd, 0)
+        ov_node   = next((n for n in self._overlay_smd.nodes if n.name == overlay_bone), None)
+        main_node = next((n for n in self._cur_smd.nodes   if n.name == main_bone),    None)
+        if ov_node is None or main_node is None:
+            return
+        ov_pos   = ov_world.get(ov_node.id,   np.eye(4))[:3, 3]
+        main_pos = main_world.get(main_node.id, np.eye(4))[:3, 3]
+        ox = float(main_pos[0] - ov_pos[0])
+        oy = float(main_pos[1] - ov_pos[1])
+        oz = float(main_pos[2] - ov_pos[2])
+        for spin, val in zip(self._overlay_offset_spins, (ox, oy, oz)):
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
+        self._viewport.set_overlay_offset(ox, oy, oz)
 
     def _on_selection_changed(self) -> None:
         items = self._tree.selectedItems()
