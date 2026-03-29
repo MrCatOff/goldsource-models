@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QCheckBox, QComboBox, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QInputDialog, QFileDialog, QGroupBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QSlider, QTabWidget,
+    QTableWidgetItem, QAbstractItemView, QSlider, QTabWidget, QDoubleSpinBox,
 )
 
 try:
@@ -478,6 +478,108 @@ def _build_pw_body_smd(
 # ---------------------------------------------------------------------------
 # Bone world-transform maths
 # ---------------------------------------------------------------------------
+
+def _extract_euler_zyx(R: np.ndarray) -> tuple[float, float, float]:
+    """
+    Extract (rx, ry, rz) from a 3×3 rotation matrix built as Rz(rz)@Ry(ry)@Rx(rx).
+    Handles gimbal lock when cos(ry) ≈ 0.
+    """
+    sy = -R[2, 0]
+    cy = math.sqrt(R[2, 1] ** 2 + R[2, 2] ** 2)
+    if cy > 1e-6:
+        rx = math.atan2(R[2, 1], R[2, 2])
+        ry = math.atan2(sy, cy)
+        rz = math.atan2(R[1, 0], R[0, 0])
+    else:
+        rx = math.atan2(-R[1, 2], R[1, 1])
+        ry = math.atan2(sy, cy)
+        rz = 0.0
+    return rx, ry, rz
+
+
+def _rotate_bone_in_smd(
+    smd: SMD,
+    bone_name: str,
+    drx: float,
+    dry: float,
+    drz: float,
+) -> None:
+    """
+    Rotate *bone_name* in-place by (drx, dry, drz) radians.
+
+    For reference SMDs (has triangles):
+      - Vertex positions and normals of triangles skinned to the bone are
+        rotated in world space around the bone's bind-pose origin.
+
+    For all SMDs (including animation-only):
+      - The bone's local skeleton transforms are recomputed so that the
+        world-space rotation is updated by the delta.
+      - Direct children's local translations are updated so their world
+        positions remain unchanged.
+    """
+    node = smd.node_by_name(bone_name)
+    if node is None or not smd.skeleton:
+        return
+
+    bid = node.id
+
+    # ── World transforms at frame 0 ──────────────────────────────────────
+    world0      = compute_world_transforms(smd, 0)
+    M_bone0     = world0.get(bid, np.eye(4))
+    origin      = M_bone0[:3, 3]                     # world-space pivot
+
+    # Parent world rotation at frame 0 (needed to convert delta to local)
+    parent_id   = node.parent_id
+    M_par0      = world0.get(parent_id, np.eye(4)) if parent_id != -1 else np.eye(4)
+    R_par0      = M_par0[:3, :3]
+
+    # 3×3 world-space delta rotation
+    R_delta     = _euler_mat4(drx, dry, drz)[:3, :3]
+
+    # ── Rotate vertex geometry (reference SMDs only) ─────────────────────
+    if smd.triangles:
+        for tri in smd.triangles:
+            for v in (tri.v0, tri.v1, tri.v2):
+                if v.bone_id == bid:
+                    p = np.array([v.x, v.y, v.z], dtype=np.float64)
+                    p_new = R_delta @ (p - origin) + origin
+                    v.x, v.y, v.z = float(p_new[0]), float(p_new[1]), float(p_new[2])
+                    n = R_delta @ np.array([v.nx, v.ny, v.nz], dtype=np.float64)
+                    v.nx, v.ny, v.nz = float(n[0]), float(n[1]), float(n[2])
+
+    # ── Update skeleton transforms for every frame ───────────────────────
+    # Convert world-space delta to local-space delta once (using frame-0 parent):
+    #   R_local_new = R_par0.T @ R_delta @ R_par0 @ R_local_old
+    # We compose it as a rotation applied to the *current* local rotation.
+    R_delta_local = R_par0.T @ R_delta @ R_par0    # local-space delta
+
+    id_to_node = {n.id: n for n in smd.nodes}
+
+    for frame in smd.skeleton:
+        bt_map = {bt.bone_id: bt for bt in frame.bones}
+        bt = bt_map.get(bid)
+        if bt is None:
+            continue
+
+        # Current local rotation matrix
+        R_local_old = _euler_mat4(bt.rx, bt.ry, bt.rz)[:3, :3]
+        R_local_new = R_delta_local @ R_local_old
+        rx_new, ry_new, rz_new = _extract_euler_zyx(R_local_new)
+        bt.rx, bt.ry, bt.rz = rx_new, ry_new, rz_new
+
+        # Update direct children's local translation so world positions are
+        # unchanged: T_local_child_new = R_local_new.T @ R_local_old @ T_local_child_old
+        T_corr = R_local_new.T @ R_local_old   # child translation correction
+        for child in smd.nodes:
+            if child.parent_id == bid:
+                bt_child = bt_map.get(child.id)
+                if bt_child is not None:
+                    t_old = np.array([bt_child.tx, bt_child.ty, bt_child.tz])
+                    t_new = T_corr @ t_old
+                    bt_child.tx = float(t_new[0])
+                    bt_child.ty = float(t_new[1])
+                    bt_child.tz = float(t_new[2])
+
 
 def _euler_mat4(rx: float, ry: float, rz: float) -> np.ndarray:
     """
@@ -1732,6 +1834,37 @@ class ViewerPanel(QWidget):
         self._pw_status.setWordWrap(True)
         pl.addWidget(self._pw_status)
 
+        # ── Bone rotation section ──────────────────────────────────────────
+        rot_box = QGroupBox("Rotate Selected Bone (degrees)")
+        rot_layout = QVBoxLayout(rot_box)
+        rot_layout.setContentsMargins(6, 4, 6, 4)
+        rot_layout.setSpacing(3)
+
+        rot_axes_row = QHBoxLayout()
+        rot_axes_row.setSpacing(4)
+        self._pw_rot_label = QLabel("(select a bone in the tree above)")
+        self._pw_rot_label.setStyleSheet("color: #888; font-size: 10px;")
+        rot_layout.addWidget(self._pw_rot_label)
+
+        for axis in ("RX", "RY", "RZ"):
+            rot_axes_row.addWidget(QLabel(axis + ":"))
+            spin = QDoubleSpinBox()
+            spin.setRange(-360.0, 360.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(1.0)
+            spin.setValue(0.0)
+            spin.setSuffix("°")
+            spin.setFixedWidth(72)
+            setattr(self, f"_pw_rot_{axis.lower()}", spin)
+            rot_axes_row.addWidget(spin)
+        rot_layout.addLayout(rot_axes_row)
+
+        self._btn_apply_rot = QPushButton("Apply Rotation to All SMDs")
+        self._btn_apply_rot.clicked.connect(self._on_apply_bone_rotation)
+        rot_layout.addWidget(self._btn_apply_rot)
+
+        pl.addWidget(rot_box)
+
         pw_btn_row = QHBoxLayout()
         self._btn_clear_pw = QPushButton("Clear")
         self._btn_clear_pw.setEnabled(False)
@@ -1995,6 +2128,10 @@ class ViewerPanel(QWidget):
             bid = items[0].data(0, Qt.ItemDataRole.UserRole)
             self._viewport.set_selected_bone(bid)
             self._viewport.highlight_bone(bid)
+            bone_name = items[0].text(0)
+            self._pw_rot_label.setText(f"Bone: {bone_name}")
+        else:
+            self._pw_rot_label.setText("(select a bone in the tree above)")
 
     def _on_rename_clicked(self) -> None:
         items = self._tree.selectedItems()
@@ -2643,6 +2780,43 @@ class ViewerPanel(QWidget):
         self._pw_status.setText("")
         self._btn_apply_pw.setEnabled(False)
         self._btn_clear_pw.setEnabled(False)
+
+    def _on_apply_bone_rotation(self) -> None:
+        """Rotate the selected bone's geometry and skeleton in all SMDs."""
+        items = self._tree.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "Rotate Bone",
+                                "No bone selected. Select a bone in the tree first.")
+            return
+        model = next(
+            (m for m in self._models if m.name == self._cur_model_name), None
+        )
+        if model is None:
+            return
+
+        bone_name = items[0].text(0)
+        drx = math.radians(self._pw_rot_rx.value())
+        dry = math.radians(self._pw_rot_ry.value())
+        drz = math.radians(self._pw_rot_rz.value())
+
+        if drx == 0.0 and dry == 0.0 and drz == 0.0:
+            return
+
+        n_modified = 0
+        for smd in model.smds.values():
+            if smd.node_by_name(bone_name) is None:
+                continue
+            _rotate_bone_in_smd(smd, bone_name, drx, dry, drz)
+            n_modified += 1
+
+        if n_modified:
+            self._on_ref_changed()   # refresh viewport
+            self.operationRecorded.emit(
+                f"Rotated bone '{bone_name}' by "
+                f"({math.degrees(drx):.2f}°, {math.degrees(dry):.2f}°, "
+                f"{math.degrees(drz):.2f}°) across {n_modified} SMD(s)",
+                "rotate_bone",
+            )
 
     def _on_apply_pw(self) -> None:
         if not self._pw_bone_map or self._pw_smd is None:
