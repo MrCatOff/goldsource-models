@@ -790,6 +790,9 @@ if _GL_OK:
             self._frame_idx = idx
             self._build_skeleton(idx)
             self._compute_skinned_verts(idx)
+            if self._overlay_anim_smd is not None:
+                self._build_overlay_skeleton(idx)
+                self._compute_overlay_skinned_verts(idx)
             self.update()
 
         def set_texture_dir(self, directory: str) -> None:
@@ -2500,14 +2503,42 @@ class ViewerPanel(QWidget):
             return
         if self._overlay_smd is None or self._cur_smd is None:
             return
-        ov_world   = compute_world_transforms(self._overlay_smd, 0)
-        main_world = compute_world_transforms(self._cur_smd, 0)
-        ov_node   = next((n for n in self._overlay_smd.nodes if n.name == overlay_bone), None)
-        main_node = next((n for n in self._cur_smd.nodes   if n.name == main_bone),    None)
-        if ov_node is None or main_node is None:
+
+        frame_idx = self._viewport._frame_idx
+
+        # ── Overlay bone world position ───────────────────────────────────
+        ov_node = next((n for n in self._overlay_smd.nodes if n.name == overlay_bone), None)
+        if ov_node is None:
             return
-        ov_pos   = ov_world.get(ov_node.id,   np.eye(4))[:3, 3]
-        main_pos = main_world.get(main_node.id, np.eye(4))[:3, 3]
+        ov_anim_smd = self._viewport._overlay_anim_smd
+        if ov_anim_smd is not None:
+            anim_world   = compute_world_transforms(ov_anim_smd, frame_idx)
+            anim_by_name = {n.name: n.id for n in ov_anim_smd.nodes}
+            anim_bid = anim_by_name.get(overlay_bone)
+            if anim_bid is not None:
+                ov_pos = anim_world.get(anim_bid, np.eye(4))[:3, 3]
+            else:
+                # Bone not in anim SMD — fall back to bind pose
+                ov_pos = compute_world_transforms(self._overlay_smd, 0).get(ov_node.id, np.eye(4))[:3, 3]
+        else:
+            ov_pos = compute_world_transforms(self._overlay_smd, 0).get(ov_node.id, np.eye(4))[:3, 3]
+
+        # ── Main model bone world position ────────────────────────────────
+        main_node = next((n for n in self._cur_smd.nodes if n.name == main_bone), None)
+        if main_node is None:
+            return
+        main_anim_smd = self._viewport._anim_smd
+        if main_anim_smd is not None:
+            anim_world   = compute_world_transforms(main_anim_smd, frame_idx)
+            anim_by_name = {n.name: n.id for n in main_anim_smd.nodes}
+            anim_bid = anim_by_name.get(main_bone)
+            if anim_bid is not None:
+                main_pos = anim_world.get(anim_bid, np.eye(4))[:3, 3]
+            else:
+                main_pos = compute_world_transforms(self._cur_smd, 0).get(main_node.id, np.eye(4))[:3, 3]
+        else:
+            main_pos = compute_world_transforms(self._cur_smd, 0).get(main_node.id, np.eye(4))[:3, 3]
+
         ox = float(main_pos[0] - ov_pos[0])
         oy = float(main_pos[1] - ov_pos[1])
         oz = float(main_pos[2] - ov_pos[2])
