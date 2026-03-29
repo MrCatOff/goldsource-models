@@ -199,17 +199,29 @@ def _apply_hand_replacement(
         if wp_node:
             wp_node_by_hand_name[hn.name] = wp_node
 
+    # For reference SMDs (non-animation, has triangles) the skeleton must match
+    # hands_smd (weapon.smd) exactly — use its bind-pose directly for all
+    # pw/hand bones.  For animation SMDs keep using the weapon's per-frame data
+    # so animations play correctly.
+    is_reference_smd = bool(smd.triangles)
+    hands_bind: dict[int, "BoneTransform"] = {}
+    if hands_smd.skeleton:
+        hands_bind = {bt.bone_id: bt for bt in hands_smd.skeleton[0].bones}
+
     new_frames: list[SkeletonFrame] = []
     for frame in (smd.skeleton or []):
         old_bt = {bt.bone_id: bt for bt in frame.bones}
         new_bones: list[BoneTransform] = []
 
-        # Hand bones — always use the weapon's own skeleton data (just re-ID'd).
-        # The master hands file only contributes node IDs/names/hierarchy,
-        # never transforms, so animation is preserved correctly.
         for hn in hands_smd.nodes:
-            wp_node = wp_node_by_hand_name.get(hn.name)
-            src_bt  = old_bt.get(wp_node.id) if wp_node else None
+            if is_reference_smd:
+                # Reference SMD: use hands_smd bind-pose directly so skeleton
+                # is identical to weapon.smd.
+                src_bt = hands_bind.get(hn.id)
+            else:
+                # Animation SMD: map weapon's per-frame transforms to new IDs.
+                wp_node = wp_node_by_hand_name.get(hn.name)
+                src_bt  = old_bt.get(wp_node.id) if wp_node else None
             if src_bt:
                 new_bones.append(BoneTransform(
                     bone_id=hn.id,
@@ -420,19 +432,27 @@ def _build_pw_body_smd(
         new_parent = old_to_new.get(n.parent_id, -1) if n.parent_id != -1 else -1
         new_nodes.append(Node(id=old_to_new[n.id], name=n.name, parent_id=new_parent))
 
-    # ── Skeleton frame 0: ALL transforms from weapon_ref_smd ──────────────
+    # ── Skeleton frame 0 ──────────────────────────────────────────────────
     wp_bt = {bt.bone_id: bt for bt in weapon_ref_smd.skeleton[0].bones} \
             if weapon_ref_smd.skeleton else {}
+    pw_bt = {bt.bone_id: bt for bt in pw_smd.skeleton[0].bones} \
+            if pw_smd.skeleton else {}
 
-    # Build a lookup: weapon_bone_name → transform
+    # weapon_bone_name → weapon transform (for explicitly mapped bones)
     wp_name_to_bt = {n.name: wp_bt.get(n.id) for n in weapon_ref_smd.nodes}
 
     new_bones: list[BoneTransform] = []
     for pn in sorted(pw_smd.nodes, key=lambda x: x.id):
         out_id  = pw_wp_id[pn.id]
-        # Find the weapon bone this pw bone maps to (if any)
+        # 1. Try explicit user map: pw_name → weapon_name → weapon transform
         wp_name = pw_to_weapon.get(pn.name)
         bt      = wp_name_to_bt.get(wp_name) if wp_name else None
+        # 2. Try implicit name match: pw bone name == weapon bone name
+        if bt is None:
+            bt = wp_name_to_bt.get(pn.name)
+        # 3. Fall back to pw_smd's own bind-pose so positions stay consistent
+        if bt is None:
+            bt = pw_bt.get(pn.id)
         if bt:
             new_bones.append(BoneTransform(
                 bone_id=out_id,
