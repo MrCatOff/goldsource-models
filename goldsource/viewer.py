@@ -785,7 +785,9 @@ if _GL_OK:
             self._overlay_skinned_verts: list | None = None
             self._overlay_bone_pos:     dict[int, tuple[float, float, float]] = {}
             self._overlay_bone_lines:   list[tuple[int, int]]       = []
-            self._overlay_offset:       tuple[float, float, float]  = (0.0, 0.0, 0.0)
+
+            # Visual offset applied to the MAIN model (not the overlay)
+            self._main_offset:          tuple[float, float, float]  = (0.0, 0.0, 0.0)
 
             self.setMouseTracking(True)
             self.setMinimumSize(300, 300)
@@ -810,8 +812,8 @@ if _GL_OK:
                 self._compute_overlay_skinned_verts()
             self.update()
 
-        def set_overlay_offset(self, ox: float, oy: float, oz: float) -> None:
-            self._overlay_offset = (ox, oy, oz)
+        def set_main_offset(self, ox: float, oy: float, oz: float) -> None:
+            self._main_offset = (ox, oy, oz)
             self.update()
 
         def set_smd(self, smd: SMD | None) -> None:
@@ -1130,9 +1132,13 @@ if _GL_OK:
             )
 
             self._draw_grid()
+            mx, my, mz = self._main_offset
+            glPushMatrix()
+            glTranslatef(mx, my, mz)
             if self._show_mesh:
                 self._draw_mesh()
             self._draw_skeleton()
+            glPopMatrix()
             if self._overlay_smd is not None:
                 self._draw_overlay()
 
@@ -1245,9 +1251,6 @@ if _GL_OK:
 
         def _draw_overlay(self) -> None:
             """Draw the overlay (second) SMD in a distinct orange colour."""
-            ox, oy, oz = self._overlay_offset
-            glPushMatrix()
-            glTranslatef(ox, oy, oz)
             # Solid fill
             if self._overlay_tris:
                 active = (
@@ -1291,7 +1294,6 @@ if _GL_OK:
                 for x, y, z in self._overlay_bone_pos.values():
                     glVertex3f(x, y, z)
                 glEnd()
-            glPopMatrix()
 
         # ── Mouse interaction ────────────────────────────────────────────
 
@@ -1411,7 +1413,7 @@ else:
         def set_overlay_anim_smd(self, smd: SMD | None) -> None:
             pass
 
-        def set_overlay_offset(self, ox: float, oy: float, oz: float) -> None:
+        def set_main_offset(self, ox: float, oy: float, oz: float) -> None:
             pass
 
         def set_selected_bone(self, bone_id: int | None) -> None:
@@ -2246,6 +2248,11 @@ class ViewerPanel(QWidget):
         ov_reset_btn.setFixedWidth(44)
         ov_reset_btn.clicked.connect(self._on_overlay_offset_reset)
         ov_offset_bar.addWidget(ov_reset_btn)
+        ov_apply_btn = QPushButton("Apply to Model")
+        ov_apply_btn.setFixedWidth(90)
+        ov_apply_btn.setToolTip("Bake offset into the model's root bone(s) and reset")
+        ov_apply_btn.clicked.connect(self._on_overlay_offset_apply)
+        ov_offset_bar.addWidget(ov_apply_btn)
         # Separator
         ov_offset_bar.addSpacing(8)
         ov_offset_bar.addWidget(QLabel("Align:"))
@@ -2541,14 +2548,42 @@ class ViewerPanel(QWidget):
         ox = self._overlay_offset_spins[0].value()
         oy = self._overlay_offset_spins[1].value()
         oz = self._overlay_offset_spins[2].value()
-        self._viewport.set_overlay_offset(ox, oy, oz)
+        self._viewport.set_main_offset(ox, oy, oz)
 
     def _on_overlay_offset_reset(self) -> None:
         for spin in self._overlay_offset_spins:
             spin.blockSignals(True)
             spin.setValue(0.0)
             spin.blockSignals(False)
-        self._viewport.set_overlay_offset(0.0, 0.0, 0.0)
+        self._viewport.set_main_offset(0.0, 0.0, 0.0)
+
+    def _on_overlay_offset_apply(self) -> None:
+        """Bake the visual offset into the main model's root bone(s)."""
+        ox = self._overlay_offset_spins[0].value()
+        oy = self._overlay_offset_spins[1].value()
+        oz = self._overlay_offset_spins[2].value()
+        if ox == 0.0 and oy == 0.0 and oz == 0.0:
+            return
+        model = next(
+            (m for m in self._models if m.name == self._cur_model_name), None
+        )
+        if model is None:
+            return
+        # Apply offset to every root bone (parent_id == -1) in all SMDs
+        n_modified = 0
+        for smd in model.smds.values():
+            for node in smd.nodes:
+                if node.parent_id == -1:
+                    _translate_bone_in_smd(smd, node.name, ox, oy, oz)
+            n_modified += 1
+        if n_modified:
+            self._on_overlay_offset_reset()   # clear visual offset after baking
+            self._on_ref_changed()
+            self.operationRecorded.emit(
+                f"Applied offset ({ox:.2f}, {oy:.2f}, {oz:.2f}) to model "
+                f"'{self._cur_model_name}' across {n_modified} SMD(s)",
+                "apply_offset",
+            )
 
     def _refresh_overlay_align_bone_combo(self) -> None:
         self._ov_align_bone_combo.blockSignals(True)
@@ -2609,14 +2644,15 @@ class ViewerPanel(QWidget):
         else:
             main_pos = compute_world_transforms(self._cur_smd, 0).get(main_node.id, np.eye(4))[:3, 3]
 
-        ox = float(main_pos[0] - ov_pos[0])
-        oy = float(main_pos[1] - ov_pos[1])
-        oz = float(main_pos[2] - ov_pos[2])
+        # Move the MAIN model so its bone lands on the overlay bone
+        ox = float(ov_pos[0] - main_pos[0])
+        oy = float(ov_pos[1] - main_pos[1])
+        oz = float(ov_pos[2] - main_pos[2])
         for spin, val in zip(self._overlay_offset_spins, (ox, oy, oz)):
             spin.blockSignals(True)
             spin.setValue(val)
             spin.blockSignals(False)
-        self._viewport.set_overlay_offset(ox, oy, oz)
+        self._viewport.set_main_offset(ox, oy, oz)
 
     def _on_selection_changed(self) -> None:
         items = self._tree.selectedItems()
