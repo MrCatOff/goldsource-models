@@ -293,7 +293,8 @@ class _ModelListPanel(QWidget):
 
     def _on_add(self) -> None:
         directory = QFileDialog.getExistingDirectory(
-            self, "Select decompiled model directory"
+            self, "Select decompiled model directory", "",
+            QFileDialog.Option.DontUseNativeDialog,
         )
         if not directory:
             return

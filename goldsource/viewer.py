@@ -642,44 +642,23 @@ def _translate_bone_in_smd(
     """
     Translate *bone_name* in-place by (dtx, dty, dtz) world-space units.
 
-    For reference SMDs (has triangles):
-      - Vertex positions of triangles skinned to the bone are shifted.
-
-    For all SMDs (including animation-only):
-      - The bone's local skeleton translation is updated in every frame so
-        the world-space shift is preserved.  Children are unaffected (they
-        move with the parent automatically).
+    Only triangle vertex positions are modified — the skeleton is left
+    untouched.  StudioMDL derives the vertex-to-bone local offset from the
+    vertex world position in the reference SMD, so moving vertices is what
+    actually repositions the mesh in the compiled model.  Modifying the
+    skeleton translation has no effect on mesh position in HLMV.
     """
     node = smd.node_by_name(bone_name)
-    if node is None or not smd.skeleton:
+    if node is None:
         return
 
-    bid       = node.id
-    parent_id = node.parent_id
-    world0    = compute_world_transforms(smd, 0)
-    M_par0    = world0.get(parent_id, np.eye(4)) if parent_id != -1 else np.eye(4)
-    R_par0    = M_par0[:3, :3]
-
-    delta_world = np.array([dtx, dty, dtz], dtype=np.float64)
-    delta_local = R_par0.T @ delta_world   # convert world delta to parent-local
-
-    # Shift vertex positions (reference SMDs only)
-    if smd.triangles:
-        for tri in smd.triangles:
-            for v in (tri.v0, tri.v1, tri.v2):
-                if v.bone_id == bid:
-                    v.x += float(delta_world[0])
-                    v.y += float(delta_world[1])
-                    v.z += float(delta_world[2])
-
-    # Update local translation in every skeleton frame
-    for frame in smd.skeleton:
-        bt_map = {bt.bone_id: bt for bt in frame.bones}
-        bt = bt_map.get(bid)
-        if bt is not None:
-            bt.tx += float(delta_local[0])
-            bt.ty += float(delta_local[1])
-            bt.tz += float(delta_local[2])
+    bid = node.id
+    for tri in smd.triangles:
+        for v in (tri.v0, tri.v1, tri.v2):
+            if v.bone_id == bid:
+                v.x += dtx
+                v.y += dty
+                v.z += dtz
 
 
 def _euler_mat4(rx: float, ry: float, rz: float) -> np.ndarray:
