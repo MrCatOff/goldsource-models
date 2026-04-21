@@ -1099,6 +1099,7 @@ class _QCEditorPanel(QWidget):
         self._qc_path:   Path | None    = None
         self._cur_model: str            = ""
         self._loading:   bool           = False  # suppress change signals during load
+        self._pending_smd_renames: list[tuple[str, str]] = []  # (old_stem, new_stem)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -1380,6 +1381,7 @@ class _QCEditorPanel(QWidget):
             QMessageBox.critical(self, "QC Load Error", str(exc))
             self._clear_editor()
             return
+        self._pending_smd_renames.clear()
         self._refresh_seq_list(keep_row=0)
         self._refresh_bg_list(keep_row=0)
         self._btn_save.setEnabled(True)
@@ -1387,6 +1389,7 @@ class _QCEditorPanel(QWidget):
     def _clear_editor(self) -> None:
         self._qc = None
         self._qc_path = None
+        self._pending_smd_renames.clear()
         self._seq_list.clear()
         self._detail_group.setEnabled(False)
         self._btn_save.setEnabled(False)
@@ -1650,9 +1653,24 @@ class _QCEditorPanel(QWidget):
     def _on_entry_cell_changed(self, item: QTableWidgetItem) -> None:
         if self._loading:
             return
-        row = self._bg_list.currentRow()
-        if row >= 0:
-            self._flush_entries_to_bg(row)
+        bg_row = self._bg_list.currentRow()
+        if bg_row < 0:
+            return
+
+        # Column 0 is the SMD filename.  Capture the old stem from the data
+        # model *before* flushing so we can queue an on-disk rename at save time.
+        if (item.column() == 0
+                and self._qc is not None
+                and bg_row < len(self._qc.bodygroups)):
+            entry_row = item.row()
+            bg = self._qc.bodygroups[bg_row]
+            if entry_row < len(bg.entries):
+                old_stem = bg.entries[entry_row].smd
+                new_stem = item.text().strip()
+                if old_stem and new_stem and old_stem != new_stem:
+                    self._pending_smd_renames.append((old_stem, new_stem))
+
+        self._flush_entries_to_bg(bg_row)
 
     def _on_entry_selection_changed(self) -> None:
         has = bool(self._entry_table.selectedItems())
@@ -1691,14 +1709,58 @@ class _QCEditorPanel(QWidget):
         if row < 0 or row >= len(self._qc.bodygroups):
             return
         bg = self._qc.bodygroups[row]
+        old_name = bg.name
         name, ok = QInputDialog.getText(
-            self, "Rename bodygroup", "New name:", text=bg.name
+            self, "Rename bodygroup", "New name:", text=old_name
         )
-        if not ok or not name.strip() or name.strip() == bg.name:
+        new_name = name.strip()
+        if not ok or not new_name or new_name == old_name:
             return
-        bg.name = name.strip()
+        bg.name = new_name
         self._bg_list.item(row).setText(bg.name)
         self._bg_entries_group.setTitle(f"Entries — {bg.name}")
+
+        if self._qc_path is None:
+            return
+
+        # Sync table → model before inspecting entries (table is the live state)
+        self._flush_entries_to_bg(row)
+
+        model_dir = self._qc_path.parent
+
+        # Rename the SMD file on disk: old_name.smd → new_name.smd.
+        # (Convention: bodygroup name == SMD file stem.)
+        old_file = model_dir / f"{old_name}.smd"
+        new_file = model_dir / f"{new_name}.smd"
+        file_error: str = ""
+        if old_file.exists():
+            try:
+                old_file.rename(new_file)
+            except OSError as exc:
+                file_error = str(exc)
+
+        # Update any studio entries that referenced the old name
+        entry_updated = False
+        for entry in bg.entries:
+            if entry.smd == old_name:
+                entry.smd = new_name
+                entry_updated = True
+
+        # Refresh the entry table to show the updated SMD name
+        if entry_updated:
+            self._loading = True
+            self._entry_table.blockSignals(True)
+            self._entry_table.setRowCount(0)
+            for e in bg.entries:
+                self._append_entry_row(e.smd, e.reverse, e.scale)
+            self._entry_table.blockSignals(False)
+            self._loading = False
+
+        if file_error:
+            QMessageBox.warning(
+                self, "Rename bodygroup",
+                f"Could not rename '{old_name}.smd' on disk:\n{file_error}",
+            )
 
     def _on_entry_add(self) -> None:
         if self._qc is None:
@@ -1776,15 +1838,38 @@ class _QCEditorPanel(QWidget):
         bg_row = self._bg_list.currentRow()
         if bg_row >= 0:
             self._flush_entries_to_bg(bg_row)
+
+        # Rename SMD files on disk for any entry stems that were edited
+        model_dir = self._qc_path.parent
+        rename_errors: list[str] = []
+        for old_stem, new_stem in self._pending_smd_renames:
+            old_file = model_dir / f"{old_stem}.smd"
+            new_file = model_dir / f"{new_stem}.smd"
+            if old_file.exists():
+                try:
+                    old_file.rename(new_file)
+                except OSError as exc:
+                    rename_errors.append(f"{old_stem}.smd → {new_stem}.smd: {exc}")
+        self._pending_smd_renames.clear()
+
         try:
             self._qc.save(self._qc_path)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
             return
-        QMessageBox.information(
-            self, "Saved",
-            f"QC file saved:\n{self._qc_path}",
-        )
+
+        if rename_errors:
+            QMessageBox.warning(
+                self, "Saved with warnings",
+                f"QC file saved:\n{self._qc_path}\n\n"
+                "Could not rename the following SMD file(s) on disk:\n"
+                + "\n".join(rename_errors),
+            )
+        else:
+            QMessageBox.information(
+                self, "Saved",
+                f"QC file saved:\n{self._qc_path}",
+            )
         self.qcSaved.emit(self._cur_model)
 
     def reload_model(self, name: str) -> None:

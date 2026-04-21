@@ -129,6 +129,173 @@ def _delete_bone(smd: SMD, bone_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Finger auto-detection algorithm
+# ---------------------------------------------------------------------------
+
+def _auto_detect_hand_finger_mapping(
+    weapon_smd: SMD,
+    hands_smd: SMD,
+) -> dict[str, str]:
+    """
+    Automatically detect which weapon bones correspond to which hand finger
+    bones in *hands_smd*.
+
+    Strategy
+    --------
+    1. Find every bone in each SMD that has **exactly 5** direct children that
+       each start a strict 3-bone chain (root → mid → tip, each link a single
+       child).  These are the *hand bones* (e.g. Bone_Lefthand / Bip01_L_Hand).
+    2. Match weapon hand bones to hand-SMD hand bones by world-space proximity.
+    3. For each matched pair, identify the thumb chain as the one whose root is
+       closest (in local space) to the hand bone origin — the thumb attaches to
+       a different part of the palm and has a distinctly shorter offset distance.
+    4. Sort the remaining four chains by their local **tx** coordinate
+       (descending).  This ordering is consistent between SMDs in the same
+       coordinate system (index → little for the left hand; little → index for
+       the right hand).
+    5. Rank-match the sorted weapon chains to the sorted hand chains and emit a
+       ``weapon_bone_name → hand_bone_name`` mapping for every bone pair.
+    6. Also walk up the parent chain from each matched hand bone and map the
+       weapon's forearm/root bones to the corresponding hand-SMD ancestors.
+
+    Returns
+    -------
+    dict[str, str]
+        ``{weapon_bone_name: hand_bone_name}`` for all detected finger bones,
+        the hand bones themselves, and their ancestor (forearm/root) bones.
+        Returns an empty dict if no five-finger hand bone is found.
+    """
+    import math as _math
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _build_children(smd: SMD) -> dict[int, list[int]]:
+        c: dict[int, list[int]] = {}
+        for n in smd.nodes:
+            c.setdefault(n.parent_id, []).append(n.id)
+        return c
+
+    def _strict_3_chain(
+        root_id: int,
+        child_map: dict[int, list[int]],
+        by_id: dict[int, "Node"],
+    ) -> list["Node"] | None:
+        """Return [root, mid, tip] for a strict single-child 3-bone chain."""
+        root = by_id.get(root_id)
+        ch1 = child_map.get(root_id, [])
+        if root is None or len(ch1) != 1:
+            return None
+        mid = by_id.get(ch1[0])
+        ch2 = child_map.get(ch1[0], [])
+        if mid is None or len(ch2) != 1:
+            return None
+        tip = by_id.get(ch2[0])
+        return [root, mid, tip] if tip is not None else None
+
+    def _find_hand_candidates(
+        smd: SMD,
+    ) -> list[tuple["Node", list[list["Node"]]]]:
+        """Return list of (hand_node, [chain, chain, …]) where exactly 5 chains."""
+        c = _build_children(smd)
+        by_id = {n.id: n for n in smd.nodes}
+        result = []
+        for node in smd.nodes:
+            chains = [
+                ch for child_id in c.get(node.id, [])
+                if (ch := _strict_3_chain(child_id, c, by_id)) is not None
+            ]
+            if len(chains) == 5:
+                result.append((node, chains))
+        return result
+
+    def _local_pos(smd: SMD, bone_id: int) -> tuple[float, float, float]:
+        """Return (tx, ty, tz) from the first skeleton frame for *bone_id*."""
+        if smd.skeleton:
+            for bt in smd.skeleton[0].bones:
+                if bt.bone_id == bone_id:
+                    return (bt.tx, bt.ty, bt.tz)
+        return (0.0, 0.0, 0.0)
+
+    def _sort_chains(
+        chains: list[list["Node"]],
+        smd: SMD,
+    ) -> list[list["Node"]]:
+        """
+        Sort five finger chains as [thumb, f1, f2, f3, f4].
+
+        The thumb is identified as the chain whose root has the smallest
+        Euclidean distance from its parent (hand bone) origin — i.e. the
+        shortest local translation vector in the bind pose.  The remaining
+        four are sorted by their root's local *tx* in descending order, which
+        gives a consistent finger ordering across left and right hands in the
+        same coordinate frame.
+        """
+        distances = [
+            _math.sqrt(sum(v * v for v in _local_pos(smd, c[0].id)))
+            for c in chains
+        ]
+        thumb_idx = distances.index(min(distances))
+        thumb = chains[thumb_idx]
+        non_thumb = [c for i, c in enumerate(chains) if i != thumb_idx]
+        non_thumb.sort(key=lambda c: _local_pos(smd, c[0].id)[0], reverse=True)
+        return [thumb] + non_thumb
+
+    # ── main logic ───────────────────────────────────────────────────────
+
+    wp_candidates = _find_hand_candidates(weapon_smd)
+    hs_candidates = _find_hand_candidates(hands_smd)
+    if not wp_candidates or not hs_candidates:
+        return {}
+
+    wp_world = compute_world_transforms(weapon_smd, 0)
+    hs_world = compute_world_transforms(hands_smd, 0)
+
+    wp_by_id = {n.id: n for n in weapon_smd.nodes}
+    hs_by_id = {n.id: n for n in hands_smd.nodes}
+
+    mapping: dict[str, str] = {}
+    used_hs: set[int] = set()
+
+    for wp_node, wp_chains in wp_candidates:
+        wp_pos = wp_world.get(wp_node.id, np.eye(4))[:3, 3]
+
+        # Closest unmatched hand-SMD hand bone
+        best_dist   = float("inf")
+        best_hs     = None
+        best_chains = None
+        for hs_node, hs_chains in hs_candidates:
+            if hs_node.id in used_hs:
+                continue
+            hs_pos = hs_world.get(hs_node.id, np.eye(4))[:3, 3]
+            dist = float(np.linalg.norm(wp_pos - hs_pos))
+            if dist < best_dist:
+                best_dist, best_hs, best_chains = dist, hs_node, hs_chains
+        if best_hs is None:
+            continue
+        used_hs.add(best_hs.id)
+
+        # Map the hand bone itself
+        mapping[wp_node.name] = best_hs.name
+
+        # Walk up parent chains: weapon forearm → hand forearm, etc.
+        wp_anc = wp_by_id.get(wp_node.parent_id)
+        hs_anc = hs_by_id.get(best_hs.parent_id)
+        while wp_anc is not None and hs_anc is not None:
+            mapping[wp_anc.name] = hs_anc.name
+            wp_anc = wp_by_id.get(wp_anc.parent_id)
+            hs_anc = hs_by_id.get(hs_anc.parent_id)
+
+        # Sort and rank-match finger chains
+        wp_sorted = _sort_chains(wp_chains, weapon_smd)
+        hs_sorted = _sort_chains(best_chains, hands_smd)
+        for wp_chain, hs_chain in zip(wp_sorted, hs_sorted):
+            for wp_bone, hs_bone in zip(wp_chain, hs_chain):
+                mapping[wp_bone.name] = hs_bone.name
+
+    return mapping
+
+
+# ---------------------------------------------------------------------------
 # Hand-replacement algorithm
 # ---------------------------------------------------------------------------
 
@@ -2043,6 +2210,14 @@ class ViewerPanel(QWidget):
         self._btn_clear_hands.setEnabled(False)
         self._btn_clear_hands.clicked.connect(self._on_clear_hands_map)
         hands_btn_row.addWidget(self._btn_clear_hands)
+        self._btn_auto_detect_hands = QPushButton("Auto-detect")
+        self._btn_auto_detect_hands.setEnabled(False)
+        self._btn_auto_detect_hands.setToolTip(
+            "Automatically match weapon finger chains to hand finger bones\n"
+            "based on bone lengths and local positions."
+        )
+        self._btn_auto_detect_hands.clicked.connect(self._on_auto_detect_hands)
+        hands_btn_row.addWidget(self._btn_auto_detect_hands)
         self._btn_apply_hands = QPushButton("Apply Hands to All SMDs")
         self._btn_apply_hands.setEnabled(False)
         self._btn_apply_hands.setStyleSheet(
@@ -3027,6 +3202,7 @@ class ViewerPanel(QWidget):
         self._hands_status.setText("")
         self._btn_apply_hands.setEnabled(False)
         self._btn_clear_hands.setEnabled(False)
+        self._btn_auto_detect_hands.setEnabled(False)
 
         if self._hands_smd is None:
             return
@@ -3055,6 +3231,14 @@ class ViewerPanel(QWidget):
             self._hands_tree.setItemWidget(item, 1, combo)
 
         self._hands_tree.expandAll()
+
+        # Enable auto-detect when both a weapon SMD and a hands SMD are present
+        self._btn_auto_detect_hands.setEnabled(self._cur_smd is not None)
+
+        # Automatically run finger detection so the user doesn't have to
+        # click the button manually every time they load a hands SMD.
+        if self._cur_smd is not None:
+            self._on_auto_detect_hands()
 
     def _on_hand_combo_changed(self, hand_node: "Node", weapon_name: str) -> None:
         """
@@ -3179,6 +3363,77 @@ class ViewerPanel(QWidget):
         self._hands_status.setText("")
         self._btn_apply_hands.setEnabled(False)
         self._btn_clear_hands.setEnabled(False)
+
+    def _on_auto_detect_hands(self) -> None:
+        """
+        Run the automatic finger-chain detector and pre-populate the bone-map
+        combo boxes.
+
+        For each weapon bone that the detector matches to a hand bone, the
+        corresponding row's combo box is set to that weapon bone name (if it
+        is not already assigned).  Signals are blocked during the batch update
+        so that the existing per-change cascade logic does not fire for every
+        individual assignment; the bone_map and UI state are rebuilt once at
+        the end.
+        """
+        if self._hands_smd is None or self._cur_smd is None:
+            return
+
+        mapping = _auto_detect_hand_finger_mapping(self._cur_smd, self._hands_smd)
+        if not mapping:
+            return
+
+        # mapping: {weapon_name: hand_name}
+        # Invert to hand_name → weapon_name for combo lookup
+        hand_to_weapon: dict[str, str] = {hn: wn for wn, hn in mapping.items()}
+        hand_name_to_id: dict[str, int] = {n.name: n.id for n in self._hands_smd.nodes}
+
+        # Block all signals during batch update
+        for combo in self._hand_combo_map.values():
+            combo.blockSignals(True)
+
+        for hand_name, weapon_name in hand_to_weapon.items():
+            hand_id = hand_name_to_id.get(hand_name)
+            if hand_id is None:
+                continue
+            combo = self._hand_combo_map.get(hand_id)
+            if combo is None:
+                continue
+            idx = combo.findText(weapon_name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        # Unblock signals
+        for combo in self._hand_combo_map.values():
+            combo.blockSignals(False)
+
+        # Rebuild bone_map from the updated combo states
+        self._bone_map.clear()
+        for hand_id, combo in self._hand_combo_map.items():
+            hand_node = next(
+                (n for n in self._hands_smd.nodes if n.id == hand_id), None
+            )
+            if hand_node is None:
+                continue
+            weapon_name = combo.currentText()
+            if weapon_name and weapon_name != "(none)":
+                self._bone_map[weapon_name] = hand_node.name
+
+        # Refresh combo item lists (removes already-used names from other combos)
+        self._refresh_all_combos()
+
+        n = len(self._bone_map)
+        total_weapon = len(self._cur_smd.nodes) if self._cur_smd else 0
+        weapon_specific = total_weapon - n
+        if n:
+            self._hands_status.setText(
+                f"{n} mapped · {weapon_specific} weapon-specific"
+            )
+        else:
+            self._hands_status.setText("")
+
+        self._btn_apply_hands.setEnabled(bool(self._bone_map))
+        self._btn_clear_hands.setEnabled(bool(self._bone_map))
 
     def _on_apply_hands(self) -> None:
         if not self._bone_map or self._hands_smd is None:
