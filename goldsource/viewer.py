@@ -1978,6 +1978,12 @@ class ViewerPanel(QWidget):
         self._btn_delete.clicked.connect(self._on_delete_clicked)
         bone_btns.addWidget(self._btn_delete)
 
+        self._btn_reparent = QPushButton("Reparent")
+        self._btn_reparent.setEnabled(False)
+        self._btn_reparent.setToolTip("Change parent of selected bone")
+        self._btn_reparent.clicked.connect(self._on_reparent_clicked)
+        bone_btns.addWidget(self._btn_reparent)
+
         self._btn_apply_all = QPushButton("Apply to All")
         self._btn_apply_all.setEnabled(False)
         self._btn_apply_all.setToolTip(
@@ -2639,6 +2645,7 @@ class ViewerPanel(QWidget):
         has_smd = self._cur_smd is not None
         self._btn_rename.setEnabled(has_sel)
         self._btn_delete.setEnabled(has_sel)
+        self._btn_reparent.setEnabled(has_sel)
         self._btn_export.setEnabled(has_smd)
         if items:
             bid = items[0].data(0, Qt.ItemDataRole.UserRole)
@@ -2714,6 +2721,63 @@ class ViewerPanel(QWidget):
                 "delete",
             )
 
+    def _on_reparent_clicked(self) -> None:
+        items = self._tree.selectedItems()
+        if not items or self._cur_smd is None:
+            return
+        bone_name = items[0].text(0)
+        node = self._cur_smd.node_by_name(bone_name)
+        if node is None:
+            return
+
+        # Exclude the bone itself and its descendants from valid parent choices
+        excluded = set(_collect_descendants(self._cur_smd, bone_name))
+        excluded.add(bone_name)
+        choices = ["(root)"] + [
+            n.name for n in self._cur_smd.nodes if n.name not in excluded
+        ]
+
+        id_to_node = {n.id: n for n in self._cur_smd.nodes}
+        current_parent = id_to_node.get(node.parent_id)
+        current_text = current_parent.name if current_parent else "(root)"
+        current_idx = choices.index(current_text) if current_text in choices else 0
+
+        new_parent, ok = QInputDialog.getItem(
+            self, "Reparent Bone",
+            f"New parent for '{bone_name}':",
+            choices,
+            current=current_idx,
+            editable=False,
+        )
+        if not ok:
+            return
+
+        if new_parent == "(root)":
+            new_parent_id = -1
+            new_parent_name = None
+        else:
+            parent_node = self._cur_smd.node_by_name(new_parent)
+            if parent_node is None:
+                return
+            new_parent_id = parent_node.id
+            new_parent_name = new_parent
+
+        if new_parent_id == node.parent_id:
+            return  # no change
+
+        node.parent_id = new_parent_id
+        self._pending_ops.append({
+            "type": "reparent",
+            "name": bone_name,
+            "new_parent": new_parent_name,  # None means root
+        })
+        self._update_apply_button()
+        self._rebuild_tree()
+        self.operationRecorded.emit(
+            f"Reparented '{bone_name}' → '{new_parent}' in {self._ref_combo.currentText()}",
+            "reparent",
+        )
+
     def _on_apply_all_clicked(self) -> None:
         if not self._pending_ops:
             return
@@ -2726,6 +2790,9 @@ class ViewerPanel(QWidget):
         for op in self._pending_ops:
             if op["type"] == "rename":
                 lines.append(f"  Rename  '{op['old']}'  →  '{op['new']}'")
+            elif op["type"] == "reparent":
+                parent_str = op["new_parent"] or "(root)"
+                lines.append(f"  Reparent '{op['name']}'  →  parent '{parent_str}'")
             else:
                 lines.append(f"  Delete  '{op['name']}'")
         summary = "\n".join(lines)
@@ -2755,6 +2822,15 @@ class ViewerPanel(QWidget):
                     for node in smd.nodes:
                         if node.name == op["old"]:
                             node.name = op["new"]
+                elif op["type"] == "reparent":
+                    target = smd.node_by_name(op["name"])
+                    if target is not None:
+                        if op["new_parent"] is None:
+                            target.parent_id = -1
+                        else:
+                            parent = smd.node_by_name(op["new_parent"])
+                            if parent is not None:
+                                target.parent_id = parent.id
                 else:
                     _delete_bone(smd, op["name"])
             applied += 1
