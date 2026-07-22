@@ -18,6 +18,24 @@ from goldsource.smd import (
     Vertex,
     Triangle,
 )
+from goldsource.hands import (
+    HandRig,
+    HandMatch,
+    HandNormalisation,
+    detect_rigs,
+    match_hands,
+    build_normalised_hand,
+    load_reference_hand,
+)
+from goldsource.skeleton import (
+    compute_keep_set,
+    remove_bones,
+    renumber,
+    graft_ancestors,
+    world_transforms,
+)
+from goldsource.compiler import CompileResult, compile_qc, find_studiomdl
+from goldsource.pipeline import PipelineResult, ModelPrep, discover_models, run
 from goldsource.qc import (
     QC,
     Sequence,
@@ -61,4 +79,26 @@ __all__ = [
     "BoneController",
     "TextureRenderMode",
     "TextureGroup",
+    # Hands
+    "HandRig",
+    "HandMatch",
+    "HandNormalisation",
+    "detect_rigs",
+    "match_hands",
+    "build_normalised_hand",
+    "load_reference_hand",
+    # Skeleton
+    "compute_keep_set",
+    "remove_bones",
+    "renumber",
+    "graft_ancestors",
+    "world_transforms",
+    # Compile + pipeline
+    "CompileResult",
+    "compile_qc",
+    "find_studiomdl",
+    "PipelineResult",
+    "ModelPrep",
+    "discover_models",
+    "run",
 ]
