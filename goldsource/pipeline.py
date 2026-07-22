@@ -48,17 +48,25 @@ from goldsource.merger import (
 from goldsource.qc import QC, BodyGroup, BodyGroupEntry
 from goldsource.sanitize import sanitize_directory
 from goldsource.skeleton import (
+    animated_bone_names,
     compute_keep_set,
+    concat_meshes,
     graft_ancestors,
     remove_bones,
     rename_bones,
     renumber,
+    unique_vertex_count,
 )
 from goldsource.smd import SMD
 
 
 SHARED_HAND_KEY = "_shared/hand"
 HAND_SMD_KEY = "hands"
+# Name for the packed always-on weapon parts.
+PART_GROUP_PREFIX = "weapon"
+# studiomdl's MAXSTUDIOVERTS per submodel.  The source models sit right at it
+# (v_skull5 has a 2045-vertex part), so it is the budget their authors targeted.
+VERTEX_BUDGET = 2048
 _HANDS_GROUP_RE = re.compile(r"hand", re.IGNORECASE)
 
 
@@ -72,6 +80,8 @@ class ModelPrep:
     name: str
     directory: Path
     renamed_files: dict[str, str] = field(default_factory=dict)
+    renamed_bodygroups: dict[str, int] = field(default_factory=dict)
+    packed_groups: tuple[int, int] | None = None
     hands: HandNormalisation | None = None
     pruned_bones: list[str] = field(default_factory=list)
     bones_before: int = 0
@@ -88,6 +98,8 @@ class PipelineResult:
     output_dir: Path | None = None
     qc_path: Path | None = None
     shared_hand: bool = False
+    exceeds_bodygroup_limits: bool = False
+    hand_variants: int = 0
     compile: CompileResult | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -114,7 +126,11 @@ class PipelineResult:
                 lines.append(f"Bone conflicts resolved by rename: {len(report.conflicts)}")
             lines.append(f"Sequences: {len(self.merge.qc.sequences)}")
             lines.append(f"Textures:  {len(self.merge.textures)}")
-            lines.append(f"Hand mesh: {'shared (1 copy)' if self.shared_hand else 'per-model copies'}")
+            if self.shared_hand:
+                lines.append(f"Hand mesh: shared, {self.hand_variants} distinct "
+                             f"{'copy' if self.hand_variants == 1 else 'copies'}")
+            else:
+                lines.append("Hand mesh: per-model copies")
             lines.append("")
             lines.append("pev_body values:")
             for name in self.merge.model_names:
@@ -128,8 +144,10 @@ class PipelineResult:
 
         if self.compile is not None:
             lines.append("")
-            status = "OK" if self.compile.ok else f"FAILED (exit {self.compile.returncode})"
-            lines.append(f"Compile: {status}")
+            if self.compile.ok:
+                lines.append("Compile: OK")
+            else:
+                lines.append(f"Compile: FAILED - {self.compile.failure_reason}")
             if self.compile.output_mdl is not None and self.compile.ok:
                 size = self.compile.output_mdl.stat().st_size
                 lines.append(f"  {self.compile.output_mdl}  ({size / 1024:.0f} KB)")
@@ -164,6 +182,40 @@ def discover_models(root: str | Path) -> list[Path]:
 # Per-model preparation
 # ---------------------------------------------------------------------------
 
+def dedupe_bodygroup_names(qc: QC) -> dict[str, int]:
+    """
+    Make every ``$bodygroup`` name unique within *qc*, in place.
+
+    A QC may legally declare several bodygroups sharing a name — they are
+    independent submodel slots and only their order matters.  The merger,
+    however, aligns groups across models *by name* and looks them up with
+    ``bodygroup_by_name``, which returns only the first match.  Left alone,
+    every duplicate after the first is silently dropped from the merged model,
+    taking its meshes with it (``v_ak47chimera`` declares 19 groups, 17 of them
+    sharing a name).
+
+    Duplicates are renamed ``name_2``, ``name_3``, … so each keeps its own slot.
+    Returns ``{original_name: occurrences}`` for names that needed it.
+    """
+    taken = set()
+    duplicated: dict[str, int] = {}
+
+    for bodygroup in qc.bodygroups:
+        if bodygroup.name not in taken:
+            taken.add(bodygroup.name)
+            continue
+
+        duplicated[bodygroup.name] = duplicated.get(bodygroup.name, 1) + 1
+        counter = 2
+        while f"{bodygroup.name}_{counter}" in taken:
+            counter += 1
+        renamed = f"{bodygroup.name}_{counter}"
+        taken.add(renamed)
+        bodygroup.name = renamed
+
+    return duplicated
+
+
 def _resolve_smd(model: ModelInput, raw_path: str) -> str | None:
     """Map a QC ``studio`` path onto a key in ``model.smds``."""
     norm = _norm_path(raw_path)
@@ -186,15 +238,31 @@ def _reference_keys(model: ModelInput) -> list[str]:
     return keys
 
 
-def _hand_keys(model: ModelInput, group_pattern: re.Pattern[str]) -> list[str]:
-    """
-    Keys of the SMDs that make up the model's hand bodygroup.
+@dataclass
+class _HandSlot:
+    """A bodygroup entry that points at one of the model's hand meshes."""
+    group: BodyGroup
+    entry: BodyGroupEntry
+    key: str
 
-    Falls back to picking the reference mesh with the largest share of vertices
-    bound to a detected hand rig, for models whose bodygroup is named something
-    other than "hands".
+
+def _hand_slots(model: ModelInput, group_pattern: re.Pattern[str]) -> list[_HandSlot]:
     """
-    keys: list[str] = []
+    Locate the bodygroup entries holding the model's hand meshes.
+
+    The bodygroup is usually named for it ("hands", "rhand", …), but not
+    always: ``v_rpg_remapped`` keeps its hand in a group called "body".  So
+    when no name matches, fall back to the reference mesh whose vertices are
+    mostly bound to a detected hand rig.
+
+    The owning group and entry are returned alongside the SMD key, because the
+    caller has to rewrite exactly those entries — rediscovering them by name
+    later would miss the odd cases and leave an entry pointing at a mesh that
+    no longer exists.
+    """
+    slots: list[_HandSlot] = []
+    seen: set[str] = set()
+
     for bodygroup in model.qc.bodygroups:
         if not group_pattern.search(bodygroup.name):
             continue
@@ -202,10 +270,11 @@ def _hand_keys(model: ModelInput, group_pattern: re.Pattern[str]) -> list[str]:
             if entry.is_blank:
                 continue
             key = _resolve_smd(model, entry.smd)
-            if key is not None and key not in keys:
-                keys.append(key)
-    if keys:
-        return keys
+            if key is not None and key not in seen:
+                seen.add(key)
+                slots.append(_HandSlot(group=bodygroup, entry=entry, key=key))
+    if slots:
+        return slots
 
     best_key, best_share = None, 0.0
     for key in _reference_keys(model):
@@ -224,7 +293,20 @@ def _hand_keys(model: ModelInput, group_pattern: re.Pattern[str]) -> list[str]:
         share = hits / (len(smd.triangles) * 3)
         if share > best_share:
             best_key, best_share = key, share
-    return [best_key] if best_key is not None and best_share > 0.5 else []
+
+    if best_key is None or best_share <= 0.5:
+        return []
+
+    for bodygroup in model.qc.bodygroups:
+        for entry in bodygroup.entries:
+            if not entry.is_blank and _resolve_smd(model, entry.smd) == best_key:
+                return [_HandSlot(group=bodygroup, entry=entry, key=best_key)]
+    return []
+
+
+def _hand_keys(model: ModelInput, group_pattern: re.Pattern[str]) -> list[str]:
+    """SMD keys of the model's hand meshes."""
+    return [slot.key for slot in _hand_slots(model, group_pattern)]
 
 
 def normalise_hands(
@@ -245,7 +327,8 @@ def normalise_hands(
     """
     result = HandNormalisation(model_name=model.name)
 
-    keys = _hand_keys(model, group_pattern)
+    slots = _hand_slots(model, group_pattern)
+    keys = [slot.key for slot in slots]
     if not keys:
         result.error = "no hand bodygroup found"
         return result
@@ -288,7 +371,9 @@ def normalise_hands(
         rename_bones(smd, renames)
     _rename_qc_bones(model.qc, renames)
 
-    new_hand = build_normalised_hand(reference_hand, texture=texture)
+    new_hand = build_normalised_hand(
+        reference_hand, texture=texture, mapped=set(match.mapping),
+    )
 
     # Collapse however many hand bodygroups the model has (some split left and
     # right into separate groups) into a single group holding the one mesh.
@@ -301,14 +386,28 @@ def normalise_hands(
     model.smds[hand_key] = new_hand
     result.replaced_keys.append(hand_key)
 
+    # Drop exactly the entries that pointed at the superseded meshes, then put
+    # the unified group where the first of them lived.  Groups are matched by
+    # identity, not by name, so a hand parked in a group called "body" is still
+    # removed instead of being left pointing at a deleted mesh.
     unified = BodyGroup(name=hands_group_name, entries=[BodyGroupEntry(smd=hand_key)])
+    doomed_entries = {id(slot.entry) for slot in slots}
+    affected = {id(slot.group) for slot in slots}
+
     rebuilt: list[BodyGroup] = []
     inserted = False
     for bodygroup in model.qc.bodygroups:
-        if group_pattern.search(bodygroup.name):
+        if id(bodygroup) in affected:
+            bodygroup.entries = [
+                entry for entry in bodygroup.entries if id(entry) not in doomed_entries
+            ]
             if not inserted:
                 rebuilt.append(unified)
                 inserted = True
+            # A group emptied by the removal disappears; one that still holds
+            # other meshes stays.
+            if bodygroup.entries:
+                rebuilt.append(bodygroup)
             continue
         rebuilt.append(bodygroup)
     if not inserted:
@@ -352,7 +451,99 @@ def _rename_qc_bones(qc: QC, renames: dict[str, str]) -> None:
     qc.keepbones = [renames.get(bone, bone) for bone in qc.keepbones]
 
 
-def prune_model(model: ModelInput, keep_hitbox_bones: bool = False) -> tuple[list[str], int, int]:
+def pack_always_on_parts(
+    model: ModelInput,
+    budget: int = VERTEX_BUDGET,
+    skip_keys: set[str] | None = None,
+    group_prefix: str = PART_GROUP_PREFIX,
+) -> int:
+    """
+    Merge a model's always-on meshes into as few bodygroups as the vertex
+    budget allows.  Returns the number of groups the model ends up with.
+
+    Many models use bodygroups purely to *split* one weapon across several
+    meshes — ``v_charger7`` ships ``v_charger7_01`` and ``_02``, ``v_ak47chimera``
+    is cut into 19 pieces — and every piece is drawn at once.  They are not
+    switchable variants: each such group holds exactly one entry.
+
+    Left alone, the merged model needs one bodypart per piece per model, and
+    since bodyparts are independent the viewer's default (every part at index 0)
+    shows a mix of several weapons at once.  Packing the pieces back together
+    collapses that to a handful of slots.
+
+    Groups holding a real choice — two or more entries, or an explicit blank —
+    are left untouched, since their whole purpose is to be switched.
+    """
+    skip = skip_keys or set()
+
+    packable: list[tuple[BodyGroup, str]] = []
+    for bodygroup in model.qc.bodygroups:
+        if len(bodygroup.entries) != 1:
+            continue  # a real choice, or already empty
+        entry = bodygroup.entries[0]
+        if entry.is_blank:
+            continue
+        key = _resolve_smd(model, entry.smd)
+        if key is None or key in skip:
+            continue
+        if entry.reverse or entry.scale is not None:
+            continue  # carries per-entry options that must not be merged away
+        packable.append((bodygroup, key))
+
+    if len(packable) < 2:
+        return len(model.qc.bodygroups)
+
+    # Largest first, so big meshes claim a slot and small ones fill the gaps.
+    ordered = sorted(
+        packable,
+        key=lambda item: unique_vertex_count(model.smds[item[1]]),
+        reverse=True,
+    )
+
+    packs: list[list[str]] = []
+    sizes: list[int] = []
+    for _bodygroup, key in ordered:
+        size = unique_vertex_count(model.smds[key])
+        for index, used in enumerate(sizes):
+            if used + size <= budget:
+                packs[index].append(key)
+                sizes[index] += size
+                break
+        else:
+            packs.append([key])
+            sizes.append(size)
+
+    if len(packs) >= len(packable):
+        return len(model.qc.bodygroups)  # nothing would be gained
+
+    # Take the meshes out of the model before rebuilding, keeping a local
+    # handle on them — they are the inputs to the concatenation.
+    sources = {key: model.smds[key] for _bodygroup, key in packable}
+
+    packed_groups = [bodygroup for bodygroup, _key in packable]
+    position = model.qc.bodygroups.index(packed_groups[0])
+    for bodygroup in packed_groups:
+        model.qc.bodygroups.remove(bodygroup)
+    for key in sources:
+        model.smds.pop(key, None)
+
+    replacements: list[BodyGroup] = []
+    for index, keys in enumerate(packs):
+        name = group_prefix if index == 0 else f"{group_prefix}_{index + 1}"
+        smd_key = _unique_key(model, name)
+        model.smds[smd_key] = concat_meshes([sources[key] for key in keys])
+        replacements.append(BodyGroup(name=name, entries=[BodyGroupEntry(smd=smd_key)]))
+
+    model.qc.bodygroups[position:position] = replacements
+    dedupe_bodygroup_names(model.qc)
+    return len(model.qc.bodygroups)
+
+
+def prune_model(
+    model: ModelInput,
+    keep_hitbox_bones: bool = False,
+    keep_animated_bones: bool = False,
+) -> tuple[list[str], int, int]:
     """
     Drop every bone that carries no geometry and is not named by the QC, from
     the reference mesh *and* every animation, folding transforms into children
@@ -366,6 +557,14 @@ def prune_model(model: ModelInput, keep_hitbox_bones: bool = False) -> tuple[lis
         references = [smd for smd in model.smds.values() if not smd.is_animation]
 
     keep = compute_keep_set(references, model.qc, keep_hitbox_bones=keep_hitbox_bones)
+
+    if keep_animated_bones:
+        # Folding an animated bone spreads its motion into every child, which
+        # can push a sequence past studiomdl's 64 KB cap even as the bone count
+        # falls.  Keeping them costs bones but leaves the animation data as
+        # compressible as it was.
+        for smd in model.smds.values():
+            keep |= animated_bone_names(smd)
 
     all_bones: set[str] = set()
     for smd in model.smds.values():
@@ -383,7 +582,11 @@ def prune_model(model: ModelInput, keep_hitbox_bones: bool = False) -> tuple[lis
     # needs (e.g. when a shared root survived pruning) so every SMD of this
     # model agrees on parentage — studiomdl rejects mismatches outright.
     if references:
-        authority = references[0]
+        # The mesh with the fullest skeleton defines the hierarchy.  Taking the
+        # first one would let a substituted hand — which only knows its own
+        # bones — become the authority, leaving the weapon meshes' extra
+        # ancestors ungrafted and their parentage in conflict.
+        authority = max(references, key=lambda smd: len(smd.nodes))
         for smd in model.smds.values():
             if smd is not authority:
                 graft_ancestors(smd, authority)
@@ -402,75 +605,156 @@ def prune_model(model: ModelInput, keep_hitbox_bones: bool = False) -> tuple[lis
 def _collapse_shared_hands(
     result: MergeResult,
     hand_keys_by_model: dict[str, list[str]],
-    group_pattern: re.Pattern[str] = _HANDS_GROUP_RE,
-) -> bool:
+    hands_group_name: str = HAND_SMD_KEY,
+) -> tuple[dict[str, dict[str, int]], int]:
     """
-    When every model's normalised hand mesh is byte-identical, replace the
-    per-model hand bodygroup entries with a single shared entry and keep one
-    copy of the mesh.  Returns True when the collapse happened.
-    """
-    if len(hand_keys_by_model) < 2:
-        return False
+    Replace the per-model hand bodygroup entries with one entry per *distinct*
+    hand mesh, so identical hands are stored once.
 
-    output_keys: list[str] = []
+    Most models end up with the exact same normalised hand, but not all: a rig
+    with four fingers or a single hand yields a trimmed mesh (see
+    :func:`~goldsource.hands.build_normalised_hand`).  Requiring every mesh to
+    be identical before sharing would mean one odd model forces all 58 to carry
+    their own copy, so meshes are grouped by content and shared within a group.
+
+    A trailing blank entry is added for models whose hands were not normalised;
+    they keep their own hand bodygroup and must not be shown a shared one.
+
+    Only the group *normalisation itself created* is rewritten, matched by
+    exact name.  Matching on a name pattern instead would also catch the
+    original hand group of a model that could not be normalised — wiping the
+    entry for the hand mesh it still needs.
+
+    Returns ``({group_name: {model_name: entry_index}}, variant_count)``.
+    """
+    groups = [bg for bg in result.qc.bodygroups if bg.name == hands_group_name]
+    if not groups or len(hand_keys_by_model) < 2:
+        return {}, 0
+
+    owned: dict[str, str] = {}
     for model_name, keys in hand_keys_by_model.items():
         for key in keys:
             full = f"{model_name}/{key}"
             if full in result.smds:
-                output_keys.append(full)
+                owned[model_name] = full
+                break
 
-    if len(output_keys) < 2:
-        return False
+    if len(owned) < 2:
+        return {}, 0
 
-    rendered = {result.smds[key].to_string() for key in output_keys}
-    if len(rendered) != 1:
-        return False  # meshes differ — keep per-model copies
+    # Group meshes by content, in model order so numbering is deterministic.
+    variant_of: dict[str, int] = {}
+    sources: list[str] = []
+    assignment: dict[str, int] = {}
+    for model_name in result.model_names:
+        key = owned.get(model_name)
+        if key is None:
+            continue
+        rendered = result.smds[key].to_string()
+        if rendered not in variant_of:
+            variant_of[rendered] = len(sources)
+            sources.append(key)
+        assignment[model_name] = variant_of[rendered]
 
-    groups = [bg for bg in result.qc.bodygroups if group_pattern.search(bg.name)]
-    if not groups:
-        return False
+    if len(sources) >= len(owned):
+        return {}, 0  # every model's hand is unique — nothing to share
 
-    shared = result.smds[output_keys[0]]
-    for key in output_keys:
+    shared_keys: list[str] = []
+    for index, source in enumerate(sources):
+        name = SHARED_HAND_KEY if index == 0 else f"{SHARED_HAND_KEY}_{index + 1}"
+        shared_keys.append(name)
+        result.smds[name] = result.smds[source]
+    for key in set(owned.values()):
         del result.smds[key]
-    result.smds[SHARED_HAND_KEY] = shared
+
+    # Models that kept their own hands select the trailing blank.
+    blank_index = len(shared_keys)
+    entries = [BodyGroupEntry(smd=key) for key in shared_keys]
+    entries.append(BodyGroupEntry(smd=""))
+    for model_name in result.model_names:
+        assignment.setdefault(model_name, blank_index)
 
     for group in groups:
-        group.entries = [BodyGroupEntry(smd=SHARED_HAND_KEY)]
+        group.entries = list(entries)
 
-    return True
+    return {group.name: dict(assignment) for group in groups}, len(shared_keys)
 
 
-def _recompute_pev_body(qc: QC, model_names: list[str]) -> dict[str, int] | None:
+def _recompute_pev_body(
+    qc: QC,
+    model_names: list[str],
+    group_indices: dict[str, dict[str, int]],
+    overrides: dict[str, dict[str, int]] | None = None,
+) -> dict[str, int]:
     """
     Recompute each model's ``pev_body`` after the bodygroup layout changed.
 
-    Bodygroup selections are encoded positionally: value = Σ index_g × stride_g
+    Bodygroup selections are encoded positionally: value = Σ index_g × stride_g,
     where stride_g is the product of the entry counts of all preceding groups.
-    Returns ``None`` when a model owns no entry in a multi-entry group, since
-    the mapping would then be ambiguous.
+
+    The per-model entry indices come from *group_indices* (recorded by the
+    merger) rather than being inferred from entry paths, because a model that
+    lacks a group contributes a *blank* entry, and a blank carries no path to
+    attribute it by.  *overrides* supplies replacement indices for groups whose
+    entries were rewritten after the merge, such as the shared hands group.
     """
     values = {name: 0 for name in model_names}
+    replaced = overrides or {}
     stride = 1
 
     for group in qc.bodygroups:
-        count = len(group.entries)
-        owners: dict[str, int] = {}
-        for index, entry in enumerate(group.entries):
-            if entry.is_blank:
-                continue
-            owner = entry.smd.split("/")[0]
-            if owner in values and owner not in owners:
-                owners[owner] = index
-
-        if count > 1 and len(owners) < len(model_names):
-            return None
-
+        indices = replaced.get(group.name) or group_indices.get(group.name, {})
         for name in model_names:
-            values[name] += owners.get(name, 0) * stride
-        stride *= count
+            values[name] += indices.get(name, 0) * stride
+        stride *= len(group.entries)
 
     return values
+
+
+# studiomdl's MAXSTUDIOBODYPARTS; it writes past the array without checking.
+MAX_BODYPARTS = 32
+# pev_body is a signed 32-bit int in the engine.
+MAX_BODY_VALUE = 2 ** 31 - 1
+
+
+def _check_bodygroup_limits(result: MergeResult) -> list[str]:
+    """
+    Flag bodygroup layouts that studiomdl or the engine cannot represent.
+
+    Submodel selection is encoded as a single integer — the mixed-radix product
+    of every group's entry count — so groups multiply rather than add.  Enough
+    of them overflows the value (and crashes studiomdl outright, with no error
+    message, when the bodypart count exceeds its fixed array).
+    """
+    messages: list[str] = []
+
+    count = len(result.qc.bodygroups)
+    if count > MAX_BODYPARTS:
+        messages.append(
+            f"{count} bodygroups exceeds studiomdl's limit of {MAX_BODYPARTS}; "
+            f"the compiler will crash without reporting an error. Merge fewer "
+            f"models per output, or ones with fewer bodygroups."
+        )
+
+    combinations = 1
+    for group in result.qc.bodygroups:
+        combinations *= max(1, len(group.entries))
+    if combinations > MAX_BODY_VALUE:
+        messages.append(
+            f"bodygroup combinations ({combinations:.3g}) overflow the 32-bit "
+            f"pev_body value; submodel selection would be undefined in game. "
+            f"Merge fewer models per output."
+        )
+
+    largest = max(
+        (value for value in result.pev_body_map.values()), default=0
+    )
+    if largest > MAX_BODY_VALUE:
+        messages.append(
+            f"largest pev_body value ({largest}) exceeds the 32-bit limit."
+        )
+
+    return messages
 
 
 def _strip_unused_textures(result: MergeResult) -> list[str]:
@@ -527,11 +811,46 @@ def _dedupe_shared_hand_warnings(
     return kept
 
 
+def _studiomdl_surviving_bones(result: MergeResult) -> set[str]:
+    """
+    The bones studiomdl will actually keep in the compiled model.
+
+    It drops any bone that carries no vertices and is not an ancestor of one,
+    regardless of whether the SMD still declares it — so a bone can be present
+    in our output and still be absent from the .mdl.  Attachments and
+    controllers pin their bones; hitboxes do not, and one left pointing at a
+    dropped bone aborts the compile with "cannot find bone ... for bbox".
+    """
+    survivors: set[str] = set()
+
+    for raw in _ref_smd_names(result.qc):
+        key = _norm_path(raw)
+        smd = result.smds.get(key)
+        if smd is None:
+            base = key.split("/")[-1]
+            smd = next(
+                (s for k, s in result.smds.items() if k.split("/")[-1] == base),
+                None,
+            )
+        if smd is None:
+            continue
+
+        by_id = {n.id: n for n in smd.nodes}
+        for bone_id in {v.bone_id for tri in smd.triangles for v in tri.vertices}:
+            node = by_id.get(bone_id)
+            while node is not None and node.name not in survivors:
+                survivors.add(node.name)
+                node = by_id.get(node.parent_id)
+
+    survivors |= {a.bone for a in result.qc.attachments}
+    survivors |= {c.bone for c in result.qc.controllers}
+    survivors |= set(result.qc.keepbones)
+    return survivors
+
+
 def _strip_dangling_bone_refs(result: MergeResult) -> list[str]:
     """Remove hitboxes/attachments/controllers pointing at pruned bones."""
-    known: set[str] = set()
-    for smd in result.smds.values():
-        known |= {n.name for n in smd.nodes}
+    known = _studiomdl_surviving_bones(result)
 
     messages: list[str] = []
 
@@ -568,7 +887,9 @@ def run(
     hand_texture: str | Path | None = None,
     normalise: bool = True,
     prune: bool = True,
+    pack_parts: bool = True,
     keep_hitbox_bones: bool = False,
+    keep_animated_bones: bool = False,
     share_hands: bool = True,
     sanitise: bool = True,
     exclude: list[str] | None = None,
@@ -626,6 +947,12 @@ def run(
         model = ModelInput.from_directory(directory.name, directory)
         prep.sequences = len(model.qc.sequences)
 
+        prep.renamed_bodygroups = dedupe_bodygroup_names(model.qc)
+        if prep.renamed_bodygroups:
+            total = sum(count - 1 for count in prep.renamed_bodygroups.values())
+            log(f"    renamed {total} duplicate bodygroup name(s): "
+                f"{', '.join(sorted(prep.renamed_bodygroups))}")
+
         if normalise and reference_hand is not None:
             normalisation = normalise_hands(
                 model, reference_hand, reference_rigs, texture=hand_texture_name,
@@ -642,14 +969,31 @@ def run(
             else:
                 prep.warnings.append(f"hand normalisation skipped: {normalisation.error}")
                 log(f"    hand normalisation skipped: {normalisation.error}")
+                # This model keeps its own hands, so it must not land in the
+                # group the shared-hand collapse rewrites.
+                for bodygroup in model.qc.bodygroups:
+                    if bodygroup.name == HAND_SMD_KEY:
+                        bodygroup.name = f"{HAND_SMD_KEY}_original"
+                dedupe_bodygroup_names(model.qc)
 
         if hand_texture is not None and normalise:
             texture_path = Path(hand_texture)
             if texture_path.exists():
                 model.textures[texture_path.name] = texture_path.read_bytes()
 
+        if pack_parts:
+            hand_keys = set(prep.hands.replaced_keys) if (prep.hands and prep.hands.ok) else set()
+            groups_before = len(model.qc.bodygroups)
+            groups_after = pack_always_on_parts(model, skip_keys=hand_keys)
+            prep.packed_groups = (groups_before, groups_after)
+            if groups_after < groups_before:
+                log(f"    packed {groups_before} bodygroups -> {groups_after}")
+
         if prune:
-            removed, before, after = prune_model(model, keep_hitbox_bones=keep_hitbox_bones)
+            removed, before, after = prune_model(
+                model, keep_hitbox_bones=keep_hitbox_bones,
+                keep_animated_bones=keep_animated_bones,
+            )
             prep.pruned_bones = removed
             prep.bones_before, prep.bones_after = before, after
             log(f"    bones {before} -> {after} ({len(removed)} pruned)")
@@ -668,17 +1012,17 @@ def run(
     result.merge = merged
 
     if share_hands and normalise:
-        if _collapse_shared_hands(merged, hand_keys_by_model):
+        collapsed, variants = _collapse_shared_hands(merged, hand_keys_by_model)
+        if collapsed:
             result.shared_hand = True
-            recomputed = _recompute_pev_body(merged.qc, merged.model_names)
-            if recomputed is not None:
-                merged.pev_body_map = recomputed
-            else:
-                result.warnings.append(
-                    "hand meshes were shared but pev_body could not be recomputed; "
-                    "verify bodygroup indices manually"
-                )
-            log("    hand mesh shared across all models (1 copy)")
+            result.hand_variants = variants
+            merged.pev_body_map = _recompute_pev_body(
+                merged.qc, merged.model_names, merged.bodygroup_indices,
+                overrides=collapsed,
+            )
+            log(f"    hand mesh shared: {variants} distinct "
+                f"{'copy' if variants == 1 else 'copies'} for "
+                f"{len(hand_keys_by_model)} models")
         else:
             log("    hand meshes differ per model, keeping separate copies")
 
@@ -686,6 +1030,9 @@ def run(
     if dropped:
         log(f"    dropped {len(dropped)} unused texture(s)")
     result.warnings.extend(_strip_dangling_bone_refs(merged))
+    limit_problems = _check_bodygroup_limits(merged)
+    result.warnings.extend(limit_problems)
+    result.exceeds_bodygroup_limits = bool(limit_problems)
     result.warnings.extend(
         _dedupe_shared_hand_warnings(merged.report.warnings, hand_keys_by_model)
         if result.shared_hand else merged.report.warnings

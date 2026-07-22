@@ -6,11 +6,14 @@ import pytest
 from conftest import world_at
 
 from goldsource.hands import load_reference_hand
-from goldsource.merger import ModelInput
+from goldsource.merger import ModelInput, ModelMerger
 from goldsource.pipeline import (
     _HANDS_GROUP_RE,
+    _check_bodygroup_limits,
     _hand_keys,
+    _hand_slots,
     _recompute_pev_body,
+    dedupe_bodygroup_names,
     discover_models,
     normalise_hands,
     prune_model,
@@ -27,28 +30,107 @@ def _group(name, *entries):
     return BodyGroup(name=name, entries=[BodyGroupEntry(smd=e) for e in entries])
 
 
+def test_duplicate_bodygroup_names_are_made_unique():
+    """
+    A QC may declare several bodygroups sharing a name; the merger looks groups
+    up by name, so without this every duplicate is dropped along with its meshes.
+    """
+    qc = QC(bodygroups=[
+        _group("weapon", "a"), _group("weapon", "b"),
+        _group("hands", "h"), _group("weapon", "c"),
+    ])
+    duplicated = dedupe_bodygroup_names(qc)
+
+    assert [bg.name for bg in qc.bodygroups] == ["weapon", "weapon_2", "hands", "weapon_3"]
+    assert duplicated == {"weapon": 3}
+    # No mesh was lost.
+    assert [e.smd for bg in qc.bodygroups for e in bg.entries] == ["a", "b", "h", "c"]
+
+
+def test_dedupe_bodygroup_names_avoids_an_existing_name():
+    qc = QC(bodygroups=[_group("weapon", "a"), _group("weapon_2", "b"), _group("weapon", "c")])
+    dedupe_bodygroup_names(qc)
+    assert [bg.name for bg in qc.bodygroups] == ["weapon", "weapon_2", "weapon_3"]
+
+
+def test_dedupe_bodygroup_names_leaves_unique_names_alone():
+    qc = QC(bodygroups=[_group("weapon", "a"), _group("hands", "h")])
+    assert dedupe_bodygroup_names(qc) == {}
+    assert [bg.name for bg in qc.bodygroups] == ["weapon", "hands"]
+
+
+def test_models_lacking_a_group_share_one_blank_entry(pistols_dir, default_hand_path):
+    """
+    Each group's entry count multiplies into pev_body, so giving every model
+    that lacks a group its own blank makes the value explode past 32 bits and
+    crashes studiomdl.  One shared blank keeps the group at minimum width.
+    """
+    merger = ModelMerger()
+    for name in ("v_ana", "v_deagle"):
+        model = ModelInput.from_directory(name, pistols_dir / name)
+        merger.add_model(model)
+    # Give one model an extra group the other does not have.
+    merger._models[0].qc.bodygroups.append(_group("scope", "ref_Anaconda"))
+
+    result = merger.merge("t.mdl")
+    scope = next(bg for bg in result.qc.bodygroups if bg.name == "scope")
+    # v_ana's entry plus exactly one shared blank — not one blank per model.
+    assert len(scope.entries) == 2
+    assert sum(1 for e in scope.entries if e.is_blank) == 1
+    assert result.bodygroup_indices["scope"]["v_deagle"] == 1
+
+
+MODELS = ["a", "b", "c"]
+INDICES = {
+    "weapon": {"a": 0, "b": 1, "c": 2},
+    "hands": {"a": 0, "b": 1, "c": 2},
+}
+
+
 def test_pev_body_uses_positional_stride_encoding():
     qc = QC(bodygroups=[
         _group("weapon", "a/w", "b/w", "c/w"),
         _group("hands", "a/h", "b/h", "c/h"),
     ])
-    values = _recompute_pev_body(qc, ["a", "b", "c"])
+    values = _recompute_pev_body(qc, MODELS, INDICES)
     # index_weapon * 1 + index_hands * 3
     assert values == {"a": 0, "b": 1 + 3, "c": 2 + 6}
 
 
-def test_pev_body_ignores_a_shared_single_entry_group():
-    """Collapsing hands to one shared mesh must not shift any model's value."""
+def test_pev_body_uses_overrides_for_a_rewritten_group():
+    """
+    After hands collapse to shared variants, each model's index in that group
+    comes from the collapse, not from the merger's pre-collapse record.
+    """
     qc = QC(bodygroups=[
         _group("weapon", "a/w", "b/w", "c/w"),
-        _group("hands", "_shared/hand"),
+        _group("hands", "_shared/hand", "_shared/hand_2", ""),
     ])
-    assert _recompute_pev_body(qc, ["a", "b", "c"]) == {"a": 0, "b": 1, "c": 2}
+    # a and b share variant 0; c has its own variant 1.
+    overrides = {"hands": {"a": 0, "b": 0, "c": 1}}
+    values = _recompute_pev_body(qc, MODELS, INDICES, overrides=overrides)
+    assert values == {"a": 0, "b": 1 + 0, "c": 2 + 3}
 
 
-def test_pev_body_refuses_to_guess_when_a_model_owns_no_entry():
-    qc = QC(bodygroups=[_group("weapon", "a/w", "b/w")])
-    assert _recompute_pev_body(qc, ["a", "b", "c"]) is None
+def test_pev_body_resolves_models_whose_entry_is_blank():
+    """
+    A model lacking a group contributes a blank entry, which carries no path to
+    attribute it by — the index has to come from the merger's own record.
+    """
+    qc = QC(bodygroups=[
+        _group("weapon", "a/w", "b/w"),
+        BodyGroup(name="scope", entries=[
+            BodyGroupEntry(smd="a/scope"), BodyGroupEntry(smd=""),
+        ]),
+    ])
+    indices = {"weapon": {"a": 0, "b": 1}, "scope": {"a": 0, "b": 1}}
+    values = _recompute_pev_body(qc, ["a", "b"], indices)
+    assert values == {"a": 0, "b": 1 + 2}
+
+
+def test_pev_body_defaults_to_zero_for_an_unknown_group():
+    qc = QC(bodygroups=[_group("extra", "a/x", "b/x")])
+    assert _recompute_pev_body(qc, ["a", "b"], {}) == {"a": 0, "b": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +308,15 @@ def test_all_models_and_sequences_survive(merged, pistols_dir):
 
 
 def test_hand_mesh_is_shared_once_across_all_models(merged):
+    """All pistol rigs are complete, so they collapse to a single hand mesh."""
     assert merged.shared_hand
+    assert merged.hand_variants == 1
     hand_groups = [bg for bg in merged.merge.qc.bodygroups if "hand" in bg.name.lower()]
     assert len(hand_groups) == 1
-    assert len(hand_groups[0].entries) == 1
+    # One shared mesh, plus the blank slot for models that kept their own hands.
+    non_blank = [e for e in hand_groups[0].entries if not e.is_blank]
+    assert len(non_blank) == 1
+    assert non_blank[0].smd == "_shared/hand"
 
 
 def test_every_model_gets_a_distinct_pev_body(merged):

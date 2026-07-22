@@ -30,6 +30,34 @@ class CompileResult:
         return self.returncode == 0 and self.output_mdl is not None and self.output_mdl.exists()
 
     @property
+    def crashed(self) -> bool:
+        """
+        True when studiomdl died on a Windows exception rather than exiting.
+
+        It has fixed-size arrays it fills without bounds checks (bodyparts,
+        bones, textures), so an oversized model takes it down with an access
+        violation and no diagnostic at all.
+        """
+        return self.returncode not in range(0, 256)
+
+    @property
+    def failure_reason(self) -> str | None:
+        if self.ok:
+            return None
+        if self.crashed:
+            code = self.returncode & 0xFFFFFFFF
+            known = {
+                0xC0000005: "access violation",
+                0xC00000FD: "stack overflow",
+            }.get(code, "crash")
+            return (
+                f"studiomdl {known} (0x{code:08X}) — it exceeded an internal "
+                f"limit and produced no diagnostic; check the bodygroup, bone "
+                f"and texture counts reported above"
+            )
+        return f"studiomdl exited with code {self.returncode}"
+
+    @property
     def warnings(self) -> list[str]:
         return [
             line.strip() for line in self.stdout.splitlines()

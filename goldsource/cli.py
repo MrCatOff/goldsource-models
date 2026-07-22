@@ -90,7 +90,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
         hand_texture=_resolve_hand_texture(args) if args.normalise else None,
         normalise=args.normalise,
         prune=args.prune,
+        pack_parts=args.pack_parts,
         keep_hitbox_bones=args.keep_hitbox_bones,
+        keep_animated_bones=args.keep_animated_bones,
         share_hands=args.share_hands,
         sanitise=args.sanitise,
         exclude=args.exclude,
@@ -106,9 +108,14 @@ def cmd_merge(args: argparse.Namespace) -> int:
     print(result.summary())
 
     if result.compile is not None and not result.compile.ok:
-        print()
-        print("studiomdl output:")
-        print(result.compile.stdout.strip())
+        output = result.compile.stdout.strip()
+        if output:
+            print()
+            print("studiomdl output:")
+            print(output)
+        return 1
+
+    if result.exceeds_bodygroup_limits:
         return 1
 
     if result.merge is not None and result.merge.report.exceeds_limit:
@@ -134,7 +141,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         hand_texture=_resolve_hand_texture(args) if args.normalise else None,
         normalise=args.normalise,
         prune=args.prune,
+        pack_parts=args.pack_parts,
         keep_hitbox_bones=args.keep_hitbox_bones,
+        keep_animated_bones=args.keep_animated_bones,
         exclude=args.exclude,
         write=False,
         log=log,
@@ -242,6 +251,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_hand_arguments(merge)
     merge.add_argument("--no-prune", dest="prune", action="store_false",
                        help="keep bones that carry no geometry")
+    merge.add_argument("--no-pack", dest="pack_parts", action="store_false",
+                       help="keep every always-on mesh in its own bodygroup instead of "
+                            "packing them (more bodyparts, harder to view)")
+    merge.add_argument("--keep-animated-bones", action="store_true",
+                       help="do not fold bones that move; costs bones but keeps "
+                            "animation data compressible (use if studiomdl reports "
+                            "a sequence over 64K)")
     merge.add_argument("--keep-hitbox-bones", action="store_true",
                        help="let $hbox entries pin bones against pruning "
                             "(costs shared-skeleton collapse; hitboxes are inert on view models)")
@@ -267,6 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_hand_arguments(analyze)
     analyze.add_argument("--no-prune", dest="prune", action="store_false")
     analyze.add_argument("--keep-hitbox-bones", action="store_true")
+    analyze.add_argument("--keep-animated-bones", action="store_true")
+    analyze.add_argument("--no-pack", dest="pack_parts", action="store_false")
     analyze.add_argument("--exclude", action="append", metavar="NAME")
     analyze.set_defaults(func=cmd_analyze)
 

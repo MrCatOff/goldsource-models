@@ -22,6 +22,7 @@ A bone is never removed while it still carries mesh vertices; callers compute a
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -170,6 +171,33 @@ def compute_keep_set(
 # ---------------------------------------------------------------------------
 # Bone removal (transform-preserving)
 # ---------------------------------------------------------------------------
+
+def animated_bone_names(smd: SMD) -> set[str]:
+    """
+    Bones whose local transform changes between frames.
+
+    Folding such a bone away pushes its motion into every child, so channels
+    that were constant become time-varying.  studiomdl run-length encodes
+    animation data and caps each sequence at 64 KB, so that can make a sequence
+    fail to compile even though the bone count went *down*.
+    """
+    if len(smd.skeleton) < 2:
+        return set()
+
+    id_to_name = {n.id: n.name for n in smd.nodes}
+    seen: dict[int, tuple] = {}
+    animated: set[int] = set()
+    for frame in smd.skeleton:
+        for bt in frame.bones:
+            value = (bt.tx, bt.ty, bt.tz, bt.rx, bt.ry, bt.rz)
+            previous = seen.get(bt.bone_id)
+            if previous is None:
+                seen[bt.bone_id] = value
+            elif previous != value:
+                animated.add(bt.bone_id)
+
+    return {id_to_name[b] for b in animated if b in id_to_name}
+
 
 def remove_bones(smd: SMD, remove: set[str]) -> list[str]:
     """
@@ -327,8 +355,13 @@ def graft_ancestors(target: SMD, authority: SMD) -> list[str]:
 
     The grafted bones take their local transforms from *authority*'s bind pose,
     and the re-parented root's own local transform is recomputed so its
-    **world-space bind pose is unchanged** — otherwise the mesh would shift,
-    because reference SMDs store vertices in world space.
+    **world-space pose is unchanged** — otherwise the mesh would shift, because
+    reference SMDs store vertices in world space.
+
+    *target* may be an animation with many frames: the grafted bones are added
+    to every one of them, and the compensation is solved per frame.  Writing
+    only the first frame would leave later frames missing a bone the hierarchy
+    depends on.
 
     Returns the names of the bones grafted in.
     """
@@ -349,9 +382,12 @@ def graft_ancestors(target: SMD, authority: SMD) -> list[str]:
         if bt.bone_id == node.id
     }
 
-    target_world = world_transforms(target)
+    # Capture every frame's world pose before touching the hierarchy.
+    original_world = [
+        world_transforms(target, index) for index in range(len(target.skeleton))
+    ]
     grafted: list[str] = []
-    frame = target.skeleton[0]
+    reparented = False
     next_id = max((n.id for n in target.nodes), default=-1) + 1
 
     for root in [n for n in target.nodes if n.parent_id == -1]:
@@ -360,8 +396,11 @@ def graft_ancestors(target: SMD, authority: SMD) -> list[str]:
         while parent is not None and not any(n.name == parent for n in target.nodes):
             chain.append(parent)
             parent = authority_parent.get(parent)
-        if not chain:
-            continue
+        if not chain and parent is None:
+            continue  # already a root in the authority too
+        # When *chain* is empty the ancestor is already present in the target —
+        # grafted while handling an earlier root — and this root still has to be
+        # re-parented onto it, so fall through rather than skipping.
 
         # chain is nearest-first; create from the far end so parents come first.
         previous_id = (
@@ -373,11 +412,14 @@ def graft_ancestors(target: SMD, authority: SMD) -> list[str]:
             if source is None:
                 continue
             target.nodes.append(Node(id=next_id, name=name, parent_id=previous_id))
-            frame.bones.append(BoneTransform(
-                bone_id=next_id,
-                tx=source.tx, ty=source.ty, tz=source.tz,
-                rx=source.rx, ry=source.ry, rz=source.rz,
-            ))
+            # The grafted bone is static, so the same local transform goes into
+            # every frame of the target.
+            for frame in target.skeleton:
+                frame.bones.append(BoneTransform(
+                    bone_id=next_id,
+                    tx=source.tx, ty=source.ty, tz=source.tz,
+                    rx=source.rx, ry=source.ry, rz=source.rz,
+                ))
             grafted.append(name)
             previous_id = next_id
             next_id += 1
@@ -386,22 +428,105 @@ def graft_ancestors(target: SMD, authority: SMD) -> list[str]:
             continue
 
         root.parent_id = previous_id
+        reparented = True
+        parent_name = next(n.name for n in target.nodes if n.id == previous_id)
 
-        # Preserve the root's world pose under its new parent.
-        new_parent_world = world_transforms(target).get(
-            next(n.name for n in target.nodes if n.id == previous_id)
-        )
-        original_world = target_world.get(root.name)
-        if new_parent_world is not None and original_world is not None:
-            local = np.linalg.inv(new_parent_world) @ original_world
-            for index, bt in enumerate(frame.bones):
+        # Preserve the root's world pose under its new parent, frame by frame.
+        for index, frame in enumerate(target.skeleton):
+            new_parent_world = world_transforms(target, index).get(parent_name)
+            was = original_world[index].get(root.name)
+            if new_parent_world is None or was is None:
+                continue
+            local = np.linalg.inv(new_parent_world) @ was
+            for position, bt in enumerate(frame.bones):
                 if bt.bone_id == root.id:
-                    frame.bones[index] = _bt_from_mat4(root.id, local)
+                    frame.bones[position] = _bt_from_mat4(root.id, local)
                     break
 
-    if grafted:
+    if grafted or reparented:
         renumber(target)
     return grafted
+
+
+def unique_vertex_count(smd: SMD) -> int:
+    """
+    Distinct vertices in *smd*, the quantity studiomdl budgets per submodel.
+
+    Positions are compared together with the bone they are bound to, which is
+    how the compiler deduplicates them.
+    """
+    return len({
+        (v.x, v.y, v.z, v.bone_id)
+        for tri in smd.triangles
+        for v in tri.vertices
+    })
+
+
+def concat_meshes(meshes: list[SMD]) -> SMD:
+    """
+    Combine several reference meshes that share a skeleton into one.
+
+    Reference SMDs store vertices in world space, so the triangles can simply be
+    carried over — what must be preserved is each bone's **world transform**,
+    since that is what studiomdl divides out to get bone-local coordinates.  A
+    bone missing from the combined skeleton is therefore grafted in with a local
+    transform solved against its new parent, reproducing the world pose it had
+    in its own mesh; copying the raw local transform would silently shift that
+    part of the geometry.
+    """
+    if not meshes:
+        raise ValueError("concat_meshes needs at least one mesh")
+    if len(meshes) == 1:
+        return deepcopy(meshes[0])
+
+    base = deepcopy(meshes[0])
+    if not base.skeleton:
+        base.skeleton.append(SkeletonFrame(time=0))
+
+    for other in meshes[1:]:
+        other_by_id = {n.id: n for n in other.nodes}
+        other_world = world_transforms(other)
+
+        for node_id in topo_order(other):
+            node = other_by_id[node_id]
+            if any(n.name == node.name for n in base.nodes):
+                continue
+
+            parent_name = (
+                other_by_id[node.parent_id].name
+                if node.parent_id in other_by_id else None
+            )
+            parent = next((n for n in base.nodes if n.name == parent_name), None)
+            new_id = max((n.id for n in base.nodes), default=-1) + 1
+            base.nodes.append(Node(
+                id=new_id, name=node.name,
+                parent_id=parent.id if parent is not None else -1,
+            ))
+
+            # Solve the local transform that restores this bone's world pose.
+            world = other_world.get(node.name)
+            parent_world = (
+                world_transforms(base).get(parent.name) if parent is not None else None
+            )
+            if world is None:
+                local = np.eye(4)
+            elif parent_world is None:
+                local = world
+            else:
+                local = np.linalg.inv(parent_world) @ world
+            base.skeleton[0].bones.append(_bt_from_mat4(new_id, local))
+
+        base_ids = {n.name: n.id for n in base.nodes}
+        for triangle in other.triangles:
+            copied = deepcopy(triangle)
+            for vertex in copied.vertices:
+                source = other_by_id.get(vertex.bone_id)
+                if source is not None and source.name in base_ids:
+                    vertex.bone_id = base_ids[source.name]
+            base.triangles.append(copied)
+
+    renumber(base)
+    return base
 
 
 @dataclass

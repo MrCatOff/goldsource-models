@@ -11,6 +11,7 @@ from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame, Vertex, Tria
 
 
 PISTOLS = PROJECT_ROOT / "storage" / "decompiled" / "pistols"
+MORE_WEAPONS = PROJECT_ROOT / "storage" / "decompiled" / "more_weapons"
 DEFAULT_HAND = PROJECT_ROOT / "storage" / "hands" / "default_hand.smd"
 
 
@@ -19,6 +20,13 @@ def pistols_dir() -> Path:
     if not PISTOLS.is_dir():
         pytest.skip(f"sample models not present at {PISTOLS}")
     return PISTOLS
+
+
+@pytest.fixture(scope="session")
+def more_weapons_dir() -> Path:
+    if not MORE_WEAPONS.is_dir():
+        pytest.skip(f"sample models not present at {MORE_WEAPONS}")
+    return MORE_WEAPONS
 
 
 @pytest.fixture(scope="session")

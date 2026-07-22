@@ -239,6 +239,10 @@ class MergeResult:
     model_names: list[str] = field(default_factory=list)
     # Correct pev_body value per model (encodes all bodygroup selections via stride formula)
     pev_body_map: dict[str, int] = field(default_factory=dict)
+    # {group_name: {model_name: index of that model's first entry in that group}}.
+    # Needed to recompute pev_body when the bodygroup layout is changed after
+    # the merge, since a blank entry cannot be attributed to a model by path.
+    bodygroup_indices: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def save(self, output_dir: str | Path) -> None:
         """
@@ -290,8 +294,16 @@ class MergeResult:
             lines = [f"[{name}]"]
             if name in self.pev_body_map:
                 lines.append(f"pev_body = {self.pev_body_map[name]}")
+            used_keys: set[str] = set()
             for seq_name, seq_idx in seq_map.get(name, []):
-                lines.append(f"anim_{seq_name} = {seq_idx}")
+                key = _ini_key(seq_name)
+                if key in used_keys:
+                    counter = 2
+                    while f"{key}_{counter}" in used_keys:
+                        counter += 1
+                    key = f"{key}_{counter}"
+                used_keys.add(key)
+                lines.append(f"anim_{key} = {seq_idx}")
             sections.append("\n".join(lines))
 
         return "\n\n".join(sections) + "\n"
@@ -494,7 +506,9 @@ class ModelMerger:
         # share a common top-level bone.
         output_smds = {k: _inject_universal_root(v) for k, v in output_smds.items()}
 
-        merged_qc, pev_body_map = _build_merged_qc(self._models, bone_maps, output_modelname, config)
+        merged_qc, pev_body_map, group_indices = _build_merged_qc(
+            self._models, bone_maps, output_modelname, config
+        )
 
         # Build $texturegroup if skin slots are configured.
         if config and config.skin_slots:
@@ -527,6 +541,7 @@ class ModelMerger:
             report=report,
             model_names=[m.name for m in self._models],
             pev_body_map=pev_body_map,
+            bodygroup_indices=group_indices,
         )
 
     # ------------------------------------------------------------------
@@ -999,31 +1014,50 @@ def _build_merged_qc(
     # pev_body encoding: sum over groups of (first_entry_index_for_model * stride)
     # stride for group g = product of total entry counts of all prior groups.
     pev_body: dict[str, int] = {m.name: 0 for m in models}
+    # {group_name: {model_name: index of that model's first entry in the group}}
+    group_indices: dict[str, dict[str, int]] = {}
     stride = 1
 
     for group_name in all_group_names:
         combined = BodyGroup(name=group_name)
         entry_offset = 0
+        group_indices[group_name] = {}
+        without_group: list[str] = []
+
         for model in models:
             bg = model.qc.bodygroup_by_name(group_name)
-            # Record this model's first entry index in this group (contributes to pev_body)
-            pev_body[model.name] += entry_offset * stride
             if bg is None:
-                combined.entries.append(BodyGroupEntry(smd=""))  # blank slot
-                entry_offset += 1
-            else:
-                for entry in bg.entries:
-                    if entry.is_blank:
-                        combined.entries.append(BodyGroupEntry(smd=""))
-                    else:
-                        # Prefix path with model name
-                        new_smd = f"{model.name}/{_norm_path(entry.smd)}"
-                        combined.entries.append(BodyGroupEntry(
-                            smd=new_smd,
-                            reverse=entry.reverse,
-                            scale=entry.scale,
-                        ))
-                entry_offset += len(bg.entries)
+                # Deferred: every model lacking this group shares ONE blank entry.
+                without_group.append(model.name)
+                continue
+            # Record this model's first entry index in this group (contributes to pev_body)
+            group_indices[group_name][model.name] = entry_offset
+            for entry in bg.entries:
+                if entry.is_blank:
+                    combined.entries.append(BodyGroupEntry(smd=""))
+                else:
+                    # Prefix path with model name
+                    new_smd = f"{model.name}/{_norm_path(entry.smd)}"
+                    combined.entries.append(BodyGroupEntry(
+                        smd=new_smd,
+                        reverse=entry.reverse,
+                        scale=entry.scale,
+                    ))
+            entry_offset += len(bg.entries)
+
+        # A single shared blank for all models that do not use this group.
+        # Giving each of them its own blank would multiply the group's entry
+        # count by the model count, and pev_body is a product of those counts —
+        # with many groups that overflows an int and crashes studiomdl.
+        if without_group:
+            combined.entries.append(BodyGroupEntry(smd=""))
+            for model_name in without_group:
+                group_indices[group_name][model_name] = entry_offset
+            entry_offset += 1
+
+        for model in models:
+            pev_body[model.name] += group_indices[group_name][model.name] * stride
+
         merged.bodygroups.append(combined)
         stride *= entry_offset  # total entries in this group
 
@@ -1067,10 +1101,20 @@ def _build_merged_qc(
             out_seq.name = _apply_seq_renames(out_seq.name, seq_renames)
             if out_seq.name in seen_seq_names:
                 out_seq.name = f"{model.name}__{out_seq.name}"
+            # A model may declare several sequences under one name (v_rpg_remapped
+            # has four called "fire"), so prefixing once is not enough to make
+            # the name unique — keep suffixing until it is, or they collapse
+            # into one entry in the sequence index map.
+            if out_seq.name in seen_seq_names:
+                stem = out_seq.name
+                counter = 2
+                while f"{stem}_{counter}" in seen_seq_names:
+                    counter += 1
+                out_seq.name = f"{stem}_{counter}"
             seen_seq_names.add(out_seq.name)
             merged.sequences.append(out_seq)
 
-    return merged, pev_body
+    return merged, pev_body, group_indices
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1197,21 @@ def _pick_ref_smd(model: ModelInput) -> SMD | None:
         if not smd.is_animation:
             return smd
     return next(iter(model.smds.values()), None)
+
+
+def _ini_key(name: str) -> str:
+    """
+    Make a sequence name safe to use as an INI key.
+
+    ``=`` and ``:`` are both key/value separators, and some CSO models carry a
+    watermark sequence literally named ``:LARS-DAY[BR]EAKER:`` — left as-is it
+    splits at the wrong place and every following key is misread.  The sequence
+    itself keeps its real name in the QC; only this lookup key is rewritten.
+    """
+    safe = name.strip()
+    for character in ("=", ":", "[", "]", "\n", "\r"):
+        safe = safe.replace(character, "_")
+    return safe.strip("_") or "unnamed"
 
 
 def _norm_path(path: str) -> str:

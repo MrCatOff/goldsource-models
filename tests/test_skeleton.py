@@ -1,5 +1,7 @@
 """Skeleton surgery must never move a surviving bone."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -14,7 +16,7 @@ from goldsource.skeleton import (
     topo_order,
     qc_referenced_bones,
 )
-from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame
+from goldsource.smd import SMD, Node, BoneTransform, SkeletonFrame, Triangle, Vertex
 
 
 def test_remove_bone_preserves_world_pose_in_every_frame():
@@ -124,6 +126,65 @@ def test_graft_ancestors_restores_parentage_without_moving_the_mesh():
     after = world_at(partial)
     for name in ("B", "C"):
         assert np.allclose(before[name], after[name], atol=1e-9), name
+
+
+def test_folding_a_long_chain_through_gimbal_lock_stays_accurate():
+    """
+    Composing bones can land on gimbal lock even when no single bone is near it.
+    The Euler extraction must not discard the Z rotation there: the error is of
+    order ``cy`` and every joint further down the chain multiplies it by its
+    lever arm, so a shoulder-sized slip shows up as visible drift at the tip.
+    """
+    # A chain whose composed Y rotation passes through 90 degrees.
+    smd = SMD(nodes=[Node(id=0, name="b0", parent_id=-1)])
+    frame = SkeletonFrame(time=0, bones=[BoneTransform(0, 0.0, 0.0, 0.0, 0.0, math.pi / 2, 0.0)])
+    for i in range(1, 8):
+        smd.nodes.append(Node(id=i, name=f"b{i}", parent_id=i - 1))
+        frame.bones.append(BoneTransform(i, 4.0, 0.5, -0.25, 0.3, 0.0, 0.2))
+    smd.skeleton.append(frame)
+
+    # Bind geometry to the tip so only the intermediates are prunable.
+    tip = Vertex(bone_id=7, x=1.0, y=2.0, z=3.0, nx=0.0, ny=0.0, nz=1.0, u=0.0, v=0.0)
+    smd.triangles.append(Triangle(material="t.bmp", v0=tip, v1=tip, v2=tip))
+
+    before = world_at(smd)
+    remove_bones(smd, {f"b{i}" for i in range(1, 7)})
+    after = world_at(smd)
+
+    drift = float(np.abs(before["b7"] - after["b7"]).max())
+    assert drift < 1e-9, f"tip drifted by {drift}"
+
+
+def test_graft_ancestors_fills_every_animation_frame():
+    """
+    A grafted bone must exist in all frames — writing only the first would
+    leave later frames missing a bone the hierarchy hangs off.
+    """
+    authority = make_chain_smd()
+
+    partial = SMD(
+        version=1,
+        nodes=[Node(id=0, name="B", parent_id=-1), Node(id=1, name="C", parent_id=0)],
+    )
+    for t in range(4):
+        partial.skeleton.append(SkeletonFrame(time=t, bones=[
+            BoneTransform(0, 4.0 + t, 5.0, 6.0, 0.0, 0.5, 0.6),
+            BoneTransform(1, 7.0, 8.0 - t, 9.0, 0.7, 0.8, 0.0),
+        ]))
+    before = [world_at(partial, i) for i in range(len(partial.skeleton))]
+
+    grafted = graft_ancestors(partial, authority)
+    assert grafted == ["A"]
+
+    bone_count = len(partial.nodes)
+    for frame in partial.skeleton:
+        assert len(frame.bones) == bone_count
+        assert {b.bone_id for b in frame.bones} == {n.id for n in partial.nodes}
+
+    after = [world_at(partial, i) for i in range(len(partial.skeleton))]
+    for index, (was, now) in enumerate(zip(before, after)):
+        for name in ("B", "C"):
+            assert np.allclose(was[name], now[name], atol=1e-9), f"frame {index} {name}"
 
 
 def test_graft_ancestors_is_a_noop_when_hierarchies_agree():

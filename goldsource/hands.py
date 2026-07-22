@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import combinations, permutations
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,9 @@ MIN_FINGER_CHAINS = 4
 MIN_CHAIN_LENGTH = 3
 # How far above the palm bone to look for the forearm.
 MAX_FOREARM_DEPTH = 4
+# Above this many rigs on either side, enumerating every pairing costs more
+# than it is worth and matching falls back to greedy.
+MAX_RIGS_TO_ENUMERATE = 4
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +141,60 @@ def _local_positions(smd: SMD, rig: HandRig) -> dict[str, np.ndarray]:
         if mat is not None:
             result[chain[0]] = (inv @ mat)[:3, 3]
     return result
+
+
+def _signed_volume(points: list[np.ndarray], subset: tuple[int, ...]) -> float:
+    """Signed volume of the tetrahedron formed by four of *points*."""
+    a, b, c, d = (points[i] for i in subset)
+    return float(np.dot(np.cross(b - a, c - a), d - a))
+
+
+# A chirality reading below this is noise and is ignored.
+_CHIRALITY_FLOOR = 0.25
+# Chirality is decisive when it is readable, so a mirrored pairing must lose to
+# a non-mirrored one regardless of how the positional distances happen to fall.
+MIRROR_PENALTY = 1000.0
+
+
+def _chirality(smd: SMD, rig: HandRig, forearm: str | None) -> float:
+    """
+    Signed volume of the hand's landmarks expressed in *forearm*-local space —
+    positive for one handedness, negative for the other.
+
+    Handedness cannot be read in *hand*-local space: a rig mirrors the hand
+    bone's own axes along with the geometry, so a left and a right hand give
+    nearly identical finger-root coordinates there.  That is exactly why the two
+    side assignments score within a fraction of a percent of each other.  Taking
+    the forearm as the frame instead brings in the arm-to-hand relationship,
+    which is where the mirroring actually shows up.
+
+    Returns 0.0 when the reading is unusable, which callers treat as "unknown"
+    rather than as a handedness.
+    """
+    if forearm is None:
+        return 0.0
+
+    world = world_transforms(smd)
+    base = world.get(forearm)
+    if base is None or rig.hand not in world:
+        return 0.0
+
+    inverse = np.linalg.inv(base)
+    points = [(inverse @ world[rig.hand])[:3, 3]]
+    for chain in rig.chains:
+        matrix = world.get(chain[0])
+        if matrix is not None:
+            points.append((inverse @ matrix)[:3, 3])
+
+    if len(points) < 4:
+        return 0.0
+
+    best = 0.0
+    for subset in combinations(range(len(points)), 4):
+        volume = _signed_volume(points, subset)
+        if abs(volume) > abs(best):
+            best = volume
+    return best if abs(best) >= _CHIRALITY_FLOOR else 0.0
 
 
 def _match_chains(
@@ -237,9 +295,11 @@ def match_hands(
     """
     Build a ``reference bone -> model bone`` rename map.
 
-    When both skeletons expose exactly two hands, both left/right assignments
-    are scored and the cheaper one wins — so the sides are resolved from the
-    geometry rather than from bone names, which are unreliable.
+    Every way of pairing the two skeletons' hands is scored and the cheapest
+    wins, so the sides are resolved from geometry rather than from bone names,
+    which are unreliable.  Scoring whole assignments matters most when the
+    model has only one hand: pairing greedily in reference order would hand it
+    to whichever reference rig came first, before handedness is ever consulted.
     """
     if not ref_rigs or not model_rigs:
         return HandMatch(unmapped=[r.hand for r in ref_rigs])
@@ -257,6 +317,16 @@ def match_hands(
             if ref_rig.forearm and forearm:
                 mapping[ref_rig.forearm] = forearm
                 score += penalty
+
+            # Reject a left hand bound to a right one (or vice versa).  When
+            # either reading is unusable this contributes nothing; when both
+            # model hands read the same way it applies equally to the straight
+            # and swapped assignments and cancels, leaving position to decide.
+            reference_side = _chirality(ref_smd, ref_rig, ref_rig.forearm)
+            model_side = _chirality(model_smd, model_rig, forearm)
+            if reference_side * model_side < 0:
+                score += MIRROR_PENALTY
+
             chain_pairing, cost = _match_chains(ref_smd, ref_rig, model_smd, model_rig)
             score += cost
             pairs.append((ref_rig.hand, model_rig.hand))
@@ -268,12 +338,25 @@ def match_hands(
                     mapping[ref_bone] = model_bone
         return HandMatch(mapping=mapping, score=score, pairs=pairs)
 
-    if len(ref_rigs) == 2 and len(model_rigs) == 2:
-        straight = build([(ref_rigs[0], model_rigs[0]), (ref_rigs[1], model_rigs[1])])
-        swapped = build([(ref_rigs[0], model_rigs[1]), (ref_rigs[1], model_rigs[0])])
-        best = straight if straight.score <= swapped.score else swapped
-    else:
-        # Fall back to greedy pairing on whatever is available.
+    best: HandMatch | None = None
+    if max(len(ref_rigs), len(model_rigs)) <= MAX_RIGS_TO_ENUMERATE:
+        if len(model_rigs) <= len(ref_rigs):
+            candidates = (
+                [(ref_rigs[r], model_rigs[m]) for m, r in enumerate(choice)]
+                for choice in permutations(range(len(ref_rigs)), len(model_rigs))
+            )
+        else:
+            candidates = (
+                [(ref_rigs[r], model_rigs[m]) for r, m in enumerate(choice)]
+                for choice in permutations(range(len(model_rigs)), len(ref_rigs))
+            )
+        for assignment in candidates:
+            candidate = build(assignment)
+            if best is None or candidate.score < best.score:
+                best = candidate
+
+    if best is None:
+        # Too many rigs to enumerate — fall back to greedy pairing.
         pairing: list[tuple[HandRig, HandRig]] = []
         remaining = list(model_rigs)
         for ref_rig in ref_rigs:
@@ -354,25 +437,75 @@ def safe_rename_map(mapping: dict[str, str], existing: set[str]) -> dict[str, st
     return safe
 
 
-def build_normalised_hand(reference_hand: SMD, texture: str | None = None) -> SMD:
+def _retarget_geometry(hand: SMD, keep: set[str]) -> int:
+    """
+    Rebind vertices off bones that are about to disappear.
+
+    Each doomed bone's vertices move to its nearest surviving ancestor, so the
+    geometry stays attached and simply rides that bone rigidly instead of
+    articulating.  Vertices with no surviving ancestor — a whole hand the target
+    model does not have — have their triangles dropped instead, since nothing
+    would ever animate them.  Returns the number of triangles dropped.
+    """
+    by_id = {node.id: node for node in hand.nodes}
+
+    target: dict[int, int | None] = {}
+    for node in hand.nodes:
+        if node.name in keep:
+            target[node.id] = node.id
+            continue
+        ancestor = by_id.get(node.parent_id)
+        while ancestor is not None and ancestor.name not in keep:
+            ancestor = by_id.get(ancestor.parent_id)
+        target[node.id] = ancestor.id if ancestor is not None else None
+
+    surviving: list = []
+    dropped = 0
+    for triangle in hand.triangles:
+        rebound = [target.get(v.bone_id) for v in triangle.vertices]
+        if any(bone_id is None for bone_id in rebound):
+            dropped += 1
+            continue
+        for vertex, bone_id in zip(triangle.vertices, rebound):
+            vertex.bone_id = bone_id
+        surviving.append(triangle)
+
+    hand.triangles = surviving
+    return dropped
+
+
+def build_normalised_hand(
+    reference_hand: SMD,
+    texture: str | None = None,
+    mapped: set[str] | None = None,
+) -> SMD:
     """
     Return the reference hand with its own root folded away and ids renumbered,
     ready to drop into any model whose hand bones have been canonicalised.
 
     Dropping the root leaves the forearms as roots, matching what the merger
     produces for the weapon meshes; the merger then injects a single identity
-    ``Universal_Root`` across every mesh.  The result depends only on the
-    reference hand, so it is byte-identical for every model — which is what
-    lets the hands bodygroup collapse to one shared entry.
+    ``Universal_Root`` across every mesh.
+
+    *mapped* limits the result to bones the target model actually has.  Not
+    every rig is a full pair of five-fingered hands: some have four fingers,
+    and some (``v_portal``, ``v_rpg_remapped``) have only one hand.  Emitting
+    the unmatched parts anyway would leave bones no animation ever touches,
+    rendering a frozen finger — or an entire detached hand — stuck in the bind
+    pose.  When *mapped* is omitted the whole reference hand is kept, which is
+    byte-identical for every model and lets the hands bodygroup collapse to a
+    single shared entry.
     """
     hand = deepcopy(reference_hand)
 
-    rigs = detect_rigs(hand)
     claimed: set[str] = set()
-    for rig in rigs:
+    for rig in detect_rigs(hand):
         claimed |= rig.bones
-    surplus = {n.name for n in hand.nodes if n.name not in claimed}
+    keep = claimed if mapped is None else claimed & mapped
+
+    surplus = {node.name for node in hand.nodes if node.name not in keep}
     if surplus:
+        _retarget_geometry(hand, keep)
         remove_bones(hand, surplus)
     renumber(hand)
 

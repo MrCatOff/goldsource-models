@@ -45,6 +45,11 @@ Useful flags: `--exclude NAME` (drop a model), `--rename FIND=REPLACE` (sequence
 names), `--no-hands` / `--no-prune` / `--no-share-hands` (disable a pass),
 `--keep-hitbox-bones`, `--dry-run`.
 
+**Batch size is limited by the 127-bone budget, not by the tool.** The pistols
+(~7 bones each beyond the shared 34-bone hand) fit 9 to a model; the larger CSO
+weapons in `more_weapons` carry 20-80 bones each, so only ~5 fit. Run `analyze`
+first — it reports the budget and names the models to drop.
+
 Output layout: `<out>/<model>.qc`, `<out>/<source_model>/*.smd`,
 `<out>/_shared/hand.smd`, flat `.BMP` textures, and `models.ini` mapping each
 source model to its `pev_body` value and sequence indices.
@@ -83,6 +88,31 @@ source model to its `pev_body` value and sequence indices.
 - Weapon bones from unrelated models *may* collide by name and get renamed
   apart (`v_ana` and `v_deagle` both use `Bone25`/`Bone50`) — that is correct.
   The invariant is that no *hand* bone is ever renamed apart.
+- **Handedness is read in forearm-local space, never hand-local.** A rig mirrors
+  the hand bone's own axes along with the geometry, so a left and a right hand
+  give near-identical finger coordinates in hand-local space — the two side
+  assignments score within 0.2% and the winner is noise. The forearm frame
+  brings in the arm-to-hand relationship, where the mirroring lives. All
+  pairings are scored as whole assignments; pairing greedily in reference order
+  would hand a one-handed model to whichever reference rig came first.
+- **A rig that is not a full pair of five-fingered hands gets a trimmed mesh.**
+  An unmatched finger's geometry is rebound to the palm (it rides rigidly
+  instead of articulating); an unmatched whole hand is dropped. Emitting it
+  anyway would leave bones no animation drives — a frozen hand in the bind pose.
+- **Duplicate `$bodygroup` names are made unique before merging.** The merger
+  aligns groups by name via `bodygroup_by_name`, which returns only the first
+  match, so duplicates were silently dropped with their meshes (24 of 58
+  `more_weapons` models are affected; `v_ak47chimera` lost 17 of 19 submodels).
+- **Models lacking a group share ONE blank entry, not one each.** `pev_body`
+  is a mixed-radix product of every group's entry count, so per-model blanks
+  multiply it past 32 bits — and studiomdl then dies with an access violation
+  and no diagnostic. `_check_bodygroup_limits` guards both that and the
+  32-bodypart cap.
+- **The Euler gimbal threshold is 1e-13, not 1e-6.** The degenerate branch of
+  `_extract_euler_zyx` discards the Z rotation, an error of order `cy`. Folding
+  a long bone chain amplifies it by each joint's lever arm — a 3e-7 slip at the
+  shoulder became 1e-5 units at the fingertips. Lowering the threshold took
+  worst-case animation drift from 1.0e-05 to 5.0e-12.
 - **Hitboxes do not pin bones** (they are inert on view models). A single
   `$hbox "root"` would otherwise keep a redundant root alive, giving `Bone01`
   two different parents across models — which studiomdl rejects, forcing the

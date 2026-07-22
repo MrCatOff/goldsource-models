@@ -41,10 +41,22 @@ def _euler_mat4(rx: float, ry: float, rz: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
+# Below this the Y rotation is at gimbal lock: R[2,1] and R[2,2] are pure
+# rounding noise, so X and Z can no longer be separated and Z is folded into X.
+#
+# Keep it as small as possible.  ``atan2`` is scale-invariant and stays accurate
+# for tiny-but-real arguments, whereas the degenerate branch *discards* the Z
+# rotation — an error of order ``cy``.  A threshold of 1e-6 therefore throws
+# away up to 1e-6 rad on orientations that were perfectly representable, and
+# folding a long bone chain amplifies that by each joint's lever arm (a 3e-7
+# error at the shoulder becomes 1e-5 units at the fingertips).
+_GIMBAL_EPSILON = 1e-13
+
+
 def _extract_euler_zyx(R: np.ndarray) -> tuple[float, float, float]:
     sy = -R[2, 0]
     cy = math.sqrt(R[2, 1] ** 2 + R[2, 2] ** 2)
-    if cy > 1e-6:
+    if cy > _GIMBAL_EPSILON:
         rx = math.atan2(R[2, 1], R[2, 2])
         ry = math.atan2(sy, cy)
         rz = math.atan2(R[1, 0], R[0, 0])
