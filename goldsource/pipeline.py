@@ -31,9 +31,11 @@ from goldsource.compiler import CompileResult, compile_qc
 from goldsource.hands import (
     HandNormalisation,
     build_normalised_hand,
+    canonical_rename_map,
     detect_rigs,
     load_reference_hand,
     match_hands,
+    safe_rename_map,
 )
 from goldsource.merger import (
     MergeConfig,
@@ -43,18 +45,20 @@ from goldsource.merger import (
     _norm_path,
     _ref_smd_names,
 )
-from goldsource.qc import QC, BodyGroupEntry
+from goldsource.qc import QC, BodyGroup, BodyGroupEntry
 from goldsource.sanitize import sanitize_directory
 from goldsource.skeleton import (
     compute_keep_set,
     graft_ancestors,
     remove_bones,
+    rename_bones,
     renumber,
 )
 from goldsource.smd import SMD
 
 
 SHARED_HAND_KEY = "_shared/hand"
+HAND_SMD_KEY = "hands"
 _HANDS_GROUP_RE = re.compile(r"hand", re.IGNORECASE)
 
 
@@ -229,10 +233,15 @@ def normalise_hands(
     reference_rigs: list,
     group_pattern: re.Pattern[str] = _HANDS_GROUP_RE,
     texture: str | None = None,
+    hands_group_name: str = "hands",
 ) -> HandNormalisation:
     """
-    Replace *model*'s hand mesh(es) with the optimised reference hand, rebound
-    to the model's own hand bones so its animations still drive it.
+    Replace *model*'s hand mesh(es) with the optimised reference hand.
+
+    The model's own hand bones are renamed onto the reference naming, so its
+    animations keep driving the new mesh *and* every model ends up with an
+    identically named hand skeleton.  However many hand bodygroups the model
+    had, it comes out with exactly one holding the single shared mesh.
     """
     result = HandNormalisation(model_name=model.name)
 
@@ -258,23 +267,53 @@ def normalise_hands(
     result.score = match.score
     result.unmapped = match.unmapped
 
-    new_hand = build_normalised_hand(reference_hand, match, texture=texture)
+    # Rename this model's hand bones onto the reference naming, everywhere:
+    # reference mesh, every animation, and the QC's bone references.  This is
+    # what makes differently-named rigs converge on one shared hand skeleton.
+    existing: set[str] = set()
+    for smd in model.smds.values():
+        existing |= {node.name for node in smd.nodes}
+    renames = safe_rename_map(canonical_rename_map(match), existing)
+    result.bone_renames = renames
 
+    dropped = set(canonical_rename_map(match)) - set(renames)
+    if dropped:
+        result.error = (
+            "hand bone renames would collide with existing bones: "
+            + ", ".join(sorted(dropped))
+        )
+        return result
+
+    for smd in model.smds.values():
+        rename_bones(smd, renames)
+    _rename_qc_bones(model.qc, renames)
+
+    new_hand = build_normalised_hand(reference_hand, texture=texture)
+
+    # Collapse however many hand bodygroups the model has (some split left and
+    # right into separate groups) into a single group holding the one mesh.
     retired: set[str] = set()
     for key in keys:
         retired |= {tri.material for tri in model.smds[key].triangles}
-        model.smds[key] = new_hand
-        result.replaced_keys.append(key)
+        del model.smds[key]
 
-    # Extra hand meshes collapse onto the first key; the QC entries are rewritten
-    # so every hand bodygroup entry points at the single normalised mesh.
-    if len(keys) > 1:
-        for bodygroup in model.qc.bodygroups:
-            if not group_pattern.search(bodygroup.name):
-                continue
-            for entry in bodygroup.entries:
-                if not entry.is_blank:
-                    entry.smd = keys[0]
+    hand_key = _unique_key(model, HAND_SMD_KEY)
+    model.smds[hand_key] = new_hand
+    result.replaced_keys.append(hand_key)
+
+    unified = BodyGroup(name=hands_group_name, entries=[BodyGroupEntry(smd=hand_key)])
+    rebuilt: list[BodyGroup] = []
+    inserted = False
+    for bodygroup in model.qc.bodygroups:
+        if group_pattern.search(bodygroup.name):
+            if not inserted:
+                rebuilt.append(unified)
+                inserted = True
+            continue
+        rebuilt.append(bodygroup)
+    if not inserted:
+        rebuilt.append(unified)
+    model.qc.bodygroups = rebuilt
 
     still_used = {
         tri.material
@@ -288,6 +327,29 @@ def normalise_hands(
     )
     result.smd = new_hand
     return result
+
+
+def _unique_key(model: ModelInput, preferred: str) -> str:
+    """An SMD key that does not clash with one the model already uses."""
+    if preferred not in model.smds:
+        return preferred
+    counter = 1
+    while f"{preferred}_{counter}" in model.smds:
+        counter += 1
+    return f"{preferred}_{counter}"
+
+
+def _rename_qc_bones(qc: QC, renames: dict[str, str]) -> None:
+    """Apply a bone rename map to every bone reference in the QC."""
+    if not renames:
+        return
+    for attachment in qc.attachments:
+        attachment.bone = renames.get(attachment.bone, attachment.bone)
+    for hbox in qc.hboxes:
+        hbox.bone = renames.get(hbox.bone, hbox.bone)
+    for controller in qc.controllers:
+        controller.bone = renames.get(controller.bone, controller.bone)
+    qc.keepbones = [renames.get(bone, bone) for bone in qc.keepbones]
 
 
 def prune_model(model: ModelInput, keep_hitbox_bones: bool = False) -> tuple[list[str], int, int]:

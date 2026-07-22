@@ -66,9 +66,26 @@ source model to its `pev_body` value and sequence indices.
   numbers left-hand fingers in descending order (`Finger1`→`Bone21`) and
   right-hand fingers ascending (`Finger1`→`Bone31`); a name-based table would
   silently swap index and pinky on one side.
+- **The forearm is picked by arm length, not by being the palm's parent.**
+  `v_deagle` puts a near-coincident wrist bone directly above the palm (0.36
+  units) with the real forearm one level higher (8.54, matching the reference's
+  8.45). Binding to the direct parent would slide the forearm mesh ~8.5 units
+  down the arm.
+- **Model hand bones are renamed onto the reference naming, not vice versa.**
+  Bone names are the only thing studiomdl merges on, so a rig that calls its
+  palm `"Bone 04"` instead of `Bone_Lefthand` would otherwise contribute a
+  second 34-bone copy of the same hand. Renames are collision-checked
+  (`safe_rename_map`) so two bones can never collapse into one, and QC
+  `$attachment`/`$hbox`/`$controller` bone references are renamed with them.
+- **However many hand bodygroups a model has, it comes out with one.**
+  `v_deagle` splits hands into separate `rhand`/`lhand` groups; since one mesh
+  now covers both hands, leaving two groups would render it twice.
+- Weapon bones from unrelated models *may* collide by name and get renamed
+  apart (`v_ana` and `v_deagle` both use `Bone25`/`Bone50`) — that is correct.
+  The invariant is that no *hand* bone is ever renamed apart.
 - **Hitboxes do not pin bones** (they are inert on view models). A single
   `$hbox "root"` would otherwise keep a redundant root alive, giving `Bone01`
   two different parents across models — which studiomdl rejects, forcing the
-  merger to duplicate the whole shared hand skeleton (96 bones becomes 150).
+  merger to duplicate the whole shared hand skeleton.
 - **Normalised hand meshes come out byte-identical**, so the hands bodygroup
   collapses to one shared entry instead of one copy per model.

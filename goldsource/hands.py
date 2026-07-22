@@ -46,6 +46,8 @@ from goldsource.skeleton import child_ids, world_transforms, rename_bones, remov
 MIN_FINGER_CHAINS = 4
 # A finger chain must have at least this many bones (proximal/middle/distal).
 MIN_CHAIN_LENGTH = 3
+# How far above the palm bone to look for the forearm.
+MAX_FOREARM_DEPTH = 4
 
 
 # ---------------------------------------------------------------------------
@@ -54,10 +56,14 @@ MIN_CHAIN_LENGTH = 3
 
 @dataclass
 class HandRig:
-    """A detected hand: the palm bone, its parent (forearm) and finger chains."""
+    """A detected hand: the palm bone, its ancestors and its finger chains."""
     hand: str
     forearm: str | None
     chains: list[list[str]] = field(default_factory=list)
+    # Ancestors of the palm bone, nearest first.  The forearm is *chosen* from
+    # this chain by arm length rather than assumed to be the direct parent —
+    # some rigs insert a near-coincident wrist bone between the two.
+    ancestors: list[str] = field(default_factory=list)
 
     @property
     def bones(self) -> set[str]:
@@ -100,11 +106,16 @@ def detect_rigs(smd: SMD) -> list[HandRig]:
             if len(chain) >= MIN_CHAIN_LENGTH:
                 chains.append(chain)
         if len(chains) >= MIN_FINGER_CHAINS:
-            parent = by_id.get(node.parent_id)
+            ancestors: list[str] = []
+            current = by_id.get(node.parent_id)
+            while current is not None and len(ancestors) < MAX_FOREARM_DEPTH:
+                ancestors.append(current.name)
+                current = by_id.get(current.parent_id)
             rigs.append(HandRig(
                 hand=node.name,
-                forearm=parent.name if parent is not None else None,
+                forearm=ancestors[0] if ancestors else None,
                 chains=chains,
+                ancestors=ancestors,
             ))
     return rigs
 
@@ -166,6 +177,50 @@ def _match_chains(
     return pairing, total
 
 
+def _bone_distance(world: dict[str, np.ndarray], a: str, b: str) -> float | None:
+    """Bind-pose distance between two bones, or None if either is missing."""
+    if a not in world or b not in world:
+        return None
+    return float(np.linalg.norm(world[a][:3, 3] - world[b][:3, 3]))
+
+
+def _pick_forearm(
+    ref_world: dict[str, np.ndarray], ref_rig: HandRig,
+    model_world: dict[str, np.ndarray], model_rig: HandRig,
+) -> tuple[str | None, float]:
+    """
+    Choose which ancestor of the model's palm bone plays the forearm, by
+    matching the reference rig's forearm-to-hand length.
+
+    The direct parent is not reliable: some rigs put a near-coincident wrist
+    bone directly above the palm, with the real forearm one level higher.
+    Binding the reference forearm mesh to that wrist bone would slide the whole
+    forearm down the arm by its own length.  Returns ``(bone, penalty)``.
+    """
+    if not model_rig.ancestors:
+        return None, 0.0
+
+    if ref_rig.forearm is None:
+        return model_rig.ancestors[0], 0.0
+
+    target = _bone_distance(ref_world, ref_rig.hand, ref_rig.forearm)
+    if target is None:
+        return model_rig.ancestors[0], 0.0
+
+    best_name, best_error = None, float("inf")
+    for candidate in model_rig.ancestors:
+        distance = _bone_distance(model_world, model_rig.hand, candidate)
+        if distance is None:
+            continue
+        error = abs(distance - target)
+        if error < best_error:
+            best_name, best_error = candidate, error
+
+    if best_name is None:
+        return model_rig.ancestors[0], 0.0
+    return best_name, best_error
+
+
 @dataclass
 class HandMatch:
     """Result of matching the reference hand rig onto one model."""
@@ -189,14 +244,19 @@ def match_hands(
     if not ref_rigs or not model_rigs:
         return HandMatch(unmapped=[r.hand for r in ref_rigs])
 
+    ref_world = world_transforms(ref_smd)
+    model_world = world_transforms(model_smd)
+
     def build(assignment: list[tuple[HandRig, HandRig]]) -> HandMatch:
         mapping: dict[str, str] = {}
         score = 0.0
         pairs: list[tuple[str, str]] = []
         for ref_rig, model_rig in assignment:
             mapping[ref_rig.hand] = model_rig.hand
-            if ref_rig.forearm and model_rig.forearm:
-                mapping[ref_rig.forearm] = model_rig.forearm
+            forearm, penalty = _pick_forearm(ref_world, ref_rig, model_world, model_rig)
+            if ref_rig.forearm and forearm:
+                mapping[ref_rig.forearm] = forearm
+                score += penalty
             chain_pairing, cost = _match_chains(ref_smd, ref_rig, model_smd, model_rig)
             score += cost
             pairs.append((ref_rig.hand, model_rig.hand))
@@ -246,6 +306,7 @@ class HandNormalisation:
     pairs: list[tuple[str, str]] = field(default_factory=list)
     score: float = 0.0
     unmapped: list[str] = field(default_factory=list)
+    bone_renames: dict[str, str] = field(default_factory=dict)  # model bone -> reference bone
     replaced_keys: list[str] = field(default_factory=list)   # SMD keys swapped out
     retired_textures: list[str] = field(default_factory=list)
     error: str | None = None
@@ -255,25 +316,61 @@ class HandNormalisation:
         return self.error is None and self.smd is not None
 
 
-def build_normalised_hand(
-    reference_hand: SMD,
-    match: HandMatch,
-    texture: str | None = None,
-) -> SMD:
+def canonical_rename_map(match: HandMatch) -> dict[str, str]:
     """
-    Return a copy of *reference_hand* with its bones renamed onto the target
-    model's naming, its own root folded away, and ids renumbered.
+    Invert a match into ``{model bone: reference bone}``.
 
-    Dropping the reference hand's root leaves the forearms as roots, matching
-    what the merger produces for the weapon meshes; the merger then injects a
-    single identity ``Universal_Root`` across every mesh.
+    Renaming the *model* onto the reference naming — rather than renaming the
+    reference hand onto each model — is what lets every model share one hand
+    skeleton.  Source rigs disagree about names (``Bone_Lefthand`` in most CSO
+    models, ``"Bone 04"`` in others), and a bone name is the only thing
+    studiomdl merges on, so without canonicalisation each differently-named rig
+    would contribute its own 34-bone duplicate of the same hand.
+
+    Entries that would rename a bone onto a name already used by a *different*
+    bone are dropped, so this can never collapse two bones into one.
+    """
+    inverted: dict[str, str] = {}
+    for reference_bone, model_bone in match.mapping.items():
+        inverted.setdefault(model_bone, reference_bone)
+    return inverted
+
+
+def safe_rename_map(mapping: dict[str, str], existing: set[str]) -> dict[str, str]:
+    """
+    Drop renames that would collide with an unrelated bone already in the
+    skeleton, so a rename can never merge two distinct bones.
+    """
+    renamed_away = set(mapping)
+    safe: dict[str, str] = {}
+    taken: set[str] = set()
+    for source, target in mapping.items():
+        if target in taken:
+            continue
+        if target in existing and target not in renamed_away:
+            continue
+        safe[source] = target
+        taken.add(target)
+    return safe
+
+
+def build_normalised_hand(reference_hand: SMD, texture: str | None = None) -> SMD:
+    """
+    Return the reference hand with its own root folded away and ids renumbered,
+    ready to drop into any model whose hand bones have been canonicalised.
+
+    Dropping the root leaves the forearms as roots, matching what the merger
+    produces for the weapon meshes; the merger then injects a single identity
+    ``Universal_Root`` across every mesh.  The result depends only on the
+    reference hand, so it is byte-identical for every model — which is what
+    lets the hands bodygroup collapse to one shared entry.
     """
     hand = deepcopy(reference_hand)
-    rename_bones(hand, match.mapping)
 
-    # Fold away any bone that the match did not claim (typically the reference
-    # hand's own root) so the result contains hand bones only.
-    claimed = set(match.mapping.values())
+    rigs = detect_rigs(hand)
+    claimed: set[str] = set()
+    for rig in rigs:
+        claimed |= rig.bones
     surplus = {n.name for n in hand.nodes if n.name not in claimed}
     if surplus:
         remove_bones(hand, surplus)

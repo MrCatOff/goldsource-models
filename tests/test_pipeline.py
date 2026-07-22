@@ -94,6 +94,48 @@ def test_preparation_preserves_every_animation_frame(reference, pistols_dir, mod
     assert worst < 1e-9, f"{model_name}: animation drifted by {worst}"
 
 
+def test_split_hand_bodygroups_collapse_into_one(reference, pistols_dir):
+    """
+    v_deagle splits its hands across two bodygroups ("rhand" and "lhand")
+    instead of the usual single "hands" group.  Since one mesh now covers both
+    hands, the model must come out with exactly one hand group — otherwise both
+    groups would render the same two-handed mesh on top of each other.
+    """
+    ref_smd, ref_rigs = reference
+    model = ModelInput.from_directory("v_deagle", pistols_dir / "v_deagle")
+
+    original = [bg.name for bg in model.qc.bodygroups]
+    assert sorted(n for n in original if "hand" in n.lower()) == ["lhand", "rhand"]
+
+    result = normalise_hands(model, ref_smd, ref_rigs, texture="default_hand.bmp")
+    assert result.ok, result.error
+
+    hand_groups = [bg for bg in model.qc.bodygroups if "hand" in bg.name.lower()]
+    assert len(hand_groups) == 1
+    assert len(hand_groups[0].entries) == 1
+    assert hand_groups[0].entries[0].smd in model.smds
+    # The weapon group must survive untouched.
+    assert any(bg.name == "weapon" for bg in model.qc.bodygroups)
+    # The superseded hand meshes are gone.
+    assert "rhand" not in model.smds and "lhand" not in model.smds
+
+
+def test_qc_bone_references_follow_the_canonical_rename(reference, pistols_dir):
+    """$attachment/$hbox bones must be renamed alongside the skeleton."""
+    ref_smd, ref_rigs = reference
+    model = ModelInput.from_directory("v_deagle", pistols_dir / "v_deagle")
+
+    assert any(a.bone == "Bone 04" for a in model.qc.attachments)  # guards the premise
+
+    result = normalise_hands(model, ref_smd, ref_rigs, texture="default_hand.bmp")
+    assert result.bone_renames["Bone 04"] == "Bip01_L_Hand"
+    assert any(a.bone == "Bip01_L_Hand" for a in model.qc.attachments)
+
+    known = {n.name for smd in model.smds.values() for n in smd.nodes}
+    for attachment in model.qc.attachments:
+        assert attachment.bone in known
+
+
 def test_preparation_leaves_hand_bones_rooted_consistently(reference, pistols_dir):
     """
     Every model must end up with the same parent for each hand bone — that is
@@ -141,10 +183,35 @@ def test_merge_fits_within_the_bone_limit(merged):
     )
 
 
-def test_merge_produces_no_bone_conflicts(merged):
-    """Any conflict means a shared bone got duplicated per-model."""
-    assert merged.merge.report.conflicts == []
-    assert merged.merge.renamed_bones == {}
+def test_no_hand_bone_is_ever_renamed_apart(merged, default_hand_path):
+    """
+    Weapon bones from unrelated models may collide by name and get renamed
+    apart — that is correct.  Hand bones must never be, since a renamed hand
+    bone means a model brought its own duplicate of the shared 34-bone rig.
+    """
+    from goldsource.hands import detect_rigs
+    from goldsource.smd import SMD
+
+    hand_bones: set[str] = set()
+    for rig in detect_rigs(SMD.from_file(default_hand_path)):
+        hand_bones |= rig.bones
+
+    for model_name, renames in merged.merge.renamed_bones.items():
+        clashing = hand_bones & set(renames)
+        assert not clashing, f"{model_name} duplicated hand bones: {sorted(clashing)}"
+
+
+def test_hand_skeleton_is_shared_by_every_model(merged, default_hand_path):
+    """The canonical hand rig must appear exactly once in the merged skeleton."""
+    from goldsource.hands import detect_rigs
+    from goldsource.smd import SMD
+
+    hand_bones: set[str] = set()
+    for rig in detect_rigs(SMD.from_file(default_hand_path)):
+        hand_bones |= rig.bones
+
+    emitted = {n.name for smd in merged.merge.smds.values() for n in smd.nodes}
+    assert hand_bones <= emitted, hand_bones - emitted
 
 
 def test_all_models_and_sequences_survive(merged, pistols_dir):
