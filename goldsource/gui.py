@@ -18,14 +18,15 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenuBar, QMessageBox, QProgressBar, QProgressDialog,
-    QPushButton, QSplitter, QSpinBox, QDoubleSpinBox, QStackedWidget, QStyle,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSplitter, QSpinBox, QDoubleSpinBox,
+    QStackedWidget, QStyle, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from goldsource.merger import ModelInput, MergeConfig, MergeReport, MergeResult, ModelMerger
 from goldsource.qc import QC, Sequence, SequenceEvent, BodyGroup, BodyGroupEntry
 from goldsource.sanitize import sanitize_directory
+from goldsource.optimise import analyse_directory, apply_optimisations, OptimisationReport
 from goldsource.config import (
     AppConfig, ModelEntry, SkinVariantSpec, TextureReplacementSpec, SkinSlotSpec,
 )
@@ -178,12 +179,18 @@ class _ModelListPanel(QWidget):
             "Rename non-ASCII files in a directory to ASCII-safe names "
             "and update all SMD/QC references."
         )
+        self._btn_optimise = QPushButton("Optimise Bones…")
+        self._btn_optimise.setToolTip(
+            "Analyse all SMD files and remove redundant pass-through or dead-leaf bones."
+        )
         self._btn_add.clicked.connect(self._on_add)
         self._btn_remove.clicked.connect(self._on_remove)
         self._btn_sanitize.clicked.connect(self._on_sanitize)
+        self._btn_optimise.clicked.connect(self._on_optimise_bones)
         btn_row.addWidget(self._btn_add)
         btn_row.addWidget(self._btn_remove)
         btn_row.addWidget(self._btn_sanitize)
+        btn_row.addWidget(self._btn_optimise)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -381,6 +388,69 @@ class _ModelListPanel(QWidget):
         for directory in all_renamed:
             self._reload_directory(directory)
 
+    def _on_optimise_bones(self) -> None:
+        dirs = self.model_directories()
+        if not dirs:
+            QMessageBox.information(self, "Optimise Bones", "No models loaded.")
+            return
+
+        # Collect reports for all directories
+        all_reports: dict[str, OptimisationReport] = {}
+        for name, directory in dirs.items():
+            try:
+                report = analyse_directory(directory)
+                all_reports[directory] = report
+            except Exception as exc:
+                QMessageBox.critical(self, "Optimise Bones — Error",
+                                     f"Failed to analyse {name}:\n{exc}")
+                return
+
+        # Merge candidate names across all directories for the dialog
+        all_dead: dict[str, set[str]] = {}
+        all_collapse: dict[str, set[str]] = {}
+        for report in all_reports.values():
+            for name, files in report.dead_leaves.items():
+                all_dead.setdefault(name, set()).update(files)
+            for name, files in report.collapsible.items():
+                all_collapse.setdefault(name, set()).update(files)
+
+        if not all_dead and not all_collapse:
+            QMessageBox.information(
+                self, "Optimise Bones",
+                "No optimisation candidates found in any loaded model."
+            )
+            return
+
+        dlg = _OptimiseBoneDialog(all_dead, all_collapse, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_dead = dlg.selected_dead_leaves()
+        selected_collapse = dlg.selected_collapsible()
+        if not selected_dead and not selected_collapse:
+            return
+
+        total_modified = 0
+        all_errors: list[str] = []
+        for directory in all_reports:
+            modified, errors = apply_optimisations(
+                directory, selected_dead, selected_collapse
+            )
+            total_modified += modified
+            all_errors.extend(errors)
+
+        if all_errors:
+            QMessageBox.warning(
+                self, "Optimise Bones — Warnings",
+                f"Modified {total_modified} file(s) with errors:\n\n" +
+                "\n".join(all_errors)
+            )
+        else:
+            QMessageBox.information(
+                self, "Optimise Bones — Done",
+                f"Modified {total_modified} file(s)."
+            )
+
     def _reload_directory(self, directory: str) -> None:
         """Reload any model whose source directory matches *directory*."""
         norm = str(Path(directory).resolve())
@@ -405,6 +475,82 @@ class _ModelListPanel(QWidget):
                 if m and d:
                     result[m.name] = d
         return result
+
+
+# ---------------------------------------------------------------------------
+# Optimise-Bones dialog
+# ---------------------------------------------------------------------------
+
+class _OptimiseBoneDialog(QDialog):
+    """Shows dead-leaf and collapsible-bone candidates with checkboxes."""
+
+    def __init__(
+        self,
+        dead_leaves: dict[str, set[str]],
+        collapsible: dict[str, set[str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Optimise Bones")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            "Select bones to optimise. Changes will be written to all SMD files."
+        ))
+
+        # ── Scrollable content area ───────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        scroll.setWidget(content)
+
+        # ── Dead leaves ──────────────────────────────────────────────────
+        self._dead_checks: dict[str, QCheckBox] = {}
+        if dead_leaves:
+            grp_dead = QGroupBox("Dead-leaf bones (no vertices, no children — will be deleted)")
+            vbox_dead = QVBoxLayout(grp_dead)
+            for name in sorted(dead_leaves):
+                files = sorted(dead_leaves[name])
+                cb = QCheckBox(f"{name}  [{', '.join(files)}]")
+                cb.setChecked(True)
+                vbox_dead.addWidget(cb)
+                self._dead_checks[name] = cb
+            content_layout.addWidget(grp_dead)
+
+        # ── Collapsible ───────────────────────────────────────────────────
+        self._collapse_checks: dict[str, QCheckBox] = {}
+        if collapsible:
+            grp_col = QGroupBox("Pass-through bones (no vertices, single child — child transform folded in)")
+            vbox_col = QVBoxLayout(grp_col)
+            for name in sorted(collapsible):
+                files = sorted(collapsible[name])
+                cb = QCheckBox(f"{name}  [{', '.join(files)}]")
+                cb.setChecked(True)
+                vbox_col.addWidget(cb)
+                self._collapse_checks[name] = cb
+            content_layout.addWidget(grp_col)
+
+        content_layout.addStretch()
+        layout.addWidget(scroll)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_dead_leaves(self) -> list[str]:
+        return [name for name, cb in self._dead_checks.items() if cb.isChecked()]
+
+    def selected_collapsible(self) -> list[str]:
+        return [name for name, cb in self._collapse_checks.items() if cb.isChecked()]
 
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1246,7 @@ class _QCEditorPanel(QWidget):
         self._cur_model: str            = ""
         self._loading:   bool           = False  # suppress change signals during load
         self._pending_smd_renames: list[tuple[str, str]] = []  # (old_stem, new_stem)
+        self._pending_tex_renames: list[tuple[str, str]] = []  # (old_mat, new_mat)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -1322,6 +1469,27 @@ class _QCEditorPanel(QWidget):
         bg_root.addWidget(bg_splitter, 1)
         self._tabs.addTab(bg_widget, "Bodygroups")
 
+        # ── Textures tab ─────────────────────────────────────────────────
+        tex_widget = QWidget()
+        tex_root   = QVBoxLayout(tex_widget)
+        tex_root.setContentsMargins(0, 4, 0, 0)
+        tex_root.addWidget(QLabel(
+            "Textures used across all reference SMD files in this model directory.\n"
+            "Edit the 'New name' column and click Save to rename them on disk."
+        ))
+        self._tex_table = QTableWidget(0, 2)
+        self._tex_table.setHorizontalHeaderLabels(["Current name", "New name"])
+        self._tex_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self._tex_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self._tex_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tex_table.verticalHeader().setVisible(False)
+        tex_root.addWidget(self._tex_table, 1)
+        self._tabs.addTab(tex_widget, "Textures")
+
         # ── Shared Save button (below tabs) ─────────────────────────────
         save_row = QHBoxLayout()
         save_row.addStretch()
@@ -1382,14 +1550,18 @@ class _QCEditorPanel(QWidget):
             self._clear_editor()
             return
         self._pending_smd_renames.clear()
+        self._pending_tex_renames.clear()
         self._refresh_seq_list(keep_row=0)
         self._refresh_bg_list(keep_row=0)
+        self._refresh_texture_list()
         self._btn_save.setEnabled(True)
 
     def _clear_editor(self) -> None:
         self._qc = None
         self._qc_path = None
         self._pending_smd_renames.clear()
+        self._pending_tex_renames.clear()
+        self._tex_table.setRowCount(0)
         self._seq_list.clear()
         self._detail_group.setEnabled(False)
         self._btn_save.setEnabled(False)
@@ -1827,6 +1999,41 @@ class _QCEditorPanel(QWidget):
         self._loading = False
         self._entry_table.setCurrentCell(entry_row + 1, 0)
 
+    # --- textures ---
+    def _refresh_texture_list(self) -> None:
+        """Scan all reference SMDs in the model directory and populate the texture table."""
+        from goldsource.smd import SMD as _SMD
+        self._tex_table.blockSignals(True)
+        self._tex_table.setRowCount(0)
+        if self._qc_path is None:
+            self._tex_table.blockSignals(False)
+            return
+
+        model_dir = self._qc_path.parent
+        materials: list[str] = []
+        seen: set[str] = set()
+        for smd_path in sorted(model_dir.rglob("*.smd")):
+            try:
+                smd = _SMD.from_file(smd_path)
+            except Exception:
+                continue
+            if not smd.triangles:
+                continue  # animation SMD — no texture data
+            for tri in smd.triangles:
+                if tri.material not in seen:
+                    seen.add(tri.material)
+                    materials.append(tri.material)
+
+        for mat in materials:
+            row = self._tex_table.rowCount()
+            self._tex_table.insertRow(row)
+            cur_item = QTableWidgetItem(mat)
+            cur_item.setFlags(cur_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._tex_table.setItem(row, 0, cur_item)
+            self._tex_table.setItem(row, 1, QTableWidgetItem(mat))
+
+        self._tex_table.blockSignals(False)
+
     # --- save ---
     def _on_save(self) -> None:
         if self._qc is None or self._qc_path is None:
@@ -1852,18 +2059,54 @@ class _QCEditorPanel(QWidget):
                     rename_errors.append(f"{old_stem}.smd → {new_stem}.smd: {exc}")
         self._pending_smd_renames.clear()
 
+        # Collect texture renames from the table
+        tex_renames: dict[str, str] = {}
+        for row in range(self._tex_table.rowCount()):
+            cur_item = self._tex_table.item(row, 0)
+            new_item = self._tex_table.item(row, 1)
+            if cur_item and new_item:
+                old_mat = cur_item.text()
+                new_mat = new_item.text().strip()
+                if new_mat and new_mat != old_mat:
+                    tex_renames[old_mat] = new_mat
+
+        # Apply texture renames to all reference SMD files
+        from goldsource.smd import SMD as _SMD
+        tex_errors: list[str] = []
+        if tex_renames:
+            for smd_path in sorted(model_dir.rglob("*.smd")):
+                try:
+                    smd = _SMD.from_file(smd_path)
+                except Exception:
+                    continue
+                if not smd.triangles:
+                    continue
+                changed = False
+                for tri in smd.triangles:
+                    if tri.material in tex_renames:
+                        tri.material = tex_renames[tri.material]
+                        changed = True
+                if changed:
+                    try:
+                        smd.save(smd_path)
+                    except Exception as exc:
+                        tex_errors.append(f"{smd_path.name}: {exc}")
+
+            # Refresh the table so "Current name" reflects the new names
+            self._refresh_texture_list()
+
         try:
             self._qc.save(self._qc_path)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
             return
 
-        if rename_errors:
+        all_errors = rename_errors + tex_errors
+        if all_errors:
             QMessageBox.warning(
                 self, "Saved with warnings",
                 f"QC file saved:\n{self._qc_path}\n\n"
-                "Could not rename the following SMD file(s) on disk:\n"
-                + "\n".join(rename_errors),
+                "Errors:\n" + "\n".join(all_errors),
             )
         else:
             QMessageBox.information(
