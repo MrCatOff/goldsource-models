@@ -1020,15 +1020,35 @@ def _build_merged_qc(
 
     for group_name in all_group_names:
         combined = BodyGroup(name=group_name)
-        entry_offset = 0
         group_indices[group_name] = {}
-        without_group: list[str] = []
+        without_group = [
+            model.name for model in models
+            if model.qc.bodygroup_by_name(group_name) is None
+        ]
+
+        # A viewer opens every bodypart at index 0, so index 0 decides the
+        # default view.  Two failure modes to avoid:
+        #   * blank last  → a part group the first model does not have defaults
+        #     to some *other* model's piece, stacking several weapons at once.
+        #   * blank first always → a part group the first model *does* have gets
+        #     its piece pushed to index 1, so a weapon split across many
+        #     always-on parts shows only its first fragment at the default.
+        # So index 0 belongs to the first model when it contributes, and is a
+        # blank otherwise.  Either way the default shows exactly the first
+        # model, whole, and nothing else.
+        first_has = models[0].qc.bodygroup_by_name(group_name) is not None
+        lead_blank = bool(without_group) and not first_has
+
+        blank_index: int | None = None
+        entry_offset = 0
+        if lead_blank:
+            combined.entries.append(BodyGroupEntry(smd=""))
+            blank_index = 0
+            entry_offset = 1
 
         for model in models:
             bg = model.qc.bodygroup_by_name(group_name)
             if bg is None:
-                # Deferred: every model lacking this group shares ONE blank entry.
-                without_group.append(model.name)
                 continue
             # Record this model's first entry index in this group (contributes to pev_body)
             group_indices[group_name][model.name] = entry_offset
@@ -1045,15 +1065,17 @@ def _build_merged_qc(
                     ))
             entry_offset += len(bg.entries)
 
-        # A single shared blank for all models that do not use this group.
-        # Giving each of them its own blank would multiply the group's entry
-        # count by the model count, and pev_body is a product of those counts —
-        # with many groups that overflows an int and crashes studiomdl.
-        if without_group:
+        # A trailing blank for the models that lack this group, when the first
+        # model supplied index 0.  All of them share that ONE blank: giving each
+        # its own would multiply the group's entry count by the model count, and
+        # pev_body is a product of those counts — with many groups that overflows
+        # an int and crashes studiomdl.
+        if without_group and blank_index is None:
             combined.entries.append(BodyGroupEntry(smd=""))
-            for model_name in without_group:
-                group_indices[group_name][model_name] = entry_offset
+            blank_index = entry_offset
             entry_offset += 1
+        for model_name in without_group:
+            group_indices[group_name][model_name] = blank_index
 
         for model in models:
             pev_body[model.name] += group_indices[group_name][model.name] * stride

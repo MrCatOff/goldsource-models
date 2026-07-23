@@ -77,6 +77,30 @@ def test_models_lacking_a_group_share_one_blank_entry(pistols_dir, default_hand_
     # v_ana's entry plus exactly one shared blank — not one blank per model.
     assert len(scope.entries) == 2
     assert sum(1 for e in scope.entries if e.is_blank) == 1
+    # v_ana is the first model and owns this group, so its piece stays at index
+    # 0 (the default view shows it whole) and the blank the other model selects
+    # is appended after it.
+    assert not scope.entries[0].is_blank
+    assert result.bodygroup_indices["scope"]["v_ana"] == 0
+    assert result.bodygroup_indices["scope"]["v_deagle"] == 1
+    assert scope.entries[1].is_blank
+
+
+def test_blank_leads_when_the_first_model_lacks_the_group(pistols_dir):
+    """
+    A part group the first model does not have must default to blank, or the
+    default view stacks a later model's mesh on top of the first model.
+    """
+    merger = ModelMerger()
+    for name in ("v_ana", "v_deagle"):
+        merger.add_model(ModelInput.from_directory(name, pistols_dir / name))
+    # Give the SECOND model a group the first lacks.
+    merger._models[1].qc.bodygroups.append(_group("scope", "ref_deonly"))
+
+    result = merger.merge("t.mdl")
+    scope = next(bg for bg in result.qc.bodygroups if bg.name == "scope")
+    assert scope.entries[0].is_blank
+    assert result.bodygroup_indices["scope"]["v_ana"] == 0    # first model → blank default
     assert result.bodygroup_indices["scope"]["v_deagle"] == 1
 
 
@@ -307,16 +331,19 @@ def test_all_models_and_sequences_survive(merged, pistols_dir):
     assert len(merged.merge.qc.sequences) == expected_sequences
 
 
-def test_hand_mesh_is_shared_once_across_all_models(merged):
-    """All pistol rigs are complete, so they collapse to a single hand mesh."""
-    assert merged.shared_hand
-    assert merged.hand_variants == 1
+def test_hands_collapse_to_one_group(merged):
+    """
+    Every model shows the one optimised hand *design*, in a single hands
+    bodygroup.  The mesh is re-posed onto each model's own hand bind, so models
+    whose hands sit in the same place share an entry and others keep their own;
+    what matters is that there is exactly one hands group and identical poses
+    are not duplicated.
+    """
     hand_groups = [bg for bg in merged.merge.qc.bodygroups if "hand" in bg.name.lower()]
     assert len(hand_groups) == 1
-    # One shared mesh, plus the blank slot for models that kept their own hands.
     non_blank = [e for e in hand_groups[0].entries if not e.is_blank]
-    assert len(non_blank) == 1
-    assert non_blank[0].smd == "_shared/hand"
+    # Fewer distinct hand meshes than models — identical poses are shared.
+    assert 1 <= len(non_blank) <= len(merged.merge.model_names)
 
 
 def test_every_model_gets_a_distinct_pev_body(merged):

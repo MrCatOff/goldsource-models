@@ -27,6 +27,10 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
+from goldsource.bonepool import PoolPlan, apply_pool, plan_pool
+from goldsource.optimise import _bt_from_mat4
 from goldsource.compiler import CompileResult, compile_qc
 from goldsource.hands import (
     HandNormalisation,
@@ -55,9 +59,11 @@ from goldsource.skeleton import (
     remove_bones,
     rename_bones,
     renumber,
+    topo_order,
     unique_vertex_count,
+    world_transforms,
 )
-from goldsource.smd import SMD
+from goldsource.smd import SMD, BoneTransform, Node
 
 
 SHARED_HAND_KEY = "_shared/hand"
@@ -67,6 +73,8 @@ PART_GROUP_PREFIX = "weapon"
 # studiomdl's MAXSTUDIOVERTS per submodel.  The source models sit right at it
 # (v_skull5 has a 2045-vertex part), so it is the budget their authors targeted.
 VERTEX_BUDGET = 2048
+# studiomdl's MAXSTUDIOBONES, minus the slot it reserves.
+BONE_LIMIT = 127
 _HANDS_GROUP_RE = re.compile(r"hand", re.IGNORECASE)
 
 
@@ -82,6 +90,8 @@ class ModelPrep:
     renamed_files: dict[str, str] = field(default_factory=dict)
     renamed_bodygroups: dict[str, int] = field(default_factory=dict)
     packed_groups: tuple[int, int] | None = None
+    collapsed_groups: list[str] = field(default_factory=list)
+    kept_groups: list[str] = field(default_factory=list)
     hands: HandNormalisation | None = None
     pruned_bones: list[str] = field(default_factory=list)
     bones_before: int = 0
@@ -98,6 +108,8 @@ class PipelineResult:
     output_dir: Path | None = None
     qc_path: Path | None = None
     shared_hand: bool = False
+    pool_slots: int = 0
+    pool_reshaped: int = 0
     exceeds_bodygroup_limits: bool = False
     hand_variants: int = 0
     compile: CompileResult | None = None
@@ -122,6 +134,10 @@ class PipelineResult:
             lines.append(
                 f"Merged skeleton: {report.total_unique_bones} / {report.bone_limit} bones"
             )
+            if self.pool_slots:
+                lines.append(f"Pooled weapon bones: {self.pool_slots} slots shared by "
+                             f"{len(self.preps)} models "
+                             f"({self.pool_reshaped} re-anchored)")
             if report.conflicts:
                 lines.append(f"Bone conflicts resolved by rename: {len(report.conflicts)}")
             lines.append(f"Sequences: {len(self.merge.qc.sequences)}")
@@ -309,6 +325,168 @@ def _hand_keys(model: ModelInput, group_pattern: re.Pattern[str]) -> list[str]:
     return [slot.key for slot in _hand_slots(model, group_pattern)]
 
 
+def _complete_hand_bones(
+    model: ModelInput,
+    reference_hand: SMD,
+    reference_rigs: list,
+    mapped: set[str],
+) -> set[str]:
+    """
+    For every reference hand the model *partially* has, add the finger bones it
+    is missing, static at the reference bind pose, to all of its SMDs.
+
+    A rig that maps four fingers instead of five yields a hand mesh trimmed of
+    the fifth — which no longer matches the full hand, so the shared-hand pass
+    cannot fold it in and the model carries its own near-duplicate copy.  Adding
+    the missing bone back (frozen, since the model's animation never drives it)
+    makes the mesh byte-identical to the full hand, so one shared hand serves
+    every model whose hands are complete.
+
+    A hand the model *entirely* lacks — a one-handed weapon — is left alone; a
+    whole frozen hand would float beside the weapon in the bind pose.  Only
+    hands with at least one mapped bone are completed.  Returns the reference
+    bones now present (the ``mapped`` set grown by whatever was injected).
+    """
+    present_rigs = [rig for rig in reference_rigs if rig.bones & mapped]
+    wanted: set[str] = set()
+    for rig in present_rigs:
+        wanted |= rig.bones
+    to_add = wanted - mapped
+    if not to_add:
+        return mapped
+
+    ref_by_id = {node.id: node for node in reference_hand.nodes}
+    ref_by_name = {node.name: node for node in reference_hand.nodes}
+    ref_local = {
+        ref_by_id[bone.bone_id].name: bone
+        for bone in reference_hand.skeleton[0].bones
+        if bone.bone_id in ref_by_id
+    } if reference_hand.skeleton else {}
+
+    # Parents before children, so a finger's sub-bones attach to a bone that is
+    # already in place.
+    order: list[str] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in seen or name not in ref_by_name:
+            return
+        seen.add(name)
+        node = ref_by_name[name]
+        if node.parent_id >= 0:
+            visit(ref_by_id[node.parent_id].name)
+        order.append(name)
+
+    for name in to_add:
+        visit(name)
+    injectable = [name for name in order if name in to_add]
+
+    for smd in model.smds.values():
+        name_to_id = {node.name: node.id for node in smd.nodes}
+        next_id = max((node.id for node in smd.nodes), default=-1) + 1
+        added = False
+        for name in injectable:
+            parent_name = (ref_by_id[ref_by_name[name].parent_id].name
+                           if ref_by_name[name].parent_id >= 0 else None)
+            if parent_name is None or parent_name not in name_to_id:
+                continue  # nothing to hang it off in this mesh
+            source = ref_local.get(name)
+            smd.nodes.append(Node(id=next_id, name=name, parent_id=name_to_id[parent_name]))
+            name_to_id[name] = next_id
+            for frame in smd.skeleton:
+                frame.bones.append(BoneTransform(
+                    bone_id=next_id,
+                    tx=source.tx if source else 0.0,
+                    ty=source.ty if source else 0.0,
+                    tz=source.tz if source else 0.0,
+                    rx=source.rx if source else 0.0,
+                    ry=source.ry if source else 0.0,
+                    rz=source.rz if source else 0.0,
+                ))
+            next_id += 1
+            added = True
+        if added:
+            renumber(smd)
+
+    return wanted | mapped
+
+
+def _repose_hand_to_model(new_hand: SMD, donor: SMD) -> None:
+    """
+    Move the optimised hand mesh onto the *model's* hand bind pose, in place.
+
+    By the time this runs *donor* — the model's own hand mesh — has had its hand
+    bones renamed onto the reference naming, so a bone in *new_hand* and the same
+    bone in *donor* share a name; *donor* just holds it at the model's position.
+    Every such bone is placed exactly where the model has it and the vertices
+    riding it are carried along, so the mesh keeps its optimised shape but now
+    sits where the model's animations expect the hand — no stretch between bind
+    and motion.
+
+    Bones with no counterpart in *donor* (a finger frozen in by
+    :func:`_complete_hand_bones`) keep their reference offset from their parent
+    and ride it into the new pose.
+    """
+    if not new_hand.skeleton or not donor.skeleton:
+        return
+
+    ref_world = world_transforms(new_hand, 0)
+    model_world = world_transforms(donor, 0)
+    target: dict[str, np.ndarray | None] = {
+        node.name: model_world.get(node.name) for node in new_hand.nodes
+    }
+
+    by_id = {node.id: node for node in new_hand.nodes}
+    new_world: dict[int, np.ndarray] = {}
+    vertex_xform: dict[int, np.ndarray] = {}
+
+    for node_id in topo_order(new_hand):
+        node = by_id[node_id]
+        current = ref_world.get(node.name)
+        if current is None:
+            continue
+        want = target.get(node.name)
+        if want is None:
+            # No model pose: ride the (already re-posed) parent with the same
+            # offset this bone had in the reference hand.
+            if node.parent_id != -1 and node.parent_id in new_world:
+                ref_parent = ref_world[by_id[node.parent_id].name]
+                want = new_world[node.parent_id] @ (np.linalg.inv(ref_parent) @ current)
+            else:
+                want = current
+        new_world[node_id] = want
+        vertex_xform[node_id] = want @ np.linalg.inv(current)
+
+    # Carry the geometry across.
+    for triangle in new_hand.triangles:
+        for vertex in triangle.vertices:
+            xform = vertex_xform.get(vertex.bone_id)
+            if xform is None:
+                continue
+            p = xform @ np.array([vertex.x, vertex.y, vertex.z, 1.0])
+            vertex.x, vertex.y, vertex.z = float(p[0]), float(p[1]), float(p[2])
+            n = xform[:3, :3] @ np.array([vertex.nx, vertex.ny, vertex.nz])
+            norm = float(np.linalg.norm(n))
+            if norm > 1e-9:
+                n = n / norm
+            vertex.nx, vertex.ny, vertex.nz = float(n[0]), float(n[1]), float(n[2])
+
+    # Rewrite each bone's local transform to realise the new world pose.
+    for frame in new_hand.skeleton[:1]:
+        for bone in frame.bones:
+            world = new_world.get(bone.bone_id)
+            if world is None:
+                continue
+            node = by_id[bone.bone_id]
+            if node.parent_id != -1 and node.parent_id in new_world:
+                local = np.linalg.inv(new_world[node.parent_id]) @ world
+            else:
+                local = world
+            solved = _bt_from_mat4(bone.bone_id, local)
+            bone.tx, bone.ty, bone.tz = solved.tx, solved.ty, solved.tz
+            bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
+
+
 def normalise_hands(
     model: ModelInput,
     reference_hand: SMD,
@@ -316,6 +494,7 @@ def normalise_hands(
     group_pattern: re.Pattern[str] = _HANDS_GROUP_RE,
     texture: str | None = None,
     hands_group_name: str = "hands",
+    complete_hands: bool = True,
 ) -> HandNormalisation:
     """
     Replace *model*'s hand mesh(es) with the optimised reference hand.
@@ -371,9 +550,25 @@ def normalise_hands(
         rename_bones(smd, renames)
     _rename_qc_bones(model.qc, renames)
 
+    mapped = set(match.mapping)
+    if complete_hands:
+        # Grow a near-complete hand up to the full one so it shares the single
+        # optimised mesh instead of carrying its own trimmed copy.
+        mapped = _complete_hand_bones(model, reference_hand, reference_rigs, mapped)
+        result.unmapped = sorted(set(result.unmapped) - mapped)
+
     new_hand = build_normalised_hand(
-        reference_hand, texture=texture, mapped=set(match.mapping),
+        reference_hand, texture=texture, mapped=mapped,
     )
+
+    # The optimised hand is authored around the *reference* rig's pose, but the
+    # model's animations drive its own hand bones, which may sit in a very
+    # different place (v_ak47chimera's hands are ~90 units from where the
+    # reference puts them).  Left as-is the mesh is bound at the reference pose
+    # yet animated to the model's, so it stretches away from the weapon — the
+    # forearm reads as an elongated bone and the hand detaches.  Re-posing the
+    # mesh onto the model's own bind pose makes bind and animation agree again.
+    _repose_hand_to_model(new_hand, donor)
 
     # Collapse however many hand bodygroups the model has (some split left and
     # right into separate groups) into a single group holding the one mesh.
@@ -451,11 +646,60 @@ def _rename_qc_bones(qc: QC, renames: dict[str, str]) -> None:
     qc.keepbones = [renames.get(bone, bone) for bone in qc.keepbones]
 
 
+def select_weapon_groups(
+    model: ModelInput,
+    keep: set[str] | None = None,
+    hands_pattern: re.Pattern[str] = _HANDS_GROUP_RE,
+) -> list[str]:
+    """
+    Reduce every switchable ``$bodygroup`` to its first entry, so the model
+    contributes a single weapon submodel.  Returns the names collapsed.
+
+    A source model's bodygroups mostly *split* one weapon into pieces that are
+    all drawn together — those are single-entry and packing already folds them
+    into one mesh.  A few carry a genuine choice (a scope on or off, a glowing
+    LED strip cycling through frames), and every one of those multiplies the
+    merged model's ``pev_body`` radix and costs a bodypart out of the 32
+    available, for a variant nothing in the merged model ever selects.
+
+    So by default only the first entry survives.  Naming a group in *keep*
+    leaves it switchable, for the cases where the variants are the point.
+    Hand groups are never touched — the shared-hand pass owns those.
+    """
+    kept = keep or set()
+    collapsed: list[str] = []
+
+    for bodygroup in model.qc.bodygroups:
+        if len(bodygroup.entries) < 2:
+            continue
+        if bodygroup.name in kept or hands_pattern.search(bodygroup.name):
+            continue
+        first = next((e for e in bodygroup.entries if not e.is_blank), None)
+        if first is None:
+            continue
+        bodygroup.entries = [first]
+        collapsed.append(bodygroup.name)
+
+    if collapsed:
+        # The alternatives are gone; drop the meshes only they referenced.
+        wanted = {
+            _resolve_smd(model, entry.smd)
+            for group in model.qc.bodygroups for entry in group.entries
+            if not entry.is_blank
+        }
+        for key in [k for k in model.smds
+                    if not model.smds[k].is_animation and k not in wanted]:
+            model.smds.pop(key, None)
+
+    return collapsed
+
+
 def pack_always_on_parts(
     model: ModelInput,
     budget: int = VERTEX_BUDGET,
     skip_keys: set[str] | None = None,
     group_prefix: str = PART_GROUP_PREFIX,
+    keep_switchable: set[str] | None = None,
 ) -> int:
     """
     Merge a model's always-on meshes into as few bodygroups as the vertex
@@ -491,6 +735,7 @@ def pack_always_on_parts(
         packable.append((bodygroup, key))
 
     if len(packable) < 2:
+        _canonicalise_group_names(model, group_prefix, skip, keep_switchable=keep_switchable)
         return len(model.qc.bodygroups)
 
     # Largest first, so big meshes claim a slot and small ones fill the gaps.
@@ -514,7 +759,11 @@ def pack_always_on_parts(
             sizes.append(size)
 
     if len(packs) >= len(packable):
-        return len(model.qc.bodygroups)  # nothing would be gained
+        # Nothing would be gained by concatenating, but the groups still have to
+        # agree on names with every other model's, or each spelling costs a
+        # bodypart of its own.
+        _canonicalise_group_names(model, group_prefix, skip, keep_switchable=keep_switchable)
+        return len(model.qc.bodygroups)
 
     # Take the meshes out of the model before rebuilding, keeping a local
     # handle on them — they are the inputs to the concatenation.
@@ -536,7 +785,50 @@ def pack_always_on_parts(
 
     model.qc.bodygroups[position:position] = replacements
     dedupe_bodygroup_names(model.qc)
+    _canonicalise_group_names(model, group_prefix, skip, keep_switchable=keep_switchable)
     return len(model.qc.bodygroups)
+
+
+def _canonicalise_group_names(
+    model: ModelInput,
+    group_prefix: str,
+    skip: set[str],
+    hands_pattern: re.Pattern[str] = _HANDS_GROUP_RE,
+    keep_switchable: set[str] | None = None,
+) -> None:
+    """
+    Rename a model's weapon bodygroups to ``weapon``, ``weapon_2``, … in order.
+
+    The merger aligns bodygroups across models *by name*, so two models that
+    each contribute one weapon submodel share a bodypart only if they agree on
+    what to call it.  Source models do not: the same slot is variously
+    ``bodypart1``, ``body``, ``studio``, even ``waepon``.  Left alone each
+    spelling becomes its own bodypart, and since ``pev_body`` is a mixed-radix
+    product over *every* bodypart, each one multiplies the value every model
+    needs — 22 bodyparts put it 3000x past the 32-bit ceiling.
+    """
+    index = 0
+    kept = keep_switchable or set()
+    for bodygroup in model.qc.bodygroups:
+        if bodygroup.name in kept:
+            # A group deliberately left switchable is this model's own choice,
+            # not a slot to line up with other models' weapon pieces — sharing
+            # the name would put its variants in the same bodypart as their
+            # meshes.  Give it one of its own.
+            bodygroup.name = f"{model.name}_{bodygroup.name}"
+            continue
+        holds_hand = any(_resolve_smd(model, entry.smd) in skip
+                         for entry in bodygroup.entries if not entry.is_blank)
+        if holds_hand or hands_pattern.search(bodygroup.name):
+            # The hand is not always in a group named for it — ``v_rpg_remapped``
+            # keeps it in ``body`` — and the shared-hand collapse finds its group
+            # by name.  Naming it here is what lets every model's hand share one
+            # bodypart instead of one apiece.
+            bodygroup.name = HAND_SMD_KEY
+            continue
+        index += 1
+        bodygroup.name = group_prefix if index == 1 else f"{group_prefix}_{index}"
+    dedupe_bodygroup_names(model.qc)
 
 
 def prune_model(
@@ -596,6 +888,155 @@ def prune_model(
         remaining |= {n.name for n in smd.nodes}
 
     return sorted(removed), bones_before, len(remaining)
+
+
+def _authority(model: ModelInput) -> SMD | None:
+    """The reference mesh whose skeleton is the fullest — the model's hierarchy."""
+    references = [model.smds[key] for key in _reference_keys(model) if key in model.smds]
+    if not references:
+        references = [smd for smd in model.smds.values() if not smd.is_animation]
+    return max(references, key=lambda smd: len(smd.nodes)) if references else None
+
+
+def _hierarchy(smd: SMD) -> dict[str, str | None]:
+    by_id = {node.id: node.name for node in smd.nodes}
+    return {
+        node.name: (by_id.get(node.parent_id) if node.parent_id >= 0 else None)
+        for node in smd.nodes
+    }
+
+
+def pick_pool_anchor(models: list[ModelInput], shared: set[str]) -> str | None:
+    """
+    The shared bone to hang pooled weapon bones off: whichever one the most
+    models already attach a weapon root to, so the fewest bones have to move.
+    """
+    if not shared:
+        return None
+    votes: dict[str, int] = {}
+    for model in models:
+        authority = _authority(model)
+        if authority is None:
+            continue
+        hierarchy = _hierarchy(authority)
+        for bone, parent in hierarchy.items():
+            if bone not in shared and parent in shared:
+                votes[parent] = votes.get(parent, 0) + 1
+    if votes:
+        return max(votes, key=lambda name: (votes[name], name))
+    return None
+
+
+def _ensure_anchor(smd: SMD, anchor: str, donor: SMD) -> bool:
+    """
+    Give *smd* the *anchor* bone, placed where *donor* has it and static in
+    every frame, then graft in whatever ancestors *donor* gives it.
+
+    A model whose hand rig could not be normalised has none of the shared bones,
+    so its pooled weapon roots would come out as roots while every other model's
+    hang off the anchor.  The merger sees one name with two different parents
+    and renames them apart — undoing the pooling for exactly the models that
+    have the least to share.  An inert copy of the anchor chain costs nothing
+    (those bones are shared with every other model anyway) and keeps the
+    parentage agreeing.
+
+    The pose is taken from a *prepared* model rather than the reference hand,
+    so the grafted chain matches what pruning left the other models with.
+    """
+    present = {node.name for node in smd.nodes}
+    if anchor in present:
+        return False
+
+    world = world_transforms(donor, 0).get(anchor)
+    if world is None:
+        return False
+
+    next_id = max((node.id for node in smd.nodes), default=-1) + 1
+    smd.nodes.append(Node(id=next_id, name=anchor, parent_id=-1))
+    local = _bt_from_mat4(next_id, world)
+    for frame in smd.skeleton:
+        frame.bones.append(BoneTransform(
+            bone_id=next_id, tx=local.tx, ty=local.ty, tz=local.tz,
+            rx=local.rx, ry=local.ry, rz=local.rz,
+        ))
+
+    renumber(smd)
+    graft_ancestors(smd, donor)
+    return True
+
+
+def pool_bones(
+    models: list[ModelInput],
+    shared: set[str],
+    anchor: str | None = None,
+    reference_hand: SMD | None = None,
+    bone_limit: int = BONE_LIMIT,
+) -> tuple[PoolPlan | None, dict[str, int]]:
+    """
+    Put every model's weapon bones onto a shared pool of bone slots, so merging
+    costs the *largest* model's bone count rather than the sum of all of them.
+
+    Slots are renamed and re-parented in place across each model's meshes and
+    animations; :func:`goldsource.bonepool.reparent` re-solves every frame so
+    the animations are unchanged.  QC bone references travel with the rename.
+
+    Returns the plan and ``{model: bones moved}``.
+    """
+    anchor = anchor or pick_pool_anchor(models, shared)
+    if anchor is None:
+        return None, {}
+
+    donor = next(
+        (authority for authority in (_authority(model) for model in models)
+         if authority is not None and any(n.name == anchor for n in authority.nodes)),
+        None,
+    )
+    if donor is not None:
+        for model in models:
+            if any(n.name == anchor for n in (_authority(model) or SMD()).nodes):
+                continue
+            for smd in model.smds.values():
+                _ensure_anchor(smd, anchor, donor)
+
+    forests: dict[str, dict[str, str | None]] = {}
+    for model in models:
+        # Every bone the model has anywhere, not just in its fullest mesh: a
+        # bone left out of the pool keeps its original name and collides with
+        # the identically-named bone of some other model at merge time, which
+        # is exactly the cost pooling exists to remove.
+        authority = _authority(model)
+        hierarchy: dict[str, str | None] = {}
+        for smd in model.smds.values():
+            for bone, parent in _hierarchy(smd).items():
+                if bone not in hierarchy or hierarchy[bone] is None:
+                    hierarchy[bone] = parent
+        if authority is not None:
+            hierarchy.update(_hierarchy(authority))
+        if hierarchy:
+            forests[model.name] = hierarchy
+
+    # Slots the pool may grow to before it starts re-anchoring bones to reuse
+    # one: everything the bone limit leaves over once the shared bones are in.
+    max_slots = max(1, bone_limit - len(shared))
+    plan = plan_pool(forests, shared, anchor, max_slots=max_slots)
+
+    moved: dict[str, int] = {}
+    for model in models:
+        assignment = plan.assignments.get(model.name)
+        if not assignment:
+            continue
+        moved[model.name] = apply_pool(model.smds, assignment, plan.parents)
+        _rename_qc_bones(model.qc, assignment)
+
+        # Re-parenting may have left a mesh without the anchor it now hangs off;
+        # graft it back so every SMD of this model agrees on parentage.
+        authority = _authority(model)
+        if authority is not None:
+            for smd in model.smds.values():
+                if smd is not authority:
+                    graft_ancestors(smd, authority)
+
+    return plan, moved
 
 
 # ---------------------------------------------------------------------------
@@ -888,9 +1329,14 @@ def run(
     normalise: bool = True,
     prune: bool = True,
     pack_parts: bool = True,
+    vertex_budget: int = VERTEX_BUDGET,
     keep_hitbox_bones: bool = False,
     keep_animated_bones: bool = False,
     share_hands: bool = True,
+    pool_bones_pass: bool = True,
+    bone_target: int = BONE_LIMIT,
+    keep_groups: dict[str, set[str] | str] | None = None,
+    single_group: bool = True,
     sanitise: bool = True,
     exclude: list[str] | None = None,
     merge_config: MergeConfig | None = None,
@@ -934,6 +1380,7 @@ def run(
 
     merger = ModelMerger()
     hand_keys_by_model: dict[str, list[str]] = {}
+    prepared: list[ModelInput] = []
 
     for directory in directories:
         prep = ModelPrep(name=directory.name, directory=directory)
@@ -981,10 +1428,27 @@ def run(
             if texture_path.exists():
                 model.textures[texture_path.name] = texture_path.read_bytes()
 
+        if single_group:
+            wanted = (keep_groups or {}).get(model.name, set())
+            if wanted == "*":
+                keep = {group.name for group in model.qc.bodygroups}
+            else:
+                keep = set(wanted)
+            prep.kept_groups = sorted(keep)
+            prep.collapsed_groups = select_weapon_groups(model, keep)
+            if prep.collapsed_groups:
+                log(f"    collapsed {len(prep.collapsed_groups)} switchable "
+                    f"bodygroup(s) to one entry: {', '.join(prep.collapsed_groups)}")
+            if keep:
+                log(f"    kept switchable: {', '.join(sorted(keep))}")
+
         if pack_parts:
             hand_keys = set(prep.hands.replaced_keys) if (prep.hands and prep.hands.ok) else set()
             groups_before = len(model.qc.bodygroups)
-            groups_after = pack_always_on_parts(model, skip_keys=hand_keys)
+            groups_after = pack_always_on_parts(
+                model, budget=vertex_budget, skip_keys=hand_keys,
+                keep_switchable=set(prep.kept_groups),
+            )
             prep.packed_groups = (groups_before, groups_after)
             if groups_after < groups_before:
                 log(f"    packed {groups_before} bodygroups -> {groups_after}")
@@ -1003,9 +1467,32 @@ def run(
                 names |= {n.name for n in smd.nodes}
             prep.bones_before = prep.bones_after = len(names)
 
-        merger.add_model(model)
+        prepared.append(model)
         result.preps.append(prep)
         result.warnings.extend(f"{prep.name}: {w}" for w in prep.warnings)
+
+    if pool_bones_pass and reference_hand is not None and len(prepared) > 1:
+        log("--- pooling weapon bones")
+        shared = {node.name for node in reference_hand.nodes}
+        plan, moved = pool_bones(prepared, shared, reference_hand=reference_hand,
+                                 bone_limit=bone_target)
+        if plan is not None:
+            result.pool_slots = plan.size
+            result.pool_reshaped = sum(plan.reshaped.values())
+            log(f"    {plan.size} pooled slots serve {len(prepared)} models "
+                f"({sum(len(a) for a in plan.assignments.values())} weapon bones), "
+                f"{sum(moved.values())} bones re-parented")
+            for prep in result.preps:
+                prep.bones_after = len({
+                    node.name
+                    for model in prepared if model.name == prep.name
+                    for smd in model.smds.values() for node in smd.nodes
+                })
+        else:
+            log("    no shared anchor bone found, skipping")
+
+    for model in prepared:
+        merger.add_model(model)
 
     log("--- merging")
     merged = merger.merge(model_name, config=merge_config)

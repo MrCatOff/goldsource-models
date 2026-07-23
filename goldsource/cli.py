@@ -14,6 +14,8 @@ Subcommands
 from __future__ import annotations
 
 import argparse
+import json
+import pathlib
 import sys
 from pathlib import Path
 
@@ -63,6 +65,46 @@ def _parse_renames(pairs: list[str] | None) -> list[tuple[str, str]]:
     return renames
 
 
+def _parse_keep_groups(args: argparse.Namespace) -> dict[str, set[str] | str]:
+    """
+    Collect the bodygroups that stay switchable, from ``--groups`` JSON and
+    ``--keep-group MODEL:GROUP``.
+
+    The JSON is ``{"model": ["group", ...]}``; a value of ``"*"`` keeps every
+    group that model has.  ``--keep-group`` accepts ``MODEL:*`` for the same.
+    """
+    keep: dict[str, set[str] | str] = {}
+
+    if getattr(args, "groups", None):
+        path = pathlib.Path(args.groups)
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"--groups: cannot read {path}: {exc}")
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"--groups: expected an object at the top level of {path}")
+        for model, groups in loaded.items():
+            if isinstance(groups, str):
+                if groups != "*":
+                    raise SystemExit(f"--groups: {model!r} expects a list or \"*\", got {groups!r}")
+                keep[model] = "*"
+            else:
+                keep[model] = set(groups)
+
+    for pair in getattr(args, "keep_group", None) or []:
+        if ":" not in pair:
+            raise SystemExit(f"--keep-group expects MODEL:GROUP, got {pair!r}")
+        model, group = pair.split(":", 1)
+        if group == "*":
+            keep[model] = "*"
+        elif keep.get(model) != "*":
+            existing = keep.setdefault(model, set())
+            assert isinstance(existing, set)
+            existing.add(group)
+
+    return keep
+
+
 # ---------------------------------------------------------------------------
 # merge
 # ---------------------------------------------------------------------------
@@ -91,9 +133,14 @@ def cmd_merge(args: argparse.Namespace) -> int:
         normalise=args.normalise,
         prune=args.prune,
         pack_parts=args.pack_parts,
+        vertex_budget=args.vertex_budget,
         keep_hitbox_bones=args.keep_hitbox_bones,
         keep_animated_bones=args.keep_animated_bones,
         share_hands=args.share_hands,
+        pool_bones_pass=args.pool_bones,
+        bone_target=args.bone_target,
+        keep_groups=_parse_keep_groups(args),
+        single_group=args.single_group,
         sanitise=args.sanitise,
         exclude=args.exclude,
         merge_config=merge_config,
@@ -261,6 +308,20 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--keep-hitbox-bones", action="store_true",
                        help="let $hbox entries pin bones against pruning "
                             "(costs shared-skeleton collapse; hitboxes are inert on view models)")
+    merge.add_argument("--vertex-budget", type=int, default=2048, metavar="N",
+                       help="vertices allowed per submodel when packing parts (studiomdl MAXSTUDIOVERTS)")
+    merge.add_argument("--bone-target", type=int, default=127, metavar="N",
+                       help="bones the pool may grow to before it starts re-anchoring "
+                            "to reuse a slot; lower trades animation size for bones")
+    merge.add_argument("--no-pool-bones", dest="pool_bones", action="store_false",
+                       help="do not let models share weapon bone slots "
+                            "(costs the sum of every model's bones instead of the largest)")
+    merge.add_argument("--all-groups", dest="single_group", action="store_false",
+                       help="keep every switchable bodygroup instead of one weapon submodel per model")
+    merge.add_argument("--groups", metavar="JSON",
+                       help='per-model bodygroups to keep switchable: {"v_x": ["scope"], "v_y": "*"}')
+    merge.add_argument("--keep-group", action="append", metavar="MODEL:GROUP",
+                       help="keep one bodygroup switchable (MODEL:* for all of a model's)")
     merge.add_argument("--no-share-hands", dest="share_hands", action="store_false",
                        help="write one hand mesh copy per model instead of sharing one")
     merge.add_argument("--no-sanitise", dest="sanitise", action="store_false",
