@@ -132,6 +132,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         hand_texture=_resolve_hand_texture(args) if args.normalise else None,
         normalise=args.normalise,
         prune=args.prune,
+        decimate=args.decimate,
         pack_parts=args.pack_parts,
         vertex_budget=args.vertex_budget,
         keep_hitbox_bones=args.keep_hitbox_bones,
@@ -298,6 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_hand_arguments(merge)
     merge.add_argument("--no-prune", dest="prune", action="store_false",
                        help="keep bones that carry no geometry")
+    merge.add_argument("--decimate", type=float, default=None, metavar="RATIO",
+                       help="reduce weapon meshes to RATIO of their vertices "
+                            "(e.g. 0.5 = halve; lossy). Fewer triangles and submodels; "
+                            "the optimised hand and animations are left untouched")
     merge.add_argument("--no-pack", dest="pack_parts", action="store_false",
                        help="keep every always-on mesh in its own bodygroup instead of "
                             "packing them (more bodyparts, harder to view)")

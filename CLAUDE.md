@@ -59,6 +59,16 @@ python -m goldsource merge ... --groups groups.json   # {"v_ak47lor": ["led"], "
 `--all-groups` keeps every group. Pieces of one weapon are still concatenated
 into a single submodel wherever the 2048-vertex cap allows (`--vertex-budget`).
 
+**Decimation is opt-in (`--decimate RATIO`).** The heavy CSO weapons carry ~20k
+triangles, which forces many submodels; `--decimate 0.5` halves each weapon
+mesh's vertices (v_ak47chimera: 12 submodels → 5). It is lossy but safe —
+quadric-error clustering that never mixes bones (animations unaffected), keeps
+UVs, and recomputes normals. The optimised hand and the animation SMDs are left
+untouched. Edge-collapse was tried first and stalls: these decompiled meshes are
+UV-seamed, non-manifold triangle soup, so clustering (which ignores topology) is
+the robust choice. See `storage/build/DECIMATE.md` for ratios and a Blender
+alternative.
+
 **Bone pooling is what sets the batch size.** Only one weapon is drawn at a
 time, so unrelated weapons can share bone slots — merging costs the *largest*
 model's bone count, not the sum. All 58 `more_weapons` models fit one 113-bone
@@ -73,6 +83,7 @@ source model to its `pev_body` value and sequence indices.
 
 - `goldsource/pipeline.py` — orchestration (`run()`); everything else is a step
 - `goldsource/bonepool.py` — shared weapon-bone slots and exact re-parenting
+- `goldsource/decimate.py` — lossy mesh reduction (quadric-error clustering)
 - `goldsource/hands.py` — hand rig detection and **geometric** bone matching
 - `goldsource/skeleton.py` — transform-preserving bone removal / renumbering / grafting
 - `goldsource/merger.py` — bodygroup + sequence merging, `pev_body` encoding

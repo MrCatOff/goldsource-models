@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from goldsource.bonepool import PoolPlan, apply_pool, plan_pool
+from goldsource.decimate import decimate_mesh
 from goldsource.optimise import _bt_from_mat4
 from goldsource.compiler import CompileResult, compile_qc
 from goldsource.hands import (
@@ -90,6 +91,7 @@ class ModelPrep:
     renamed_files: dict[str, str] = field(default_factory=dict)
     renamed_bodygroups: dict[str, int] = field(default_factory=dict)
     packed_groups: tuple[int, int] | None = None
+    decimated: tuple[int, int] | None = None
     collapsed_groups: list[str] = field(default_factory=list)
     kept_groups: list[str] = field(default_factory=list)
     hands: HandNormalisation | None = None
@@ -1328,6 +1330,7 @@ def run(
     hand_texture: str | Path | None = None,
     normalise: bool = True,
     prune: bool = True,
+    decimate: float | None = None,
     pack_parts: bool = True,
     vertex_budget: int = VERTEX_BUDGET,
     keep_hitbox_bones: bool = False,
@@ -1441,6 +1444,22 @@ def run(
                     f"bodygroup(s) to one entry: {', '.join(prep.collapsed_groups)}")
             if keep:
                 log(f"    kept switchable: {', '.join(sorted(keep))}")
+
+        if decimate is not None and decimate < 1.0:
+            # Weapon meshes only — the optimised hand is already lean and the
+            # animation SMDs carry no geometry.  Do this before packing so the
+            # packer sees the reduced counts and needs fewer submodels.
+            hand_keys = set(prep.hands.replaced_keys) if (prep.hands and prep.hands.ok) else set()
+            tb = ta = 0
+            for key, smd in model.smds.items():
+                if smd.is_animation or key in hand_keys:
+                    continue
+                before_t, after_t = decimate_mesh(smd, decimate)
+                tb += before_t
+                ta += after_t
+            prep.decimated = (tb, ta)
+            if tb:
+                log(f"    decimated {tb} -> {ta} triangles ({100 * ta / tb:.0f}%)")
 
         if pack_parts:
             hand_keys = set(prep.hands.replaced_keys) if (prep.hands and prep.hands.ok) else set()
