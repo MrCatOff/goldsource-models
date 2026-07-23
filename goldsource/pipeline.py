@@ -1331,6 +1331,7 @@ def run(
     normalise: bool = True,
     prune: bool = True,
     decimate: float | None = None,
+    decimate_overrides: dict[str, float] | None = None,
     pack_parts: bool = True,
     vertex_budget: int = VERTEX_BUDGET,
     keep_hitbox_bones: bool = False,
@@ -1445,7 +1446,8 @@ def run(
             if keep:
                 log(f"    kept switchable: {', '.join(sorted(keep))}")
 
-        if decimate is not None and decimate < 1.0:
+        model_ratio = (decimate_overrides or {}).get(model.name, decimate)
+        if model_ratio is not None and model_ratio < 1.0:
             # Weapon meshes only — the optimised hand is already lean and the
             # animation SMDs carry no geometry.  Do this before packing so the
             # packer sees the reduced counts and needs fewer submodels.
@@ -1454,12 +1456,13 @@ def run(
             for key, smd in model.smds.items():
                 if smd.is_animation or key in hand_keys:
                     continue
-                before_t, after_t = decimate_mesh(smd, decimate)
+                before_t, after_t = decimate_mesh(smd, model_ratio)
                 tb += before_t
                 ta += after_t
             prep.decimated = (tb, ta)
             if tb:
-                log(f"    decimated {tb} -> {ta} triangles ({100 * ta / tb:.0f}%)")
+                log(f"    decimated {tb} -> {ta} triangles ({100 * ta / tb:.0f}%"
+                    f"{f', ratio {model_ratio}' if model_ratio != decimate else ''})")
 
         if pack_parts:
             hand_keys = set(prep.hands.replaced_keys) if (prep.hands and prep.hands.ok) else set()

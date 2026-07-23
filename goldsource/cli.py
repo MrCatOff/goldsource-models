@@ -65,6 +65,20 @@ def _parse_renames(pairs: list[str] | None) -> list[tuple[str, str]]:
     return renames
 
 
+def _parse_decimate_models(args: argparse.Namespace) -> dict[str, float]:
+    """Parse ``--decimate-model MODEL=RATIO`` overrides."""
+    out: dict[str, float] = {}
+    for pair in getattr(args, "decimate_model", None) or []:
+        if "=" not in pair:
+            raise SystemExit(f"--decimate-model expects MODEL=RATIO, got {pair!r}")
+        model, ratio = pair.rsplit("=", 1)
+        try:
+            out[model] = float(ratio)
+        except ValueError:
+            raise SystemExit(f"--decimate-model: {ratio!r} is not a number")
+    return out
+
+
 def _parse_keep_groups(args: argparse.Namespace) -> dict[str, set[str] | str]:
     """
     Collect the bodygroups that stay switchable, from ``--groups`` JSON and
@@ -133,6 +147,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         normalise=args.normalise,
         prune=args.prune,
         decimate=args.decimate,
+        decimate_overrides=_parse_decimate_models(args),
         pack_parts=args.pack_parts,
         vertex_budget=args.vertex_budget,
         keep_hitbox_bones=args.keep_hitbox_bones,
@@ -303,6 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="reduce weapon meshes to RATIO of their vertices "
                             "(e.g. 0.5 = halve; lossy). Fewer triangles and submodels; "
                             "the optimised hand and animations are left untouched")
+    merge.add_argument("--decimate-model", action="append", metavar="MODEL=RATIO",
+                       help="override --decimate for one model (e.g. v_ak47chimera=0.12 "
+                            "to force it into a single submodel); repeatable")
     merge.add_argument("--no-pack", dest="pack_parts", action="store_false",
                        help="keep every always-on mesh in its own bodygroup instead of "
                             "packing them (more bodyparts, harder to view)")
