@@ -153,6 +153,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         keep_hitbox_bones=args.keep_hitbox_bones,
         keep_animated_bones=args.keep_animated_bones,
         share_hands=args.share_hands,
+        repose_hands=args.repose_hands,
         pool_bones_pass=args.pool_bones,
         bone_target=args.bone_target,
         keep_groups=_parse_keep_groups(args),
@@ -345,6 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help='per-model bodygroups to keep switchable: {"v_x": ["scope"], "v_y": "*"}')
     merge.add_argument("--keep-group", action="append", metavar="MODEL:GROUP",
                        help="keep one bodygroup switchable (MODEL:* for all of a model's)")
+    merge.add_argument("--shared-hand", dest="repose_hands", action="store_false",
+                       help="use ONE reference-posed hand for every model instead of "
+                            "re-posing per model (far less geometry, but stretches models "
+                            "whose hands sit far from the reference pose)")
     merge.add_argument("--no-share-hands", dest="share_hands", action="store_false",
                        help="write one hand mesh copy per model instead of sharing one")
     merge.add_argument("--no-sanitise", dest="sanitise", action="store_false",

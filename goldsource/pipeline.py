@@ -497,6 +497,7 @@ def normalise_hands(
     texture: str | None = None,
     hands_group_name: str = "hands",
     complete_hands: bool = True,
+    repose: bool = True,
 ) -> HandNormalisation:
     """
     Replace *model*'s hand mesh(es) with the optimised reference hand.
@@ -570,7 +571,11 @@ def normalise_hands(
     # yet animated to the model's, so it stretches away from the weapon — the
     # forearm reads as an elongated bone and the hand detaches.  Re-posing the
     # mesh onto the model's own bind pose makes bind and animation agree again.
-    _repose_hand_to_model(new_hand, donor)
+    # Skipping it lets every model keep the identical reference-posed mesh (one
+    # shared hand, far less geometry) at the cost of that stretch — only sound
+    # when the merged models all sit near the reference pose.
+    if repose:
+        _repose_hand_to_model(new_hand, donor)
 
     # Collapse however many hand bodygroups the model has (some split left and
     # right into separate groups) into a single group holding the one mesh.
@@ -1337,6 +1342,7 @@ def run(
     keep_hitbox_bones: bool = False,
     keep_animated_bones: bool = False,
     share_hands: bool = True,
+    repose_hands: bool = True,
     pool_bones_pass: bool = True,
     bone_target: int = BONE_LIMIT,
     keep_groups: dict[str, set[str] | str] | None = None,
@@ -1407,6 +1413,7 @@ def run(
         if normalise and reference_hand is not None:
             normalisation = normalise_hands(
                 model, reference_hand, reference_rigs, texture=hand_texture_name,
+                repose=repose_hands,
             )
             prep.hands = normalisation
             if normalisation.ok:
