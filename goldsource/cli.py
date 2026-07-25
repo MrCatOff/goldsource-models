@@ -134,6 +134,22 @@ def cmd_merge(args: argparse.Namespace) -> int:
     if not model_name.lower().endswith(".mdl"):
         model_name += ".mdl"
 
+    # --default-hands: offer the two hands in storage/hands/default (male, female)
+    # as a shared, selectable hands bodypart.  The male hand doubles as the
+    # matching reference, and the hands are used reference-posed (no re-pose).
+    hand_variants = None
+    if getattr(args, "default_hands", False):
+        base = Path("storage") / "hands" / "default"
+        hand_variants = [
+            (base / "male.smd", base / "male.bmp"),
+            (base / "female.smd", base / "female.bmp"),
+        ]
+        for smd, tex in hand_variants:
+            if not smd.exists():
+                raise SystemExit(f"--default-hands: missing {smd}")
+        args.hands = str(base / "male.smd")
+        args.repose_hands = False
+
     def log(message: str) -> None:
         if not args.quiet:
             print(message)
@@ -154,6 +170,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         keep_animated_bones=args.keep_animated_bones,
         share_hands=args.share_hands,
         repose_hands=args.repose_hands,
+        keep_hand_mesh=args.keep_hand_mesh,
+        hand_variants=hand_variants,
         pool_bones_pass=args.pool_bones,
         bone_target=args.bone_target,
         keep_groups=_parse_keep_groups(args),
@@ -352,6 +370,14 @@ def build_parser() -> argparse.ArgumentParser:
                             "whose hands sit far from the reference pose)")
     merge.add_argument("--no-share-hands", dest="share_hands", action="store_false",
                        help="write one hand mesh copy per model instead of sharing one")
+    merge.add_argument("--original-hands", dest="keep_hand_mesh", action="store_true",
+                       help="keep each model's OWN hand mesh, but still rename its hand "
+                            "bones onto the common naming so the skeleton is shared and "
+                            "pooled (bone-sharing without hand-sharing)")
+    merge.add_argument("--default-hands", dest="default_hands", action="store_true",
+                       help="use the two hands in storage/hands/default (male, female) as a "
+                            "shared, selectable hands bodypart for every weapon; "
+                            "add the reported stride to a weapon's pev_body to pick female")
     merge.add_argument("--no-sanitise", dest="sanitise", action="store_false",
                        help="do not rename non-ASCII source filenames")
     merge.add_argument("--exclude", action="append", metavar="NAME",

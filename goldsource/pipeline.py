@@ -498,6 +498,8 @@ def normalise_hands(
     hands_group_name: str = "hands",
     complete_hands: bool = True,
     repose: bool = True,
+    replace_mesh: bool = True,
+    vertex_budget: int = VERTEX_BUDGET,
 ) -> HandNormalisation:
     """
     Replace *model*'s hand mesh(es) with the optimised reference hand.
@@ -506,6 +508,11 @@ def normalise_hands(
     animations keep driving the new mesh *and* every model ends up with an
     identically named hand skeleton.  However many hand bodygroups the model
     had, it comes out with exactly one holding the single shared mesh.
+
+    With *replace_mesh* ``False`` the model keeps its **own** hand mesh — only
+    the *bones* are renamed onto the common naming, which is what lets the
+    skeleton be shared and pooled so many weapons still fit one file.  Each
+    weapon then shows its original hands (bone-sharing without hand-sharing).
     """
     result = HandNormalisation(model_name=model.name)
 
@@ -553,29 +560,47 @@ def normalise_hands(
         rename_bones(smd, renames)
     _rename_qc_bones(model.qc, renames)
 
-    mapped = set(match.mapping)
-    if complete_hands:
-        # Grow a near-complete hand up to the full one so it shares the single
-        # optimised mesh instead of carrying its own trimmed copy.
-        mapped = _complete_hand_bones(model, reference_hand, reference_rigs, mapped)
-        result.unmapped = sorted(set(result.unmapped) - mapped)
+    if replace_mesh:
+        mapped = set(match.mapping)
+        if complete_hands:
+            # Grow a near-complete hand up to the full one so it shares the single
+            # optimised mesh instead of carrying its own trimmed copy.
+            mapped = _complete_hand_bones(model, reference_hand, reference_rigs, mapped)
+            result.unmapped = sorted(set(result.unmapped) - mapped)
 
-    new_hand = build_normalised_hand(
-        reference_hand, texture=texture, mapped=mapped,
-    )
+        new_hand = build_normalised_hand(
+            reference_hand, texture=texture, mapped=mapped,
+        )
 
-    # The optimised hand is authored around the *reference* rig's pose, but the
-    # model's animations drive its own hand bones, which may sit in a very
-    # different place (v_ak47chimera's hands are ~90 units from where the
-    # reference puts them).  Left as-is the mesh is bound at the reference pose
-    # yet animated to the model's, so it stretches away from the weapon — the
-    # forearm reads as an elongated bone and the hand detaches.  Re-posing the
-    # mesh onto the model's own bind pose makes bind and animation agree again.
-    # Skipping it lets every model keep the identical reference-posed mesh (one
-    # shared hand, far less geometry) at the cost of that stretch — only sound
-    # when the merged models all sit near the reference pose.
-    if repose:
-        _repose_hand_to_model(new_hand, donor)
+        # The optimised hand is authored around the *reference* rig's pose, but the
+        # model's animations drive its own hand bones, which may sit in a very
+        # different place (v_ak47chimera's hands are ~90 units from where the
+        # reference puts them).  Left as-is the mesh is bound at the reference pose
+        # yet animated to the model's, so it stretches away from the weapon — the
+        # forearm reads as an elongated bone and the hand detaches.  Re-posing the
+        # mesh onto the model's own bind pose makes bind and animation agree again.
+        # Skipping it lets every model keep the identical reference-posed mesh (one
+        # shared hand, far less geometry) at the cost of that stretch — only sound
+        # when the merged models all sit near the reference pose.
+        if repose:
+            _repose_hand_to_model(new_hand, donor)
+    else:
+        # Keep the model's own hand mesh — the bones are already renamed onto the
+        # common naming (above), which is all that is needed for the skeleton to
+        # be shared and pooled.  Fold however many hand meshes the model split its
+        # hands into (rhand/lhand) back into one so it lands in a single "hands"
+        # bodypart like every other model's.
+        hand_meshes = [model.smds[key] for key in keys]
+        new_hand = hand_meshes[0] if len(hand_meshes) == 1 else concat_meshes(hand_meshes)
+
+        # The original CSO hands are high-poly; ~1/3 sit just over studiomdl's
+        # 2048-vertex-per-submodel cap (the very limit the optimised hand exists
+        # to dodge).  A single mesh cannot be split by grouping, so trim only the
+        # oversized ones just under the cap — a light, barely-visible reduction
+        # that never mixes bones, so the animation is unaffected.
+        if unique_vertex_count(new_hand) > vertex_budget:
+            decimate_mesh(new_hand, 0.95 * vertex_budget / unique_vertex_count(new_hand))
+        result.smd = new_hand
 
     # Collapse however many hand bodygroups the model has (some split left and
     # right into separate groups) into a single group holding the one mesh.
@@ -1159,6 +1184,66 @@ def _recompute_pev_body(
     return values
 
 
+def _apply_hand_variants(
+    merged: MergeResult,
+    variants: list[tuple[str | Path, str | Path]],
+    hands_group_name: str = HAND_SMD_KEY,
+) -> tuple[int, int]:
+    """
+    Replace the shared hands bodygroup with a **fixed set** of hand meshes (e.g.
+    male + female), each selectable independently of the weapon.
+
+    Every model's hand bones have already been renamed onto the common naming, so
+    all these meshes drive the same shared hand skeleton.  The hands bodypart
+    therefore becomes a free choice orthogonal to the weapon: index 0 is the
+    first variant, 1 the second, and so on, the same for every weapon.  Returns
+    ``(variant_count, hands_stride)`` — add ``hands_stride`` to a weapon's
+    ``pev_body`` to move from one variant to the next.
+    """
+    from goldsource.merger import _inject_universal_root
+
+    groups = [bg for bg in merged.qc.bodygroups if bg.name == hands_group_name]
+    if not groups:
+        return 0, 0
+
+    # Drop whatever meshes the shared-hand collapse left in the hands group.
+    for group in groups:
+        for entry in group.entries:
+            if entry.smd:
+                merged.smds.pop(entry.smd, None)
+
+    variant_keys: list[str] = []
+    for index, (smd_path, texture_path) in enumerate(variants):
+        mesh = SMD.from_file(smd_path)
+        texture_name = Path(texture_path).name
+        for triangle in mesh.triangles:
+            triangle.material = texture_name
+        mesh = _inject_universal_root(mesh)
+        key = SHARED_HAND_KEY if index == 0 else f"{SHARED_HAND_KEY}_{index + 1}"
+        merged.smds[key] = mesh
+        variant_keys.append(key)
+        if Path(texture_path).exists():
+            merged.textures[texture_name] = Path(texture_path).read_bytes()
+
+    entries = [BodyGroupEntry(smd=key) for key in variant_keys]
+    for group in groups:
+        group.entries = list(entries)
+
+    # Every weapon defaults to the first variant (index 0); recompute from there.
+    override = {hands_group_name: {name: 0 for name in merged.model_names}}
+    merged.pev_body_map = _recompute_pev_body(
+        merged.qc, merged.model_names, merged.bodygroup_indices, overrides=override
+    )
+
+    # Stride of the hands group = product of entry counts of every prior group.
+    stride = 1
+    for group in merged.qc.bodygroups:
+        if group.name == hands_group_name:
+            break
+        stride *= max(1, len(group.entries))
+    return len(variant_keys), stride
+
+
 # studiomdl's MAXSTUDIOBODYPARTS; it writes past the array without checking.
 MAX_BODYPARTS = 32
 # pev_body is a signed 32-bit int in the engine.
@@ -1343,6 +1428,8 @@ def run(
     keep_animated_bones: bool = False,
     share_hands: bool = True,
     repose_hands: bool = True,
+    keep_hand_mesh: bool = False,
+    hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     pool_bones_pass: bool = True,
     bone_target: int = BONE_LIMIT,
     keep_groups: dict[str, set[str] | str] | None = None,
@@ -1412,8 +1499,10 @@ def run(
 
         if normalise and reference_hand is not None:
             normalisation = normalise_hands(
-                model, reference_hand, reference_rigs, texture=hand_texture_name,
-                repose=repose_hands,
+                model, reference_hand, reference_rigs,
+                texture=None if keep_hand_mesh else hand_texture_name,
+                repose=repose_hands, replace_mesh=not keep_hand_mesh,
+                vertex_budget=vertex_budget,
             )
             prep.hands = normalisation
             if normalisation.ok:
@@ -1541,6 +1630,18 @@ def run(
                 f"{len(hand_keys_by_model)} models")
         else:
             log("    hand meshes differ per model, keeping separate copies")
+
+    if hand_variants and normalise:
+        count, stride = _apply_hand_variants(merged, hand_variants)
+        if count:
+            result.shared_hand = True
+            result.hand_variants = count
+            names = ", ".join(Path(smd).stem for smd, _tex in hand_variants)
+            log(f"    hands bodypart: {count} shared variants ({names}); "
+                f"+{stride} to pev_body switches variant")
+            result.warnings.append(
+                f"hands variants: index 0 = {Path(hand_variants[0][0]).stem}; "
+                f"add {stride} to a weapon's pev_body per further variant")
 
     dropped = _strip_unused_textures(merged)
     if dropped:
