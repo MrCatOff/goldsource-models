@@ -172,6 +172,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         repose_hands=args.repose_hands,
         keep_hand_mesh=args.keep_hand_mesh,
         hand_variants=hand_variants,
+        unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
         bone_target=args.bone_target,
         keep_groups=_parse_keep_groups(args),
@@ -378,6 +379,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="use the two hands in storage/hands/default (male, female) as a "
                             "shared, selectable hands bodypart for every weapon; "
                             "add the reported stride to a weapon's pev_body to pick female")
+    merge.add_argument("--no-unify-skeleton", dest="unify_skeleton", action="store_false",
+                       help="write only each weapon's own bones per SMD instead of the full "
+                            "merged skeleton in every SMD (leaner, but can hit studiomdl's "
+                            "'illegal parent bone replacement' on pooled bones)")
     merge.add_argument("--no-sanitise", dest="sanitise", action="store_false",
                        help="do not rename non-ASCII source filenames")
     merge.add_argument("--exclude", action="append", metavar="NAME",

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from goldsource.bonepool import PoolPlan, apply_pool, plan_pool
+from goldsource.bonepool import PoolPlan, apply_pool, plan_pool, reparent
 from goldsource.decimate import decimate_mesh
 from goldsource.optimise import _bt_from_mat4
 from goldsource.compiler import CompileResult, compile_qc
@@ -1244,6 +1244,100 @@ def _apply_hand_variants(
     return len(variant_keys), stride
 
 
+def _unify_skeleton(merged: MergeResult) -> int:
+    """
+    Give every output SMD the **full merged skeleton**, like a hand-authored
+    single model (``v_model4_30`` writes all 126 bones into all 236 of its SMDs).
+
+    studiomdl builds the compiled skeleton from the union of the reference meshes
+    and only needs each SMD to name the bones it actually uses, so by default the
+    merger leaves every SMD carrying just its own weapon's subset.  That is leaner
+    but lets two SMDs disagree about a bone — different subsets, and a pooled bone
+    that one mesh omits can default to a different parent in another, which
+    studiomdl rejects as *illegal parent bone replacement*.  Writing one
+    consistent skeleton into every SMD removes that whole class of failure.
+
+    The canonical parent and bind of each bone are taken from the reference
+    meshes; missing bones are grafted into each SMD static at that bind (they are
+    never drawn there, only present so the skeleton agrees).  Returns the number
+    of (SMD, bone) grafts performed.
+    """
+    canon_parent: dict[str, str | None] = {}
+    canon_local: dict[str, tuple[float, ...]] = {}
+    for raw in _ref_smd_names(merged.qc):
+        key = _norm_path(raw)
+        smd = merged.smds.get(key) or next(
+            (s for k, s in merged.smds.items() if k.split("/")[-1] == key.split("/")[-1]), None)
+        if smd is None or not smd.skeleton:
+            continue
+        by_id = {n.id: n.name for n in smd.nodes}
+        frame0 = {b.bone_id: b for b in smd.skeleton[0].bones}
+        for node in smd.nodes:
+            if node.name in canon_parent:
+                continue
+            canon_parent[node.name] = by_id[node.parent_id] if node.parent_id >= 0 else None
+            b = frame0.get(node.id)
+            canon_local[node.name] = ((b.tx, b.ty, b.tz, b.rx, b.ry, b.rz) if b
+                                      else (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    order: list[str] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in seen or name not in canon_parent:
+            return
+        seen.add(name)
+        parent = canon_parent[name]
+        if parent:
+            visit(parent)
+        order.append(name)
+
+    for name in list(canon_parent):
+        visit(name)
+
+    grafts = 0
+    for smd in merged.smds.values():
+        if not smd.skeleton:
+            continue
+        name_to_id = {n.name: n.id for n in smd.nodes}
+        next_id = max((n.id for n in smd.nodes), default=-1) + 1
+        added = 0
+        for name in order:
+            if name in name_to_id:
+                continue
+            parent = canon_parent[name]
+            smd.nodes.append(Node(id=next_id, name=name,
+                                  parent_id=name_to_id[parent] if parent else -1))
+            name_to_id[name] = next_id
+            tx, ty, tz, rx, ry, rz = canon_local[name]
+            for frame in smd.skeleton:
+                frame.bones.append(BoneTransform(
+                    bone_id=next_id, tx=tx, ty=ty, tz=tz, rx=rx, ry=ry, rz=rz))
+            next_id += 1
+            added += 1
+        if added:
+            renumber(smd)
+            grafts += added
+
+        # Force every bone onto the canonical parent, re-solving each frame so the
+        # motion is unchanged, so no two SMDs disagree about a shared bone's
+        # parent.  A batch that already compiles is a no-op here (its reference
+        # and animations already agree).  This does not rescue a bone the merger
+        # renamed *apart* into two names (v_laserminigun) — that is a naming
+        # conflict upstream of the skeleton, still handled with --no-pool-bones.
+        by_id = {n.id: n.name for n in smd.nodes}
+        new_parents = {}
+        for node in smd.nodes:
+            current = by_id[node.parent_id] if node.parent_id >= 0 else None
+            canonical = canon_parent.get(node.name, current)
+            if canonical != current:
+                new_parents[node.name] = canonical
+        if new_parents:
+            reparent(smd, new_parents)
+            renumber(smd)
+    return grafts
+
+
 # studiomdl's MAXSTUDIOBODYPARTS; it writes past the array without checking.
 MAX_BODYPARTS = 32
 # pev_body is a signed 32-bit int in the engine.
@@ -1430,6 +1524,7 @@ def run(
     repose_hands: bool = True,
     keep_hand_mesh: bool = False,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
+    unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
     bone_target: int = BONE_LIMIT,
     keep_groups: dict[str, set[str] | str] | None = None,
@@ -1642,6 +1737,12 @@ def run(
             result.warnings.append(
                 f"hands variants: index 0 = {Path(hand_variants[0][0]).stem}; "
                 f"add {stride} to a weapon's pev_body per further variant")
+
+    if unify_skeleton:
+        grafts = _unify_skeleton(merged)
+        if grafts:
+            log(f"    unified skeleton: every SMD now carries the full bone list "
+                f"({grafts} bones grafted across meshes)")
 
     dropped = _strip_unused_textures(merged)
     if dropped:
