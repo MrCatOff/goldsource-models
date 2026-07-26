@@ -197,17 +197,111 @@ def _chirality(smd: SMD, rig: HandRig, forearm: str | None) -> float:
     return best if abs(best) >= _CHIRALITY_FLOOR else 0.0
 
 
+def _line_residual(points: np.ndarray) -> float:
+    """Total perpendicular distance of *points* from their own best-fit line."""
+    centre = points.mean(0)
+    direction = np.linalg.svd(points - centre)[2][0]
+    projection = (points - centre) @ direction
+    perpendicular = (points - centre) - np.outer(projection, direction)
+    return float(np.linalg.norm(perpendicular, axis=1).sum())
+
+
+def _order_finger_roots(positions: dict[str, np.ndarray]) -> list[str]:
+    """
+    Return the finger-chain roots in anatomical order — thumb, then index to
+    pinky — from their relative geometry alone, so the order survives the palm
+    bone's own orientation and scale.
+
+    Hand-local *coordinates* are not comparable between two rigs: each sets its
+    palm bone's axes independently, so one hand's fingers can run along +X where
+    another's lie along -Z.  Nearest-neighbour in that space mis-pairs the
+    fingers when the palms disagree (v_ak47chimera, v_elite) — the mesh then tears
+    or claws.  The *structure* survives the frame, though: four knuckles in a row
+    with the thumb set off to the side.  The thumb is the root whose removal
+    leaves the other four most colinear; the four are sorted along their own
+    best-fit line and oriented so the end nearest the thumb — the index — leads.
+    """
+    names = list(positions)
+    if len(names) < MIN_FINGER_CHAINS:
+        return names
+    points = np.array([positions[name] for name in names])
+
+    thumb_index = min(range(len(names)),
+                      key=lambda i: _line_residual(np.delete(points, i, axis=0)))
+    thumb = names[thumb_index]
+    others = [names[i] for i in range(len(names)) if i != thumb_index]
+
+    cloud = np.array([positions[name] for name in others])
+    centre = cloud.mean(0)
+    axis = np.linalg.svd(cloud - centre)[2][0]
+    others.sort(key=lambda name: float((positions[name] - centre) @ axis))
+    if (np.linalg.norm(positions[others[0]] - positions[thumb])
+            > np.linalg.norm(positions[others[-1]] - positions[thumb])):
+        others.reverse()
+    return [thumb] + others
+
+
+def _world_roots(smd: SMD, rig: HandRig) -> dict[str, np.ndarray]:
+    """World-space position of each finger-chain root — the true bind geometry."""
+    world = world_transforms(smd)
+    return {chain[0]: world[chain[0]][:3, 3] for chain in rig.chains if chain[0] in world}
+
+
+def _rotation_only_residual(source: np.ndarray, target: np.ndarray) -> float:
+    """
+    Fit *source* onto *target* with rotation and uniform scale but **no
+    reflection**, and return the leftover distance.  Two clouds of the same
+    handedness align cleanly; a mirrored correspondence cannot and scores high.
+    """
+    a = source - source.mean(0)
+    b = target - target.mean(0)
+    sa = float(np.sqrt((a ** 2).sum())) or 1.0
+    sb = float(np.sqrt((b ** 2).sum())) or 1.0
+    a = a / sa
+    b = b / sb
+    u, _, vt = np.linalg.svd(a.T @ b)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0:          # forbid a reflection
+        u[:, -1] *= -1
+        rotation = u @ vt
+    return float(np.linalg.norm(a @ rotation - b))
+
+
+def _aligned_orientation(
+    src_order: list[str], dst_order: list[str],
+    src_pos: dict[str, np.ndarray], dst_pos: dict[str, np.ndarray],
+) -> list[str]:
+    """
+    Return *dst_order* the right way round: keep it, or reverse its fingers
+    (thumb fixed), whichever aligns to *src_order* without a reflection.
+    """
+    if len(dst_order) < 3:
+        return dst_order
+    reversed_fingers = [dst_order[0]] + dst_order[1:][::-1]
+    source = np.array([src_pos[n] for n in src_order])
+    forward = _rotation_only_residual(np.array([dst_pos[n] for n in dst_order]), source)
+    backward = _rotation_only_residual(np.array([dst_pos[n] for n in reversed_fingers]), source)
+    return dst_order if forward <= backward else reversed_fingers
+
+
 def _match_chains(
     src_smd: SMD, src_rig: HandRig,
     dst_smd: SMD, dst_rig: HandRig,
 ) -> tuple[dict[str, str], float]:
     """
-    Pair each of *src_rig*'s finger chains with the nearest unused chain of
-    *dst_rig*, comparing hand-local bind positions.
+    Pair each of *src_rig*'s finger chains with one of *dst_rig*'s, and score
+    the two hands' likeness for side resolution.
 
-    Returns ``({src_chain_root: dst_chain_root}, total_distance)``.  The total
-    distance doubles as a confidence score used to decide which detected hand
-    is the left one and which is the right.
+    The *pairing* is by anatomical order (thumb, then index to pinky), which is
+    invariant to how each rig orients and scales its palm — a raw hand-local
+    nearest-neighbour instead mis-pairs the fingers when the two palms' axes
+    disagree, tearing the mesh.  Ordering is only unambiguous when both rigs
+    expose the same finger count; otherwise the nearest-neighbour pairing is used
+    and hand completion / retargeting sorts out the rest.
+
+    The *score* stays the hand-local nearest-neighbour distance sum regardless:
+    it is what decides which detected hand is the left and which the right when
+    handedness cannot be read directly, and must not move with the ordering.
     """
     src_pos = _local_positions(src_smd, src_rig)
     dst_pos = _local_positions(dst_smd, dst_rig)
@@ -217,8 +311,7 @@ def _match_chains(
         for s, sp in src_pos.items()
         for d, dp in dst_pos.items()
     )
-
-    pairing: dict[str, str] = {}
+    greedy: dict[str, str] = {}
     used_src: set[str] = set()
     used_dst: set[str] = set()
     total = 0.0
@@ -227,8 +320,24 @@ def _match_chains(
             continue
         used_src.add(src_name)
         used_dst.add(dst_name)
-        pairing[src_name] = dst_name
+        greedy[src_name] = dst_name
         total += distance
+
+    if len(src_pos) == len(dst_pos) and len(src_pos) >= MIN_FINGER_CHAINS:
+        # Order both hands anatomically, then settle the index-vs-pinky direction
+        # by 3D shape: the two hands are the same real hand, so the correct finger
+        # correspondence aligns them by a rotation, and the reversed one needs a
+        # reflection.  Thumb-proximity alone is unreliable when a rig extends the
+        # thumb so it sits equidistant from the fingers (v_elite).  World-space
+        # roots carry the true geometry, unlike the palm-local frame.
+        src_world = _world_roots(src_smd, src_rig)
+        dst_world = _world_roots(dst_smd, dst_rig)
+        src_order = _order_finger_roots(src_world)
+        dst_order = _order_finger_roots(dst_world)
+        dst_order = _aligned_orientation(src_order, dst_order, src_world, dst_world)
+        pairing = dict(zip(src_order, dst_order))
+    else:
+        pairing = greedy
 
     # Unmatched chains (rigs with differing finger counts) count against the score.
     total += 10.0 * (len(src_pos) - len(pairing))
