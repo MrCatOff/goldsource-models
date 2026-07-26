@@ -103,6 +103,14 @@ class ModelInput:
         Expects exactly one ``.qc`` file in *directory* and all ``.smd`` files
         referenced by it to be present (recursively).  Any ``.bmp`` / ``.BMP``
         files found are loaded as textures.
+
+        Some CSO/nexus decompiles write texture files with **no extension** and
+        reference them that way in the SMD material field (e.g. material
+        ``dualinfinity_2_02`` -> file ``dualinfinity_2_02``).  The Sven Co-op
+        studiomdl picks the image format by extension and rejects these
+        ("unknown graphics type"), so we give any extensionless file a mesh
+        references — and that is a valid BMP (``BM`` magic) — a ``.bmp`` name
+        and rewrite the mesh materials to match.
         """
         base = Path(directory)
         qc_files = list(base.glob("*.qc"))
@@ -123,6 +131,29 @@ class ModelInput:
             if tex_file.suffix.lower() == ".bmp":
                 # Key is exactly the filename as referenced in SMD material fields.
                 textures[tex_file.name] = tex_file.read_bytes()
+
+        # Extensionless nexus textures: load only files a mesh actually names,
+        # to avoid slurping the .qc, animation SMDs, etc.  Give each a ``.bmp``
+        # name and rewrite every material that referenced it so studiomdl (which
+        # keys off the extension) accepts it.
+        referenced = {t.material for smd in smds.values() for t in smd.triangles}
+        renamed: dict[str, str] = {}
+        for tex_file in base.rglob("*"):
+            if tex_file.name in textures or Path(tex_file.name).suffix:
+                continue
+            if not tex_file.is_file() or tex_file.name not in referenced:
+                continue
+            data = tex_file.read_bytes()
+            if data[:2] != b"BM":
+                continue
+            new_name = tex_file.name + ".bmp"
+            textures[new_name] = data
+            renamed[tex_file.name] = new_name
+        if renamed:
+            for smd in smds.values():
+                for tri in smd.triangles:
+                    if tri.material in renamed:
+                        tri.material = renamed[tri.material]
 
         return cls(name=name, qc=qc, smds=smds, textures=textures)
 
