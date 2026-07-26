@@ -281,6 +281,12 @@ class MergeResult:
     # True when sequences were re-indexed to "{model}_seq_{i}".  The models.ini
     # is then keyed by that name (matching Model Viewer) instead of anim_<name>.
     sequences_indexed: bool = False
+    # Fixed shared-hand variants (--default-hands): the pev_body offset between
+    # consecutive hand variants, and their names in order (e.g. ["male",
+    # "female"]).  variant 0 is the base pev_body; each later one adds a
+    # "pev_body_<name>" line to models.ini.
+    hand_variant_stride: int = 0
+    hand_variant_names: list[str] = field(default_factory=list)
 
     def save(self, output_dir: str | Path) -> None:
         """
@@ -333,7 +339,12 @@ class MergeResult:
         for name in self.model_names:
             lines = [f"[{name}]"]
             if name in self.pev_body_map:
-                lines.append(f"pev_body = {self.pev_body_map[name]}")
+                base = self.pev_body_map[name]
+                lines.append(f"pev_body = {base}")
+                # One pev_body_<variant> line per extra fixed hand (male is the
+                # base; female etc. add the hands-group stride).
+                for i, vname in enumerate(self.hand_variant_names[1:], start=1):
+                    lines.append(f"pev_body_{vname} = {base + i * self.hand_variant_stride}")
             used_keys: set[str] = set()
             for seq_name, seq_idx in seq_map.get(name, []):
                 if self.sequences_indexed:

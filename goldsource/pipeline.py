@@ -1780,6 +1780,8 @@ def run(
         if count:
             result.shared_hand = True
             result.hand_variants = count
+            merged.hand_variant_stride = stride
+            merged.hand_variant_names = [Path(smd).stem for smd, _tex in hand_variants]
             names = ", ".join(Path(smd).stem for smd, _tex in hand_variants)
             log(f"    hands bodypart: {count} shared variants ({names}); "
                 f"+{stride} to pev_body switches variant")
