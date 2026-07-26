@@ -55,6 +55,11 @@ Output layout: `<out>/<name>.qc`, `<out>/<model>/*.smd`, shared hand under
 `<out>/_shared/`, flat `.BMP` textures, and `models.ini` mapping each source
 weapon to its `pev_body` value and sequence indices.
 
+Every output SMD carries the full merged skeleton (like a hand-built pack), so
+all bodygroups agree on bone parents; disable with `--no-unify-skeleton`. Texture
+files some CSO/nexus decompiles write **without a `.bmp` extension** are detected
+and fixed automatically, so those models compile without manual renaming.
+
 ## Common tasks
 
 ```bash
@@ -66,6 +71,10 @@ weapon to its `pev_body` value and sequence indices.
 
 # Rename sequences on the way in (repeatable)
 ... merge ... --rename fire=shoot --rename idle1=idle
+
+# Give every sequence a self-identifying name for Model Viewer: v_deagle_seq_0, ...
+# (the original name is kept as a models.ini comment)
+... merge ... --index-sequences
 
 # Compile an already-merged QC (e.g. after hand-editing it)
 .\.venv\Scripts\python.exe -m goldsource compile storage/build/pistols/v_pistols.qc
@@ -101,6 +110,28 @@ By default each model contributes **one** weapon submodel; switchable groups
 ... merge ... --all-groups                                         # keep every switchable group
 ```
 
+### Choosing how hands are handled
+
+By default every model is re-rigged onto the shared optimised hand, re-posed to
+each model's own bind so it fits (the invariants in `CLAUDE.md` explain why).
+Other options:
+
+```bash
+# Keep each model's ORIGINAL hand mesh, but still share/pool bones
+... merge ... --original-hands
+
+# Offer the two hands in storage/hands/default (male, female) as a selectable
+# hands bodypart shared across every weapon (index 0 = male; +stride for female)
+... merge ... --default-hands
+
+# One reference-posed hand for all — least geometry, but stretches off-pose rigs
+... merge ... --shared-hand
+```
+
+`--default-hands` binds one *fixed* male + female mesh to every weapon, so it
+suits rigs close to the reference; outlier rigs (a few stock-CS pistols) stretch
+under it and are better left on the default per-model re-posed hand.
+
 ## Useful flags
 
 | flag | effect |
@@ -110,14 +141,20 @@ By default each model contributes **one** weapon submodel; switchable groups
 | `--compile` | run studiomdl on the result |
 | `--studiomdl EXE` | use a specific studiomdl (e.g. one with higher limits) |
 | `--exclude NAME` | skip a model (repeatable) |
+| `--rename FIND=REPLACE` | substring-rename sequences on the way in (repeatable) |
+| `--index-sequences` | rename every sequence to `{model}_seq_{i}` for Model Viewer; original name kept as a `models.ini` comment |
 | `--decimate RATIO` | reduce weapon meshes to RATIO of their vertices (lossy) |
 | `--decimate-model M=RATIO` | override `--decimate` for one model |
 | `--vertex-budget N` | vertices allowed per submodel (studiomdl MAXSTUDIOVERTS, default 2048) |
 | `--bone-target N` | how far the bone pool may grow before re-anchoring (default 127) |
 | `--no-pool-bones` | don't share weapon bone slots (costs the *sum* of every model's bones) |
 | `--keep-animated-bones` | don't fold moving bones — use if studiomdl reports a sequence over 64K |
+| `--original-hands` | keep each model's original hand mesh, but still share/pool bones |
+| `--default-hands` | selectable male/female hands (from `storage/hands/default`) shared across all weapons |
 | `--shared-hand` | one reference-posed hand for all (less geometry, but stretches off-pose models) |
-| `--no-hands` | keep each model's original hands |
+| `--no-share-hands` | give each model its own copy of the hand |
+| `--no-unify-skeleton` | don't pad every SMD to the full merged skeleton (on by default) |
+| `--no-hands` | keep each model's original hands, unchanged |
 | `--dry-run` | analyse without writing files |
 
 Run `... merge --help` for the full list.
@@ -146,7 +183,7 @@ keep those as their own `.mdl`.
 ## Development
 
 ```bash
-.\.venv\Scripts\python.exe -m pytest tests      # 88 tests
+.\.venv\Scripts\python.exe -m pytest tests      # 95 tests
 ```
 
 See `CLAUDE.md` for the pipeline's module layout and the invariants the tests
