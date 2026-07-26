@@ -129,6 +129,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         loaded = AppConfig.load(args.config).build_merge_config()
         loaded.sequence_renames.extend(merge_config.sequence_renames)
         merge_config = loaded
+    merge_config.index_sequence_names = getattr(args, "index_sequences", False)
 
     model_name = args.name
     if not model_name.lower().endswith(".mdl"):
@@ -387,6 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="do not rename non-ASCII source filenames")
     merge.add_argument("--exclude", action="append", metavar="NAME",
                        help="skip a model directory by name (repeatable)")
+    merge.add_argument("--index-sequences", action="store_true",
+        help="rename every sequence to {model}_seq_{i} for easy identification "
+             "in Model Viewer (original names kept as models.ini keys)")
     merge.add_argument("--rename", action="append", metavar="FIND=REPLACE",
                        help="sequence name rewrite rule (repeatable)")
     merge.add_argument("--config", metavar="JSON", help="AppConfig JSON with skin variants/slots")

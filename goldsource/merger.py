@@ -274,6 +274,13 @@ class MergeResult:
     # Needed to recompute pev_body when the bodygroup layout is changed after
     # the merge, since a blank entry cannot be attributed to a model by path.
     bodygroup_indices: dict[str, dict[str, int]] = field(default_factory=dict)
+    # merged-sequence index -> original sequence name (before any
+    # "{model}_seq_{i}" renaming).  Kept as a models.ini comment so the source
+    # name (draw, idle, ...) is still visible after re-indexing.
+    sequence_original_names: dict[int, str] = field(default_factory=dict)
+    # True when sequences were re-indexed to "{model}_seq_{i}".  The models.ini
+    # is then keyed by that name (matching Model Viewer) instead of anim_<name>.
+    sequences_indexed: bool = False
 
     def save(self, output_dir: str | Path) -> None:
         """
@@ -313,8 +320,10 @@ class MergeResult:
                     model_name = p.split("/")[0]
                     break
             if model_name:
-                # Strip collision prefix "{model_name}__" added during merge
-                raw_name = seq.name
+                # Prefer the preserved original name (set when sequences are
+                # re-indexed); otherwise strip the "{model_name}__" collision
+                # prefix added during merge to recover the source name.
+                raw_name = self.sequence_original_names.get(seq_idx, seq.name)
                 prefix = model_name + "__"
                 if raw_name.startswith(prefix):
                     raw_name = raw_name[len(prefix):]
@@ -327,6 +336,14 @@ class MergeResult:
                 lines.append(f"pev_body = {self.pev_body_map[name]}")
             used_keys: set[str] = set()
             for seq_name, seq_idx in seq_map.get(name, []):
+                if self.sequences_indexed:
+                    # Key by the Model Viewer name (e.g. v_deagle_seq_0); the
+                    # name is unique by construction, and the source name goes
+                    # in a trailing comment so it stays visible.
+                    indexed = self.qc.sequences[seq_idx].name
+                    comment = f"  ; {seq_name}" if seq_name else ""
+                    lines.append(f"anim_{indexed} = {seq_idx}{comment}")
+                    continue
                 key = _ini_key(seq_name)
                 if key in used_keys:
                     counter = 2
@@ -375,6 +392,10 @@ class MergeConfig:
     # String replacement rules applied in order to every sequence name.
     # E.g. [("SP_", ""), ("DEPLOY", "draw")] renames "SP_DEPLOY_idle" → "draw_idle".
     sequence_renames: list[tuple[str, str]] = field(default_factory=list)
+    # Rename every sequence to "{model_name}_seq_{index}" (index is per-model,
+    # 0-based) so each is self-identifying in Model Viewer.  The original names
+    # are preserved as the models.ini keys.  Applied after sequence_renames.
+    index_sequence_names: bool = False
     # Per-model skin variants: model_name → list of variants
     skin_variants: dict[str, list[SkinVariant]] = field(default_factory=dict)
     # Global skin slots (skin 0 = defaults is always prepended automatically)
@@ -537,7 +558,7 @@ class ModelMerger:
         # share a common top-level bone.
         output_smds = {k: _inject_universal_root(v) for k, v in output_smds.items()}
 
-        merged_qc, pev_body_map, group_indices = _build_merged_qc(
+        merged_qc, pev_body_map, group_indices, seq_original_names = _build_merged_qc(
             self._models, bone_maps, output_modelname, config
         )
 
@@ -573,6 +594,8 @@ class ModelMerger:
             model_names=[m.name for m in self._models],
             pev_body_map=pev_body_map,
             bodygroup_indices=group_indices,
+            sequence_original_names=seq_original_names,
+            sequences_indexed=bool(config and config.index_sequence_names),
         )
 
     # ------------------------------------------------------------------
@@ -1023,7 +1046,7 @@ def _build_merged_qc(
     rename_maps: dict[str, dict[str, str]],
     output_modelname: str,
     config: MergeConfig | None = None,
-) -> tuple[QC, dict[str, int]]:
+) -> tuple[QC, dict[str, int], dict[str, dict[str, int]], dict[int, str]]:
     base = models[0].qc
     merged = QC(
         modelname=output_modelname,
@@ -1143,31 +1166,41 @@ def _build_merged_qc(
     # ---- sequences ---------------------------------------------------------
     # Apply rename rules, then prefix with model name on collision.
     seq_renames = config.sequence_renames if config else []
+    index_names = bool(config and config.index_sequence_names)
     seen_seq_names: set[str] = set()
+    # merged-sequence index -> original (pre-index) name, for the models.ini keys.
+    original_names: dict[int, str] = {}
     for model in models:
-        for seq in model.qc.sequences:
+        for local_idx, seq in enumerate(model.qc.sequences):
             out_seq = deepcopy(seq)
             # Rewrite SMD paths to include the model prefix.
             out_seq.smd_paths = [
                 f"{model.name}/{_norm_path(p)}" for p in seq.smd_paths
             ]
-            out_seq.name = _apply_seq_renames(out_seq.name, seq_renames)
-            if out_seq.name in seen_seq_names:
-                out_seq.name = f"{model.name}__{out_seq.name}"
-            # A model may declare several sequences under one name (v_rpg_remapped
-            # has four called "fire"), so prefixing once is not enough to make
-            # the name unique — keep suffixing until it is, or they collapse
-            # into one entry in the sequence index map.
-            if out_seq.name in seen_seq_names:
-                stem = out_seq.name
-                counter = 2
-                while f"{stem}_{counter}" in seen_seq_names:
-                    counter += 1
-                out_seq.name = f"{stem}_{counter}"
+            renamed = _apply_seq_renames(seq.name, seq_renames)
+            original_names[len(merged.sequences)] = renamed
+            if index_names:
+                # "{model}_seq_{i}" is unique by construction (unique model name
+                # + per-model index), so no collision handling is needed.
+                out_seq.name = f"{model.name}_seq_{local_idx}"
+            else:
+                out_seq.name = renamed
+                if out_seq.name in seen_seq_names:
+                    out_seq.name = f"{model.name}__{out_seq.name}"
+                # A model may declare several sequences under one name
+                # (v_rpg_remapped has four called "fire"), so prefixing once is
+                # not enough to make the name unique — keep suffixing until it
+                # is, or they collapse into one entry in the sequence index map.
+                if out_seq.name in seen_seq_names:
+                    stem = out_seq.name
+                    counter = 2
+                    while f"{stem}_{counter}" in seen_seq_names:
+                        counter += 1
+                    out_seq.name = f"{stem}_{counter}"
             seen_seq_names.add(out_seq.name)
             merged.sequences.append(out_seq)
 
-    return merged, pev_body, group_indices
+    return merged, pev_body, group_indices, original_names
 
 
 # ---------------------------------------------------------------------------

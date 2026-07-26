@@ -42,7 +42,9 @@ python -m goldsource compile storage/build/pistols/v_pistols.qc
 ```
 
 Useful flags: `--exclude NAME` (drop a model), `--rename FIND=REPLACE` (sequence
-names), `--no-hands` / `--no-prune` / `--no-share-hands` / `--no-pool-bones`
+names), `--index-sequences` (rename every sequence to `{model}_seq_{i}` for easy
+identification in Model Viewer; original names kept as `models.ini` keys),
+`--no-hands` / `--no-prune` / `--no-share-hands` / `--no-pool-bones`
 (disable a pass), `--keep-hitbox-bones`, `--dry-run`.
 
 **One weapon submodel per model, by default.** A source model's bodygroups
