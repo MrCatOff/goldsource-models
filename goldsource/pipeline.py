@@ -1407,6 +1407,54 @@ def _strip_unused_textures(result: MergeResult) -> list[str]:
     return sorted(dropped)
 
 
+def _downscale_textures(result: MergeResult, max_size: int) -> tuple[int, int, int]:
+    """
+    Shrink every texture whose longest side exceeds *max_size* to fit, in place.
+
+    GoldSource stores textures as 8-bit palettized bitmaps, so the only way to
+    make a merged ``.mdl`` smaller is to lower texture *resolution* — pixel count
+    is the file.  Model UVs are normalised, so the on-screen mapping is
+    unaffected by the image's pixel dimensions; a 512² skin at 256² simply
+    samples a smaller bitmap.
+
+    Each texture is decoded through its palette to RGB, resized with LANCZOS,
+    then re-quantised to a fresh 256-colour palette.  Masked textures (transparent
+    ``{`` skins, or any in a ``masked`` ``$texrendermode``) are left untouched —
+    their transparency depends on an exact palette index that requantising would
+    destroy.
+
+    Returns ``(textures_resized, bytes_before, bytes_after)``.
+    """
+    from io import BytesIO
+    from PIL import Image
+
+    skip = {m.texture.lower() for m in result.qc.texturemodes if m.mode == "masked"}
+    before = after = resized = 0
+    for name, data in list(result.textures.items()):
+        before += len(data)
+        if name.startswith("{") or name.lower() in skip or data[:2] != b"BM":
+            after += len(data)
+            continue
+        img = Image.open(BytesIO(data))
+        w, h = img.size
+        longest = max(w, h)
+        if longest <= max_size:
+            after += len(data)
+            continue
+        scale = max_size / longest
+        # Snap each side to a multiple of 16 (the safe GoldSource texture step),
+        # never upscaling.  Aspect drift is invisible: UVs are normalised.
+        def snap(px: int) -> int:
+            return max(16, min(px, round(px * scale / 16) * 16))
+        new = img.convert("RGB").resize((snap(w), snap(h)), Image.LANCZOS)
+        out = BytesIO()
+        new.quantize(colors=256, method=Image.MEDIANCUT).save(out, format="BMP")
+        result.textures[name] = out.getvalue()
+        after += len(result.textures[name])
+        resized += 1
+    return resized, before, after
+
+
 def _dedupe_shared_hand_warnings(
     warnings: list[str],
     hand_keys_by_model: dict[str, list[str]],
@@ -1530,6 +1578,7 @@ def run(
     keep_groups: dict[str, set[str] | str] | None = None,
     single_group: bool = True,
     sanitise: bool = True,
+    max_texture_size: int | None = None,
     exclude: list[str] | None = None,
     merge_config: MergeConfig | None = None,
     compile_model: bool = False,
@@ -1747,6 +1796,12 @@ def run(
     dropped = _strip_unused_textures(merged)
     if dropped:
         log(f"    dropped {len(dropped)} unused texture(s)")
+    if max_texture_size:
+        n, before, after = _downscale_textures(merged, max_texture_size)
+        if n:
+            log(f"    downscaled {n} texture(s) to <={max_texture_size}px: "
+                f"{before // 1024} KB -> {after // 1024} KB "
+                f"(saved {(before - after) // 1024} KB)")
     result.warnings.extend(_strip_dangling_bone_refs(merged))
     limit_problems = _check_bodygroup_limits(merged)
     result.warnings.extend(limit_problems)

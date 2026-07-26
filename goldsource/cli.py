@@ -179,6 +179,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         keep_groups=_parse_keep_groups(args),
         single_group=args.single_group,
         sanitise=args.sanitise,
+        max_texture_size=args.max_texture_size,
         exclude=args.exclude,
         merge_config=merge_config,
         compile_model=args.compile,
@@ -352,6 +353,9 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--keep-hitbox-bones", action="store_true",
                        help="let $hbox entries pin bones against pruning "
                             "(costs shared-skeleton collapse; hitboxes are inert on view models)")
+    merge.add_argument("--max-texture-size", type=int, default=None, metavar="N",
+        help="downscale any texture whose longest side exceeds N pixels "
+             "(e.g. 256) to shrink the .mdl; UVs are unaffected")
     merge.add_argument("--vertex-budget", type=int, default=2048, metavar="N",
                        help="vertices allowed per submodel when packing parts (studiomdl MAXSTUDIOVERTS)")
     merge.add_argument("--bone-target", type=int, default=127, metavar="N",

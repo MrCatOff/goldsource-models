@@ -99,6 +99,22 @@ reduces weapon meshes (lossy; the hand and animations are left untouched):
 Start at `0.5`. Lower ratios cut more but look blockier — see
 `storage/build/DECIMATE.md` for a per-ratio table and a Blender alternative.
 
+### Shrinking the file (texture resolution)
+
+A merged `.mdl` is mostly texture bytes — GoldSource stores them 8-bit
+palettized, so pixel count *is* the file. `--max-texture-size` downscales any
+oversized skin (quality LANCZOS resize + 256-colour requantise); model UVs are
+normalised, so nothing shifts on-screen. Masked (`{`) skins are left untouched.
+
+```bash
+# 34 CSO pistols: 14.3 MB -> 8.2 MB, near-indistinguishable on a viewmodel
+... merge ... --max-texture-size 256
+```
+
+`256` is the sweet spot; `192`/`128` save a little more with visible softening
+up close. Below ~256 returns diminish — the rest of the file is geometry and
+animation.
+
 ### Keeping switchable bodygroups
 
 By default each model contributes **one** weapon submodel; switchable groups
@@ -143,6 +159,7 @@ under it and are better left on the default per-model re-posed hand.
 | `--exclude NAME` | skip a model (repeatable) |
 | `--rename FIND=REPLACE` | substring-rename sequences on the way in (repeatable) |
 | `--index-sequences` | rename every sequence to `{model}_seq_{i}` for Model Viewer; original name kept as a `models.ini` comment |
+| `--max-texture-size N` | downscale any texture over N px on its longest side (e.g. 256) to shrink the `.mdl`; UVs unaffected |
 | `--decimate RATIO` | reduce weapon meshes to RATIO of their vertices (lossy) |
 | `--decimate-model M=RATIO` | override `--decimate` for one model |
 | `--vertex-budget N` | vertices allowed per submodel (studiomdl MAXSTUDIOVERTS, default 2048) |
@@ -183,7 +200,7 @@ keep those as their own `.mdl`.
 ## Development
 
 ```bash
-.\.venv\Scripts\python.exe -m pytest tests      # 95 tests
+.\.venv\Scripts\python.exe -m pytest tests      # 100 tests
 ```
 
 See `CLAUDE.md` for the pipeline's module layout and the invariants the tests
