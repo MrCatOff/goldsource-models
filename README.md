@@ -137,7 +137,8 @@ Other options:
 ... merge ... --original-hands
 
 # Offer the two hands in storage/hands/default (male, female) as a selectable
-# hands bodypart shared across every weapon (index 0 = male; +stride for female)
+# hands bodypart shared across every weapon.  models.ini then lists both choices
+# per weapon: `pev_body` (male) and `pev_body_female`.
 ... merge ... --default-hands
 
 # One reference-posed hand for all — least geometry, but stretches off-pose rigs
