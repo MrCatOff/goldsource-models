@@ -997,6 +997,83 @@ def _ensure_anchor(smd: SMD, anchor: str, donor: SMD) -> bool:
     return True
 
 
+def flatten_conflicting_parents(models: list[ModelInput]) -> dict[str, list[str]]:
+    """
+    Make every bone whose parent disagrees across *models* agree on one parent.
+
+    A bone that appears under two different parents becomes one name with two
+    parents at merge time — studiomdl's *illegal parent bone replacement* — so
+    the merger renames the copies apart and the shared skeleton inflates (31
+    knives needed 214 bones because two rigs hang the forearm and weapon joints
+    off different parents than the rest).  Reconciling the parent lets the copies
+    collapse into one pooled slot instead.
+
+    Each conflicting bone is moved onto the parent the **most** models already
+    give it — falling back to the root only when that parent is not present in
+    every model that has the bone — so only the outliers move.  That matters:
+    re-anchoring a bone turns its inherited constant channels into time-varying
+    ones (bigger, less compressible animation, up against studiomdl's 64 KB
+    per-sequence cap), so the fewer bones moved the better.  Rooting everything
+    blows v_spknife's idle past 64 KB; matching the majority keeps its weapon
+    bones on the hand where they were.  :func:`goldsource.bonepool.reparent`
+    re-solves every frame, so motion is unchanged.  Returns ``{model: [bones]}``.
+    """
+    hierarchies: dict[str, dict[str, str | None]] = {}
+    for model in models:
+        hierarchy: dict[str, str | None] = {}
+        for smd in model.smds.values():
+            for bone, parent in _hierarchy(smd).items():
+                hierarchy.setdefault(bone, parent)
+        authority = _authority(model)
+        if authority is not None:
+            hierarchy.update(_hierarchy(authority))
+        hierarchies[model.name] = hierarchy
+
+    bones_in: dict[str, set[str]] = {name: set(h) for name, h in hierarchies.items()}
+    parents_of: dict[str, list[str | None]] = {}
+    for hierarchy in hierarchies.values():
+        for bone, parent in hierarchy.items():
+            parents_of.setdefault(bone, []).append(parent)
+
+    conflicting = {bone for bone, seen in parents_of.items() if len(set(seen)) > 1}
+    if not conflicting:
+        return {}
+
+    # Target = the most common parent that every holder can actually adopt
+    # (the root is always adoptable), so the fewest bones re-anchor.
+    target: dict[str, str | None] = {}
+    for bone in conflicting:
+        holders = [name for name, has in bones_in.items() if bone in has]
+        counts: dict[str | None, int] = {}
+        for name in holders:
+            parent = hierarchies[name][bone]
+            counts[parent] = counts.get(parent, 0) + 1
+        ordered = sorted(counts, key=lambda p: (-counts[p], p is None, str(p)))
+        chosen: str | None = None
+        for parent in ordered:
+            if parent is None or all(parent in bones_in[name] for name in holders):
+                chosen = parent
+                break
+        target[bone] = chosen
+
+    moved: dict[str, list[str]] = {}
+    for model in models:
+        hierarchy = hierarchies[model.name]
+        targets = {
+            bone: target[bone]
+            for bone in conflicting
+            if bone in hierarchy and hierarchy[bone] != target[bone]
+        }
+        if not targets:
+            continue
+        changed: set[str] = set()
+        for smd in model.smds.values():
+            changed.update(reparent(smd, targets))
+        if changed:
+            moved[model.name] = sorted(changed)
+    return moved
+
+
 def pool_bones(
     models: list[ModelInput],
     shared: set[str],
@@ -1550,6 +1627,72 @@ def _strip_dangling_bone_refs(result: MergeResult) -> list[str]:
     return messages
 
 
+def _shorten_output_paths(merged: MergeResult, limit: int = 60) -> dict[str, str]:
+    """
+    Shorten output SMD paths so studiomdl's fixed path buffer (~64 chars) cannot
+    truncate them.
+
+    The merge nests animations as ``<model>/<model>_anims/<smd>`` — the doubled
+    model name alone is ~45 chars — so a long weapon name pushes a ``$sequence``
+    source path past studiomdl's limit and it silently drops a character
+    (``…stab_miss`` becomes ``…stab_mis`` "doesn't exist").  This collapses the
+    redundant ``<model>_anims`` level to ``a`` (keeping the readable model name);
+    if any path is still too long it aliases the model directory to ``m<i>``.
+    Rewrites the SMD keys and every QC reference in place.  Returns the key remap
+    (empty when nothing needed shortening).
+    """
+    keys = list(merged.smds)
+    out_len = lambda key: len(key) + len(".smd")
+    if all(out_len(key) <= limit for key in keys):
+        return {}
+
+    remap: dict[str, str] = {}
+    for key in keys:
+        parts = key.split("/")
+        if len(parts) >= 3 and parts[1].endswith("_anims"):
+            remap[key] = parts[0] + "/a/" + "/".join(parts[2:])
+        else:
+            remap[key] = key
+
+    if any(out_len(value) > limit for value in remap.values()):
+        tops: list[str] = []
+        for key in keys:
+            top = remap[key].split("/", 1)[0]
+            if top != "_shared" and top not in tops:
+                tops.append(top)
+        alias = {top: f"m{index}" for index, top in enumerate(tops)}
+        for key in keys:
+            value = remap[key]
+            top = value.split("/", 1)[0]
+            if top in alias:
+                remap[key] = alias[top] + value[len(top):]
+
+    # Guarantee the collapsed keys stay unique.
+    seen: set[str] = set()
+    for key in keys:
+        value = remap[key]
+        base, counter = value, 2
+        while value in seen:
+            value = f"{base}_{counter}"
+            counter += 1
+        remap[key], _ = value, seen.add(value)
+
+    if all(remap[key] == key for key in keys):
+        return {}
+
+    merged.smds = {remap[key]: smd for key, smd in merged.smds.items()}
+    fix = lambda path: remap.get(path, path)
+    if merged.qc.body is not None and merged.qc.body.smd:
+        merged.qc.body.smd = fix(merged.qc.body.smd)
+    for bodygroup in merged.qc.bodygroups:
+        for entry in bodygroup.entries:
+            if entry.smd:
+                entry.smd = fix(entry.smd)
+    for sequence in merged.qc.sequences:
+        sequence.smd_paths = [fix(path) for path in sequence.smd_paths]
+    return remap
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1574,6 +1717,8 @@ def run(
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
+    flatten_weapon_bones: bool = False,
+    short_paths: bool = True,
     bone_target: int = BONE_LIMIT,
     keep_groups: dict[str, set[str] | str] | None = None,
     single_group: bool = True,
@@ -1733,6 +1878,22 @@ def run(
         result.preps.append(prep)
         result.warnings.extend(f"{prep.name}: {w}" for w in prep.warnings)
 
+    if flatten_weapon_bones and len(prepared) > 1:
+        log("--- flattening conflicting-parent bones to root")
+        flattened = flatten_conflicting_parents(prepared)
+        if flattened:
+            total = sum(len(bones) for bones in flattened.values())
+            log(f"    re-parented {total} bone(s) across {len(flattened)} model(s) "
+                f"to remove parent conflicts")
+            for prep in result.preps:
+                prep.bones_after = len({
+                    node.name
+                    for model in prepared if model.name == prep.name
+                    for smd in model.smds.values() for node in smd.nodes
+                })
+        else:
+            log("    no parent conflicts found")
+
     if pool_bones_pass and reference_hand is not None and len(prepared) > 1:
         log("--- pooling weapon bones")
         shared = {node.name for node in reference_hand.nodes}
@@ -1819,6 +1980,12 @@ def run(
             f"over the {merged.report.bone_limit} limit; "
             f"consider excluding: {', '.join(merged.report.removal_suggestions)}"
         )
+
+    if short_paths:
+        remap = _shorten_output_paths(merged)
+        if remap:
+            log(f"    shortened {len(remap)} output path(s) to fit studiomdl's "
+                f"~64-char limit")
 
     if write:
         destination = Path(output_dir)

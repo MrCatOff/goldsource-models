@@ -175,6 +175,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
+        flatten_weapon_bones=getattr(args, "flatten_weapon_bones", False),
+        short_paths=getattr(args, "short_paths", True),
         bone_target=args.bone_target,
         keep_groups=_parse_keep_groups(args),
         single_group=args.single_group,
@@ -364,6 +366,14 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--no-pool-bones", dest="pool_bones", action="store_false",
                        help="do not let models share weapon bone slots "
                             "(costs the sum of every model's bones instead of the largest)")
+    merge.add_argument("--flatten-weapon-bones", action="store_true",
+                       help="before pooling, root every bone whose parent disagrees "
+                            "across models; removes 'illegal parent bone replacement' "
+                            "conflicts so more models pool into one skeleton (trades "
+                            "animation size for bone count)")
+    merge.add_argument("--no-short-paths", dest="short_paths", action="store_false",
+                       help="do not shorten nested output SMD paths; studiomdl may then "
+                            "truncate long <model>/<model>_anims/<smd> sequence paths")
     merge.add_argument("--all-groups", dest="single_group", action="store_false",
                        help="keep every switchable bodygroup instead of one weapon submodel per model")
     merge.add_argument("--groups", metavar="JSON",
