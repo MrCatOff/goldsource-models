@@ -590,6 +590,58 @@ def _rebind_offrig_hand_verts(mesh: SMD, reference_names: set[str]) -> dict[str,
     return moved
 
 
+def strip_forearm(smd: SMD, elbow_margin: float = 0.0) -> int:
+    """
+    Cut the **above-the-elbow** part off the forearm in a hand *smd*, in place,
+    keeping the forearm proper (elbow→wrist) and the bones.  Returns triangles
+    dropped.
+
+    The reference hands' forearm mesh runs well past the elbow toward the shoulder
+    (~43% of the forearm verts sit on the far side of the elbow).  The forearm
+    itself belongs in view, but that above-elbow stub pokes beyond the screen edge
+    when an animation extends the arm (v_axe's hit).  Each ``*_Forearm`` vertex is
+    projected onto the elbow→wrist axis (elbow at 0, wrist at the hand child); a
+    triangle whose forearm verts all fall behind the elbow (projection <
+    ``elbow_margin``; use a small negative value to keep the elbow rounded) is
+    dropped.  Triangles straddling the elbow, or anchored by a hand vertex, stay,
+    so the forearm keeps its connection to the hand.  The bones are untouched.
+    """
+    world = world_transforms(smd, 0)
+    by_id = {node.id: node for node in smd.nodes}
+    # Per forearm bone: (elbow origin, unit axis toward its hand child).
+    axes: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for node in smd.nodes:
+        if "forearm" not in node.name.lower() or node.name not in world:
+            continue
+        elbow = world[node.name][:3, 3]
+        hand = next((world[c.name] for c in smd.nodes
+                     if c.parent_id == node.id and "hand" in c.name.lower()
+                     and c.name in world), None)
+        if hand is None:
+            continue
+        axis = hand[:3, 3] - elbow
+        length = float(np.linalg.norm(axis))
+        if length > 1e-6:
+            axes[node.id] = (elbow, axis / length)
+
+    def above_elbow(vertex) -> bool:
+        frame = axes.get(vertex.bone_id)
+        if frame is None:
+            return False
+        origin, unit = frame
+        return float(np.dot(np.array([vertex.x, vertex.y, vertex.z]) - origin, unit)) < elbow_margin
+
+    kept = []
+    for triangle in smd.triangles:
+        forearm_verts = [v for v in triangle.vertices if v.bone_id in axes]
+        if forearm_verts and all(above_elbow(v) for v in forearm_verts):
+            continue
+        kept.append(triangle)
+    dropped = len(smd.triangles) - len(kept)
+    smd.triangles = kept
+    return dropped
+
+
 def _retarget_fingers_to_reference(
     model: ModelInput, reference_hand: SMD, donor: SMD
 ) -> int:
@@ -1521,6 +1573,7 @@ def _apply_hand_variants(
     merged: MergeResult,
     variants: list[tuple[str | Path, str | Path]],
     hands_group_name: str = HAND_SMD_KEY,
+    trim_forearm: bool = False,
 ) -> tuple[int, int]:
     """
     Replace the shared hands bodygroup with a **fixed set** of hand meshes (e.g.
@@ -1548,6 +1601,8 @@ def _apply_hand_variants(
     variant_keys: list[str] = []
     for index, (smd_path, texture_path) in enumerate(variants):
         mesh = SMD.from_file(smd_path)
+        if trim_forearm:
+            strip_forearm(mesh)
         texture_name = Path(texture_path).name
         for triangle in mesh.triangles:
             triangle.material = texture_name
@@ -1972,6 +2027,7 @@ def run(
     keep_hand_mesh: bool = False,
     hand_match_max_cost: float | None = 1.0,
     retarget_fingers: bool = False,
+    trim_forearm: bool = False,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
@@ -2222,7 +2278,7 @@ def run(
             log("    hand meshes differ per model, keeping separate copies")
 
     if hand_variants and normalise:
-        count, stride = _apply_hand_variants(merged, hand_variants)
+        count, stride = _apply_hand_variants(merged, hand_variants, trim_forearm=trim_forearm)
         if count:
             result.shared_hand = True
             result.hand_variants = count

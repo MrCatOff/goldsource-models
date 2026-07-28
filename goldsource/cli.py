@@ -182,6 +182,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         hand_match_max_cost=getattr(args, "hand_match_max_cost", 1.0),
         retarget_fingers=getattr(args, "retarget_fingers", False)
                          or getattr(args, "default_hands", False),
+        trim_forearm=getattr(args, "trim_forearm", False),
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
@@ -470,6 +471,11 @@ def build_parser(merge_config: dict | None = None) -> argparse.ArgumentParser:
                        help="bake each weapon's finger animation onto the shared hand's bone "
                             "lengths so one fixed hand mesh curls without stretching (no "
                             "per-weapon re-pose needed). Implied by --default-hands")
+    merge.add_argument("--trim-forearm", dest="trim_forearm", action="store_true",
+                       help="cut the above-the-elbow part off the shared hand's forearm so it "
+                            "does not poke past the screen edge when an animation extends the "
+                            "arm (v_axe's hit); the forearm proper (elbow->wrist) stays, and "
+                            "the bones are untouched")
     merge.add_argument("--no-unify-skeleton", dest="unify_skeleton", action="store_false",
                        help="write only each weapon's own bones per SMD instead of the full "
                             "merged skeleton in every SMD (leaner, but can hit studiomdl's "
