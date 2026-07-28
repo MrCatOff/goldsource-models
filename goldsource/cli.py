@@ -183,6 +183,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         retarget_fingers=getattr(args, "retarget_fingers", False)
                          or getattr(args, "default_hands", False),
         trim_forearm=getattr(args, "trim_forearm", False),
+        contact_keep_own=getattr(args, "contact_keep_own", None),
         player_model=getattr(args, "player_model", False),
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
@@ -472,6 +473,13 @@ def build_parser(merge_config: dict | None = None) -> argparse.ArgumentParser:
                        help="bake each weapon's finger animation onto the shared hand's bone "
                             "lengths so one fixed hand mesh curls without stretching (no "
                             "per-weapon re-pose needed). Implied by --default-hands")
+    merge.add_argument("--contact-keep-own", dest="contact_keep_own", type=float,
+                       default=None, metavar="EXCESS",
+                       help="keep a model's own hand when the shared hand clips into its weapon "
+                            "more than EXCESS units (averaged over the idle) beyond what the own "
+                            "hand does — a dynamic grip check that catches rigs the bind-pose "
+                            "match cost passes but that pass through the gun once fingers curl "
+                            "(~30 is a good value). Slower: poses hand+weapon per model")
     merge.add_argument("--trim-forearm", dest="trim_forearm", action="store_true",
                        help="cut the above-the-elbow part off the shared hand's forearm so it "
                             "does not poke past the screen edge when an animation extends the "

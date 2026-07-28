@@ -643,6 +643,141 @@ def strip_forearm(smd: SMD, elbow_margin: float = 0.0) -> int:
     return dropped
 
 
+def _posed_world_verts(mesh: SMD, bind: dict, pose: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    World-space position and normal of *mesh*'s vertices under *pose*, deduplicated.
+
+    Mesh vertices are stored per triangle-corner, so most positions repeat; collapsing
+    the duplicates cuts the nearest-neighbour search several-fold with no loss.
+    """
+    id_to_name = {node.id: node.name for node in mesh.nodes}
+    xform = {name: pose[name] @ np.linalg.inv(bind[name]) for name in bind if name in pose}
+    positions: list[np.ndarray] = []
+    normals: list[np.ndarray] = []
+    for triangle in mesh.triangles:
+        for vertex in triangle.vertices:
+            matrix = xform.get(id_to_name.get(vertex.bone_id))
+            if matrix is None:
+                continue
+            positions.append((matrix @ np.array([vertex.x, vertex.y, vertex.z, 1.0]))[:3])
+            normals.append(matrix[:3, :3] @ np.array([vertex.nx, vertex.ny, vertex.nz]))
+    if not positions:
+        return np.empty((0, 3)), np.empty((0, 3))
+    P = np.array(positions)
+    N = np.array(normals)
+    _, keep = np.unique(P.round(2), axis=0, return_index=True)
+    return P[keep], N[keep]
+
+
+def _mean_penetration(hand: SMD, hand_bind: dict, weapon_P: dict, weapon_N: dict,
+                      anim: SMD, frames: list[int]) -> float:
+    """
+    Penetration depth per contact vertex — how far *hand*'s vertices sit *inside*
+    the weapon, averaged over the hand vertices that are near it (over *frames*).
+
+    A hand vertex is inside when it is near the weapon surface and on the negative
+    side of that surface's outward normal.  Normalising by the count of near ("in
+    contact") vertices — not the raw sum — makes the score independent of how many
+    vertices each hand mesh happens to have, so own and shared hands compare fairly.
+    High values mean the hand clips through the weapon (passes through the gun).
+    """
+    penetration = 0.0
+    contact = 0
+    for frame in frames:
+        pose = world_transforms(anim, frame)
+        hand_P, _ = _posed_world_verts(hand, hand_bind, pose)
+        if len(hand_P) == 0 or frame not in weapon_P:
+            continue
+        wp, wn = weapon_P[frame], weapon_N[frame]
+        index = np.empty(len(hand_P), dtype=int)
+        distance = np.empty(len(hand_P))
+        for i in range(0, len(hand_P), 256):
+            batch = hand_P[i:i + 256]
+            d = np.linalg.norm(batch[:, None, :] - wp[None, :, :], axis=2)
+            index[i:i + 256] = d.argmin(1)
+            distance[i:i + 256] = d.min(1)
+        normal = wn[index]
+        normal = normal / (np.linalg.norm(normal, axis=1, keepdims=True) + 1e-9)
+        signed = np.einsum("ij,ij->i", hand_P - wp[index], normal)
+        near = distance < 3.0
+        inside = near & (signed < -0.15)
+        penetration += float((-signed[inside]).sum())
+        contact += int(near.sum())
+    return 1000.0 * penetration / max(contact, 1)
+
+
+def _shared_hand_excess_penetration(
+    model: ModelInput, reference_hand: SMD, reference_rigs: list, frames: int = 4
+) -> float:
+    """
+    How much MORE the retargeted shared hand clips into the weapon than the model's
+    own hand does (averaged over animation frames).  Returns 0 when it cannot be
+    measured.
+
+    The bind-pose match cost only checks the *rest* fit; a rig can match at rest yet
+    have the shared hand pass through the weapon once the animation curls the
+    fingers (v_kingcobra, v_bloodhunter).  This poses the weapon and each hand over
+    the idle and compares their penetration, giving a dynamic "does it actually grip
+    the gun" score the cost check misses.  Computed on a copy, so the model is left
+    untouched for the real normalisation.
+    """
+    slots = _hand_slots(model, _HANDS_GROUP_RE)
+    if not slots:
+        return 0.0
+    hand_keys = {slot.key for slot in slots}
+    own = model.smds[slots[0].key]
+    # The weapon is everything that is not a hand mesh; some weapons are split into
+    # several meshes (v_bloodhunter), so use them all — the hand must not clip any.
+    weapon_meshes = [
+        smd for key, smd in model.smds.items()
+        if not smd.is_animation and key not in hand_keys and smd.triangles
+    ]
+    anim = next((smd for key, smd in model.smds.items()
+                 if smd.is_animation and "idle" in key.lower() and smd.skeleton), None)
+    if anim is None:
+        anim = next((smd for smd in model.smds.values() if smd.is_animation and smd.skeleton), None)
+    if not weapon_meshes or anim is None:
+        return 0.0
+
+    count = min(len(anim.skeleton), 24)
+    frame_idx = list(range(0, count, max(1, count // frames)))
+    weapon_binds = [(mesh, world_transforms(mesh, 0)) for mesh in weapon_meshes]
+    weapon_P: dict[int, np.ndarray] = {}
+    weapon_N: dict[int, np.ndarray] = {}
+    for frame in frame_idx:
+        pose = world_transforms(anim, frame)
+        parts_p: list[np.ndarray] = []
+        parts_n: list[np.ndarray] = []
+        for mesh, bind in weapon_binds:
+            p, n = _posed_world_verts(mesh, bind, pose)
+            if len(p):
+                parts_p.append(p)
+                parts_n.append(n)
+        if parts_p:
+            weapon_P[frame] = np.vstack(parts_p)
+            weapon_N[frame] = np.vstack(parts_n)
+    if not weapon_P:
+        return 0.0
+
+    own_pen = _mean_penetration(own, world_transforms(own, 0), weapon_P, weapon_N, anim, frame_idx)
+
+    shared_model = deepcopy(model)
+    norm = normalise_hands(shared_model, reference_hand, reference_rigs, texture=None,
+                           repose=False, replace_mesh=True, max_match_cost=None,
+                           retarget_fingers=True)
+    if not norm.ok or not norm.replaced_keys:
+        return 0.0
+    shared_anim = next((smd for key, smd in shared_model.smds.items()
+                        if smd.is_animation and "idle" in key.lower() and smd.skeleton), None)
+    if shared_anim is None:
+        shared_anim = next((smd for smd in shared_model.smds.values()
+                            if smd.is_animation and smd.skeleton), None)
+    shared_hand = shared_model.smds[norm.replaced_keys[0]]
+    shared_pen = _mean_penetration(shared_hand, world_transforms(shared_hand, 0),
+                                   weapon_P, weapon_N, shared_anim, frame_idx)
+    return shared_pen - own_pen
+
+
 def _retarget_fingers_to_reference(
     model: ModelInput, reference_hand: SMD, donor: SMD
 ) -> int:
@@ -1136,6 +1271,12 @@ def _canonicalise_group_names(
     index = 0
     kept = keep_switchable or set()
     for bodygroup in model.qc.bodygroups:
+        if bodygroup.name.startswith(f"{HAND_SMD_KEY}_original"):
+            # A hand deliberately parked out of the shared group (a rig that could
+            # not be matched keeps its own hand here).  It DOES hold a hand mesh, so
+            # the detection below would pull it back into "hands" and the shared-hand
+            # replacement would overwrite it — leave it exactly where it is.
+            continue
         if bodygroup.name in kept:
             # A group deliberately left switchable is this model's own choice,
             # not a slot to line up with other models' weapon pieces — sharing
@@ -1575,6 +1716,7 @@ def _apply_hand_variants(
     variants: list[tuple[str | Path, str | Path]],
     hands_group_name: str = HAND_SMD_KEY,
     trim_forearm: bool = False,
+    keep_own: set[str] | None = None,
 ) -> tuple[int, int]:
     """
     Replace the shared hands bodygroup with a **fixed set** of hand meshes (e.g.
@@ -1615,11 +1757,20 @@ def _apply_hand_variants(
             merged.textures[texture_name] = Path(texture_path).read_bytes()
 
     entries = [BodyGroupEntry(smd=key) for key in variant_keys]
+    # Models whose rig could not be matched keep their own hand in a separate
+    # bodygroup; give them a trailing blank here so they show NO shared hand (else
+    # both the shared and their own hand draw at once).
+    keep_own = keep_own or set()
+    blank_index = len(entries)
+    if keep_own:
+        entries.append(BodyGroupEntry(smd=""))
     for group in groups:
         group.entries = list(entries)
 
-    # Every weapon defaults to the first variant (index 0); recompute from there.
-    override = {hands_group_name: {name: 0 for name in merged.model_names}}
+    # Shared-hand models default to variant 0; kept-own models pick the blank.
+    override = {hands_group_name: {
+        name: (blank_index if name in keep_own else 0) for name in merged.model_names
+    }}
     merged.pev_body_map = _recompute_pev_body(
         merged.qc, merged.model_names, merged.bodygroup_indices, overrides=override
     )
@@ -2095,6 +2246,7 @@ def run(
     hand_match_max_cost: float | None = 1.0,
     retarget_fingers: bool = False,
     trim_forearm: bool = False,
+    contact_keep_own: float | None = None,
     player_model: bool = False,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
@@ -2154,6 +2306,7 @@ def run(
 
     merger = ModelMerger()
     hand_keys_by_model: dict[str, list[str]] = {}
+    kept_own_hand_models: set[str] = set()
     prepared: list[ModelInput] = []
 
     for directory in directories:
@@ -2170,6 +2323,17 @@ def run(
 
         if player_model:
             _uniquify_weapon_bones(model)
+            # A p_/w_ model is one weapon = one bodygroup.  Some decompiles carry a
+            # spurious extra group (p_luger keeps its skin "upgrade" meshes in a
+            # second, mis-named "hands" group); the merger would reference those
+            # meshes without writing them and the compile fails on the missing SMD.
+            if len(model.qc.bodygroups) > 1:
+                log(f"    dropped {len(model.qc.bodygroups) - 1} extra bodygroup(s) "
+                    f"(p/w model keeps only its weapon)")
+                model.qc.bodygroups = model.qc.bodygroups[:1]
+            # Hitboxes are for the player's own model, not the held/dropped weapon;
+            # keeping them just pins (or dangles on) bones and breaks the compile.
+            model.qc.hboxes = []
 
         prep.renamed_bodygroups = dedupe_bodygroup_names(model.qc)
         if prep.renamed_bodygroups:
@@ -2178,16 +2342,27 @@ def run(
                 f"{', '.join(sorted(prep.renamed_bodygroups))}")
 
         if normalise and reference_hand is not None:
+            effective_max_cost = (
+                hand_match_max_cost
+                if not keep_hand_mesh and (hand_match_max_cost or 0) > 0
+                else None
+            )
+            # Dynamic keep-own trigger: even a rig that fits at rest may have the
+            # shared hand clip through the weapon once the fingers curl.  Measure
+            # that penetration and, if the shared hand grips much worse than the
+            # model's own, force keeping the own hand (a cost of -1 does that).
+            if contact_keep_own is not None and not keep_hand_mesh:
+                excess = _shared_hand_excess_penetration(model, reference_hand, reference_rigs)
+                if excess > contact_keep_own:
+                    log(f"    shared hand clips the weapon (excess penetration "
+                        f"{excess:.0f} > {contact_keep_own:.0f}); keeping own hand")
+                    effective_max_cost = -1.0
             normalisation = normalise_hands(
                 model, reference_hand, reference_rigs,
                 texture=None if keep_hand_mesh else hand_texture_name,
                 repose=repose_hands, replace_mesh=not keep_hand_mesh,
                 vertex_budget=vertex_budget,
-                max_match_cost=(
-                    hand_match_max_cost
-                    if not keep_hand_mesh and (hand_match_max_cost or 0) > 0
-                    else None
-                ),
+                max_match_cost=effective_max_cost,
                 retarget_fingers=retarget_fingers,
             )
             prep.hands = normalisation
@@ -2202,9 +2377,19 @@ def run(
                 if normalisation.kept_own_hand:
                     prep.warnings.append(
                         f"hand match cost {normalisation.score:.2f} over "
-                        f"{hand_match_max_cost}; kept own hand mesh to avoid distortion"
+                        f"{hand_match_max_cost}; kept own hand (rig cannot fit the shared hand)"
                     )
-                hand_keys_by_model[model.name] = list(normalisation.replaced_keys)
+                    # Keep this own hand OUT of the shared "hands" group so the
+                    # shared-hand collapse and --default-hands variant replacement
+                    # never overwrite it (its rig — e.g. mirrored handedness — cannot
+                    # be matched to the shared hand, so the shared one would grip wrong).
+                    kept_own_hand_models.add(model.name)
+                    for bodygroup in model.qc.bodygroups:
+                        if bodygroup.name == HAND_SMD_KEY:
+                            bodygroup.name = f"{HAND_SMD_KEY}_original"
+                    dedupe_bodygroup_names(model.qc)
+                else:
+                    hand_keys_by_model[model.name] = list(normalisation.replaced_keys)
                 if normalisation.unmapped:
                     prep.warnings.append(
                         f"reference hand bones left unmapped: {', '.join(normalisation.unmapped)}"
@@ -2355,7 +2540,8 @@ def run(
             log("    hand meshes differ per model, keeping separate copies")
 
     if hand_variants and normalise:
-        count, stride = _apply_hand_variants(merged, hand_variants, trim_forearm=trim_forearm)
+        count, stride = _apply_hand_variants(merged, hand_variants, trim_forearm=trim_forearm,
+                                             keep_own=kept_own_hand_models)
         if count:
             result.shared_hand = True
             result.hand_variants = count
