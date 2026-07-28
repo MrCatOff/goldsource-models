@@ -124,11 +124,20 @@ def _parse_keep_groups(args: argparse.Namespace) -> dict[str, set[str] | str]:
 # ---------------------------------------------------------------------------
 
 def cmd_merge(args: argparse.Namespace) -> int:
+    if not args.inputs:
+        raise SystemExit("merge: no inputs given (pass model directories, or set \"inputs\" in --config)")
+    if not args.output:
+        raise SystemExit("merge: no output given (pass -o/--output, or set \"output\" in --config)")
+
     merge_config = MergeConfig(sequence_renames=_parse_renames(args.rename))
+    # A skin-oriented AppConfig (models/skin slots) is loaded here as before; an
+    # options --config was already folded into the parser defaults in main().
     if args.config:
-        loaded = AppConfig.load(args.config).build_merge_config()
-        loaded.sequence_renames.extend(merge_config.sequence_renames)
-        merge_config = loaded
+        raw = json.loads(pathlib.Path(args.config).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and ("models" in raw or "skin_slots" in raw):
+            loaded = AppConfig.load(args.config).build_merge_config()
+            loaded.sequence_renames.extend(merge_config.sequence_renames)
+            merge_config = loaded
     merge_config.index_sequence_names = getattr(args, "index_sequences", False)
 
     model_name = args.name
@@ -173,6 +182,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         repose_hands=args.repose_hands,
         keep_hand_mesh=args.keep_hand_mesh,
         hand_match_max_cost=getattr(args, "hand_match_max_cost", 1.0),
+        retarget_fingers=getattr(args, "retarget_fingers", False)
+                         or getattr(args, "default_hands", False),
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
@@ -321,7 +332,36 @@ def cmd_compile(args: argparse.Namespace) -> int:
 # Parser
 # ---------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
+def _load_merge_config(path: str) -> dict | None:
+    """
+    Read a ``--config`` JSON.  Returns a dict of merge-option defaults, or ``None``
+    when the file is a skin-oriented :class:`AppConfig` (``models``/``skin_slots``),
+    which :func:`cmd_merge` loads separately.
+    """
+    try:
+        raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"--config: cannot read {path}: {exc}")
+    if not isinstance(raw, dict):
+        raise SystemExit(f"--config: expected a JSON object at the top level of {path}")
+    if "models" in raw or "skin_slots" in raw:
+        return None
+    return raw
+
+
+def _apply_merge_config(merge_parser: argparse.ArgumentParser, config: dict) -> None:
+    """Make *config*'s values the merge parser's defaults; command-line flags still win."""
+    valid = {action.dest for action in merge_parser._actions}
+    # Keys starting with "_" are treated as free-form comments and ignored.
+    unknown = sorted(key for key in config
+                     if key not in valid and not key.startswith("_"))
+    if unknown:
+        print(f"warning: --config: ignoring unknown option(s): {', '.join(unknown)}",
+              file=sys.stderr)
+    merge_parser.set_defaults(**{k: v for k, v in config.items() if k in valid})
+
+
+def build_parser(merge_config: dict | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="goldsource",
         description="Merge decompiled GoldSource weapon models into one model with submodels.",
@@ -333,8 +373,9 @@ def build_parser() -> argparse.ArgumentParser:
     merge = subparsers.add_parser(
         "merge", help="normalise hands, prune bones, merge and optionally compile",
     )
-    merge.add_argument("inputs", nargs="+", help="model directories, or a directory of them")
-    merge.add_argument("-o", "--output", required=True, help="output directory")
+    merge.add_argument("inputs", nargs="*", help="model directories, or a directory of them "
+                                                  "(may instead come from --config)")
+    merge.add_argument("-o", "--output", help="output directory (may instead come from --config)")
     merge.add_argument("-n", "--name", default="merged.mdl", help="output model name")
     _add_hand_arguments(merge)
     merge.add_argument("--no-prune", dest="prune", action="store_false",
@@ -402,6 +443,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="use the two hands in storage/hands/default (male, female) as a "
                             "shared, selectable hands bodypart for every weapon; "
                             "add the reported stride to a weapon's pev_body to pick female")
+    merge.add_argument("--retarget-hands", dest="retarget_fingers", action="store_true",
+                       help="bake each weapon's finger animation onto the shared hand's bone "
+                            "lengths so one fixed hand mesh curls without stretching (no "
+                            "per-weapon re-pose needed). Implied by --default-hands")
     merge.add_argument("--no-unify-skeleton", dest="unify_skeleton", action="store_false",
                        help="write only each weapon's own bones per SMD instead of the full "
                             "merged skeleton in every SMD (leaner, but can hit studiomdl's "
@@ -415,12 +460,19 @@ def build_parser() -> argparse.ArgumentParser:
              "in Model Viewer (original names kept as models.ini keys)")
     merge.add_argument("--rename", action="append", metavar="FIND=REPLACE",
                        help="sequence name rewrite rule (repeatable)")
-    merge.add_argument("--config", metavar="JSON", help="AppConfig JSON with skin variants/slots")
+    merge.add_argument("--config", metavar="JSON",
+                       help="load merge options from a JSON file — every long option is a key "
+                            "(e.g. {\"inputs\": [...], \"output\": \"...\", \"exclude\": [...], "
+                            "\"flatten_weapon_bones\": true}); flags on the command line override "
+                            "it. See storage/configs/knives.json. (An AppConfig JSON with "
+                            "\"models\"/skin slots is still read as before.)")
     merge.add_argument("--compile", action="store_true", help="run studiomdl on the result")
     merge.add_argument("--studiomdl", metavar="EXE", help="path to studiomdl")
     merge.add_argument("--ignore-warnings", action="store_true",
                        help="pass -i to studiomdl")
     merge.add_argument("--dry-run", action="store_true", help="analyse without writing files")
+    if merge_config:
+        _apply_merge_config(merge, merge_config)
     merge.set_defaults(func=cmd_merge)
 
     # --- analyze ---
@@ -453,8 +505,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    # A merge --config file provides option defaults; load it first so the real
+    # parser can seed its defaults from it (command-line flags still override).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    known, _ = pre.parse_known_args(raw_argv)
+    merge_config = _load_merge_config(known.config) if known.config else None
+    parser = build_parser(merge_config)
+    args = parser.parse_args(raw_argv)
     try:
         return args.func(args)
     except (FileNotFoundError, NotADirectoryError, ValueError) as exc:

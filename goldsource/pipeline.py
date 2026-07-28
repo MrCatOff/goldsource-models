@@ -63,6 +63,7 @@ from goldsource.skeleton import (
     topo_order,
     unique_vertex_count,
     world_transforms,
+    _mat4_from_bt,
 )
 from goldsource.smd import SMD, BoneTransform, Node
 
@@ -540,6 +541,73 @@ def _rebind_offrig_hand_verts(mesh: SMD, reference_names: set[str]) -> dict[str,
     return moved
 
 
+def _retarget_fingers_to_reference(
+    model: ModelInput, reference_hand: SMD, donor: SMD
+) -> int:
+    """
+    Rewrite every animation's **finger** bones so they drive the shared reference
+    hand without stretching, keeping the weapon's finger pose (the grip and its
+    motion) but the reference hand's bone *lengths*.  Returns bone-frames rewritten.
+
+    A single shared hand mesh cannot be re-posed per weapon (see
+    :func:`_repose_hand_to_model`), so when every weapon shares one fixed hand
+    (``--default-hands``) each weapon's animation still carries *its own* finger
+    bone offsets frame by frame.  Those offsets are the source rig's bone lengths;
+    driving the shared mesh — whose vertices expect the reference hand's lengths —
+    with them stretches the fingers, and where a source bone is much longer or
+    shorter a triangle explodes into a sliver (v_bhdagger's worst edge reached
+    36x).  This is exactly the mismatch re-posing cancels for the mesh; here we
+    cancel it on the animation instead.
+
+    Each finger frame keeps the weapon's **absolute** local rotation and only
+    swaps in the reference finger's translation ``[A_rot | S_trans]``.  The
+    rotation is what curls the finger, so the weapon's grip and its per-frame
+    motion carry over verbatim; forcing ``S``'s translation gives the bone the
+    length the mesh was bound to, so it moves rigidly and cannot stretch.  A
+    *delta* transfer (``S·W⁻¹·A``) was tried first and left the fingers frozen at
+    the reference hand's **open** rest: these weapon hands are authored already
+    gripping the weapon, so the motion relative to that grip-rest is almost
+    nothing and the reference hand's own rest (open) showed through.  Palm and
+    forearm are left on the weapon's own animation, so the hand still sits exactly
+    where it grips the weapon.  *donor* is unused now but kept for signature
+    stability.
+    """
+    is_finger = lambda name: "finger" in name.lower()
+    reference_id = {node.id: node.name for node in reference_hand.nodes}
+    if not reference_hand.skeleton:
+        return 0
+    shared = {
+        reference_id[bone.bone_id]: _mat4_from_bt(bone)
+        for bone in reference_hand.skeleton[0].bones
+        if is_finger(reference_id.get(bone.bone_id, ""))
+    }
+    if not shared:
+        return 0
+
+    count = 0
+    for smd in model.smds.values():
+        id_to_name = {node.id: node.name for node in smd.nodes}
+        for frame in smd.skeleton:
+            for bone in frame.bones:
+                name = id_to_name.get(bone.bone_id)
+                if name not in shared:
+                    continue
+                if smd.is_animation:
+                    local = _mat4_from_bt(bone).copy()   # weapon's grip + finger motion
+                    local[:3, 3] = shared[name][:3, 3]   # reference hand's bone length
+                else:
+                    # A reference (non-animation) mesh: agree with the shared hand's
+                    # finger bind so studiomdl's single per-bone bind is consistent.
+                    # The weapon's own hand mesh is replaced, so its finger vertices
+                    # never render at this bind.
+                    local = shared[name]
+                solved = _bt_from_mat4(bone.bone_id, local)
+                bone.tx, bone.ty, bone.tz = solved.tx, solved.ty, solved.tz
+                bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
+                count += 1
+    return count
+
+
 def normalise_hands(
     model: ModelInput,
     reference_hand: SMD,
@@ -552,6 +620,7 @@ def normalise_hands(
     replace_mesh: bool = True,
     vertex_budget: int = VERTEX_BUDGET,
     max_match_cost: float | None = None,
+    retarget_fingers: bool = False,
 ) -> HandNormalisation:
     """
     Replace *model*'s hand mesh(es) with the optimised reference hand.
@@ -629,6 +698,13 @@ def normalise_hands(
         rename_bones(smd, renames)
     _rename_qc_bones(model.qc, renames)
 
+    # With a single fixed hand shared by every weapon (no per-model re-pose), bake
+    # each weapon's finger animation onto the reference hand's finger lengths so
+    # the shared mesh curls without stretching.  Done before the mesh is swapped,
+    # while the model's own hand bind is still available as the source pose.
+    if retarget_fingers and replace_mesh:
+        result.retargeted = _retarget_fingers_to_reference(model, reference_hand, donor)
+
     if replace_mesh:
         mapped = set(match.mapping)
         if complete_hands:
@@ -656,10 +732,21 @@ def normalise_hands(
     else:
         # Keep the model's own hand mesh — the bones are already renamed onto the
         # common naming (above), which is all that is needed for the skeleton to
-        # be shared and pooled.  Fold however many hand meshes the model split its
-        # hands into (rhand/lhand) back into one so it lands in a single "hands"
-        # bodypart like every other model's.
-        hand_meshes = [model.smds[key] for key in keys]
+        # be shared and pooled.
+        #
+        # Entries WITHIN one $bodygroup are mutually-exclusive alternatives, not
+        # pieces drawn together: v_bhdagger's "hands" group offers a male OR a
+        # female hand, some rigs a LOD switch.  Concatenating them superimposes
+        # two full hands on one skeleton, and since studiomdl gives each bone a
+        # single bind the two disagreeing binds shear the fingers into splinters.
+        # So keep the first entry of each group and only concatenate ACROSS groups
+        # (a rig that splits its left and right hands into two separate groups,
+        # which really are drawn together).
+        first_per_group: dict[int, str] = {}
+        for slot in slots:
+            first_per_group.setdefault(id(slot.group), slot.key)
+        own_keys = list(first_per_group.values())
+        hand_meshes = [model.smds[key] for key in own_keys]
         new_hand = hand_meshes[0] if len(hand_meshes) == 1 else concat_meshes(hand_meshes)
 
         # Kept because the reference matched too poorly to repose without warping
@@ -1835,6 +1922,7 @@ def run(
     repose_hands: bool = True,
     keep_hand_mesh: bool = False,
     hand_match_max_cost: float | None = 1.0,
+    retarget_fingers: bool = False,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
@@ -1918,14 +2006,17 @@ def run(
                     if not keep_hand_mesh and (hand_match_max_cost or 0) > 0
                     else None
                 ),
+                retarget_fingers=retarget_fingers,
             )
             prep.hands = normalisation
             if normalisation.ok:
                 pairs = ", ".join(f"{a}->{b}" for a, b in normalisation.pairs)
                 kept = " — kept own hand (match too poor to share)" \
                     if normalisation.kept_own_hand else ""
+                retgt = f", retargeted {normalisation.retargeted} finger-frames" \
+                    if normalisation.retargeted else ""
                 log(f"    hands rebound ({pairs}), match cost "
-                    f"{normalisation.score:.2f}{kept}")
+                    f"{normalisation.score:.2f}{kept}{retgt}")
                 if normalisation.kept_own_hand:
                     prep.warnings.append(
                         f"hand match cost {normalisation.score:.2f} over "

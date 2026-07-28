@@ -503,6 +503,7 @@ class HandNormalisation:
     retired_textures: list[str] = field(default_factory=list)
     error: str | None = None
     kept_own_hand: bool = False   # match too poor to share; own mesh retained
+    retargeted: int = 0           # finger bone-frames baked onto the shared hand
 
     @property
     def ok(self) -> bool:
