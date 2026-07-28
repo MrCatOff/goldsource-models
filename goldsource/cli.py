@@ -183,6 +183,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         retarget_fingers=getattr(args, "retarget_fingers", False)
                          or getattr(args, "default_hands", False),
         trim_forearm=getattr(args, "trim_forearm", False),
+        player_model=getattr(args, "player_model", False),
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
@@ -476,6 +477,11 @@ def build_parser(merge_config: dict | None = None) -> argparse.ArgumentParser:
                             "does not poke past the screen edge when an animation extends the "
                             "arm (v_axe's hit); the forearm proper (elbow->wrist) stays, and "
                             "the bones are untouched")
+    merge.add_argument("--player-model", dest="player_model", action="store_true",
+                       help="build a third-person p_/w_ model: no hand pipeline, no bone "
+                            "pooling, and collapse the per-weapon sequences into ONE 'player' "
+                            "pose that holds every weapon (the weapon is chosen by pev_body, "
+                            "like the stock CS weapons.mdl). Use with --no-hands")
     merge.add_argument("--no-unify-skeleton", dest="unify_skeleton", action="store_false",
                        help="write only each weapon's own bones per SMD instead of the full "
                             "merged skeleton in every SMD (leaner, but can hit studiomdl's "

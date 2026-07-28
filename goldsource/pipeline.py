@@ -24,6 +24,7 @@ per-weapon submodels, running the whole sequence unattended:
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,7 +51,7 @@ from goldsource.merger import (
     _norm_path,
     _ref_smd_names,
 )
-from goldsource.qc import QC, BodyGroup, BodyGroupEntry
+from goldsource.qc import QC, BodyGroup, BodyGroupEntry, Sequence
 from goldsource.sanitize import sanitize_directory
 from goldsource.skeleton import (
     animated_bone_names,
@@ -65,7 +66,7 @@ from goldsource.skeleton import (
     world_transforms,
     _mat4_from_bt,
 )
-from goldsource.smd import SMD, BoneTransform, Node
+from goldsource.smd import SMD, BoneTransform, Node, SkeletonFrame
 
 
 SHARED_HAND_KEY = "_shared/hand"
@@ -1632,6 +1633,72 @@ def _apply_hand_variants(
     return len(variant_keys), stride
 
 
+def _uniquify_weapon_bones(model: ModelInput) -> dict[str, str]:
+    """
+    Rename a P-model's weapon bones model-unique, keeping the shared ``Bip01``
+    player skeleton.  Returns the rename map.
+
+    Every ``p_``/``w_`` model rides the same biped (``Bip01*``), which must merge
+    into one shared skeleton, but each carries its own weapon bone(s) off the
+    hand.  Some rigs give those generic names (``p``, ``Knife_Wow``) that would
+    collide across weapons; the merger shares a same-named, same-parent bone, so
+    two weapons that hold differently (``p`` on ``p_ironfan`` vs
+    ``p_tomahawk_xmas``) would then be posed by one shared bone and one would be
+    wrong.  Prefixing the non-``Bip01`` bones with the model name keeps every
+    weapon on its own bone so the single player pose places each correctly.
+    """
+    names: set[str] = set()
+    for smd in model.smds.values():
+        names |= {node.name for node in smd.nodes}
+    renames = {
+        name: f"{model.name}__{name}"
+        for name in names
+        if not name.startswith("Bip01")
+    }
+    if renames:
+        for smd in model.smds.values():
+            rename_bones(smd, renames)
+        _rename_qc_bones(model.qc, renames)
+    return renames
+
+
+def _collapse_to_player_pose(
+    merged: MergeResult, sequence_name: str = "player", anim_key: str = "a/player"
+) -> int:
+    """
+    Replace a P (third-person) model's per-weapon sequences with ONE animation
+    that holds the biped in its carry pose and every weapon bone at its own resting
+    place.  Returns the bone count of the pose (0 if nothing to do).
+
+    A ``p_``/``w_`` model rides the player skeleton and the engine plays a *single*
+    sequence on it no matter which weapon ``pev_body`` selects, so every weapon
+    bone has to be posed by that one clip (this is how the stock CS ``weapons.mdl``
+    works — one ``player`` sequence over a shared skeleton, weapons chosen by
+    bodygroup).  After :func:`_unify_skeleton` every reference mesh carries the
+    full skeleton with each weapon bone at its own bind (its held pose), so this
+    lifts that frame-0 pose into a two-frame animation and drops the per-model
+    sequences.  Requires pooling OFF so every weapon keeps its own bone.
+    """
+    references = [smd for smd in merged.smds.values() if not smd.is_animation and smd.skeleton]
+    if not references:
+        return 0
+    reference = max(references, key=lambda smd: len(smd.nodes))
+
+    pose = SMD()
+    pose.nodes = deepcopy(reference.nodes)
+    frame = reference.skeleton[0]
+    pose.skeleton = [
+        SkeletonFrame(time=0, bones=deepcopy(frame.bones)),
+        SkeletonFrame(time=1, bones=deepcopy(frame.bones)),
+    ]
+
+    for key in [k for k, smd in merged.smds.items() if smd.is_animation]:
+        del merged.smds[key]
+    merged.smds[anim_key] = pose
+    merged.qc.sequences = [Sequence(name=sequence_name, smd_paths=[anim_key], fps=30)]
+    return len(pose.nodes)
+
+
 def _unify_skeleton(merged: MergeResult) -> int:
     """
     Give every output SMD the **full merged skeleton**, like a hand-authored
@@ -2028,6 +2095,7 @@ def run(
     hand_match_max_cost: float | None = 1.0,
     retarget_fingers: bool = False,
     trim_forearm: bool = False,
+    player_model: bool = False,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
@@ -2052,6 +2120,12 @@ def run(
     """
     result = PipelineResult()
     excluded = {name.lower() for name in (exclude or [])}
+
+    if player_model:
+        # A P/W model is posed by one shared sequence, so every weapon needs its
+        # own bone (no pooling), and the whole skeleton must be in every SMD.
+        pool_bones_pass = False
+        unify_skeleton = True
 
     directories: list[Path] = []
     for item in inputs:
@@ -2093,6 +2167,9 @@ def run(
 
         model = ModelInput.from_directory(directory.name, directory)
         prep.sequences = len(model.qc.sequences)
+
+        if player_model:
+            _uniquify_weapon_bones(model)
 
         prep.renamed_bodygroups = dedupe_bodygroup_names(model.qc)
         if prep.renamed_bodygroups:
@@ -2296,6 +2373,12 @@ def run(
         if grafts:
             log(f"    unified skeleton: every SMD now carries the full bone list "
                 f"({grafts} bones grafted across meshes)")
+
+    if player_model:
+        bones = _collapse_to_player_pose(merged)
+        if bones:
+            log(f"    player pose: one 'player' sequence holds all weapons "
+                f"({bones}-bone skeleton); weapon chosen by pev_body")
 
     dropped = _strip_unused_textures(merged)
     if dropped:
