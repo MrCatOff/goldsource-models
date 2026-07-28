@@ -156,45 +156,65 @@ _CHIRALITY_FLOOR = 0.25
 MIRROR_PENALTY = 1000.0
 
 
-def _chirality(smd: SMD, rig: HandRig, forearm: str | None) -> float:
+def _chirality(smd: SMD, rig: HandRig, forearm: str | None = None) -> float:
     """
-    Signed volume of the hand's landmarks expressed in *forearm*-local space —
-    positive for one handedness, negative for the other.
+    Signed volume ``det[index−palm, pinky−palm, thumb−palm]`` of the hand's
+    landmarks in **world space**, with the finger roots in **anatomical order**
+    (thumb / index / pinky, from :func:`_order_finger_roots`) — positive for one
+    handedness, negative for the other.  Returns 0.0 when unreadable; *forearm* is
+    accepted for call-signature compatibility and unused.
 
-    Handedness cannot be read in *hand*-local space: a rig mirrors the hand
-    bone's own axes along with the geometry, so a left and a right hand give
-    nearly identical finger-root coordinates there.  That is exactly why the two
-    side assignments score within a fraction of a percent of each other.  Taking
-    the forearm as the frame instead brings in the arm-to-hand relationship,
-    which is where the mirroring actually shows up.
+    Both choices are load-bearing:
 
-    Returns 0.0 when the reading is unusable, which callers treat as "unknown"
-    rather than as a handedness.
+    - **World space, not hand- or forearm-local.**  A hand-local frame mirrors its
+      own axes along with the geometry, so a left and a right hand read alike; and
+      an earlier forearm-local reading still inverted on some rigs.
+    - **A fixed anatomical order**, not the rig's raw child-discovery order.  Taking
+      the volume over whichever landmarks the child list happens to yield flips the
+      sign arbitrarily: ``v_anaconda``'s left read ``+1.84`` where world+ordered
+      reads ``−1.84`` — a false mirror that added a full ``MIRROR_PENALTY`` and made
+      the merger reject the correct hand and keep the model's own (usp / deagle /
+      glock / anaconda families).  Ordering the points first fixes it.
     """
-    if forearm is None:
-        return 0.0
-
     world = world_transforms(smd)
-    base = world.get(forearm)
-    if base is None or rig.hand not in world:
+    if rig.hand not in world:
+        return 0.0
+    palm = world[rig.hand][:3, 3]
+    roots = {chain[0]: world[chain[0]][:3, 3] for chain in rig.chains if chain[0] in world}
+    if len(roots) < MIN_FINGER_CHAINS:
         return 0.0
 
-    inverse = np.linalg.inv(base)
-    points = [(inverse @ world[rig.hand])[:3, 3]]
-    for chain in rig.chains:
-        matrix = world.get(chain[0])
-        if matrix is not None:
-            points.append((inverse @ matrix)[:3, 3])
-
-    if len(points) < 4:
+    names = list(roots)
+    points = np.array([roots[name] for name in names])
+    # Thumb = the root whose removal leaves the others most colinear.
+    thumb = names[min(range(len(names)),
+                      key=lambda i: _line_residual(np.delete(points, i, axis=0)))]
+    others = [name for name in names if name != thumb]
+    # A weapon bone parented under the hand can be detected as a sixth "finger"
+    # (v_m1887craft's craft_root) and land in the index slot, flipping the sign.
+    # The real knuckles are colinear, so drop the farthest-off-line root until four
+    # remain — that removes such intruders.
+    while len(others) > 4:
+        cloud = np.array([roots[name] for name in others])
+        centre = cloud.mean(0)
+        axis = np.linalg.svd(cloud - centre)[2][0]
+        perpendicular = np.linalg.norm(
+            (cloud - centre) - np.outer((cloud - centre) @ axis, axis), axis=1)
+        others.pop(int(perpendicular.argmax()))
+    if len(others) < 2:
         return 0.0
 
-    best = 0.0
-    for subset in combinations(range(len(points)), 4):
-        volume = _signed_volume(points, subset)
-        if abs(volume) > abs(best):
-            best = volume
-    return best if abs(best) >= _CHIRALITY_FLOOR else 0.0
+    cloud = np.array([roots[name] for name in others])
+    centre = cloud.mean(0)
+    axis = np.linalg.svd(cloud - centre)[2][0]
+    others.sort(key=lambda name: float((roots[name] - centre) @ axis))
+    if (np.linalg.norm(roots[others[0]] - roots[thumb])
+            > np.linalg.norm(roots[others[-1]] - roots[thumb])):
+        others.reverse()   # orient so the index (nearest the thumb) leads
+
+    index, pinky = roots[others[0]], roots[others[-1]]
+    volume = float(np.dot(np.cross(index - palm, pinky - palm), roots[thumb] - palm))
+    return volume if abs(volume) >= _CHIRALITY_FLOOR else 0.0
 
 
 def _line_residual(points: np.ndarray) -> float:
