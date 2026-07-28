@@ -172,6 +172,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
         share_hands=args.share_hands,
         repose_hands=args.repose_hands,
         keep_hand_mesh=args.keep_hand_mesh,
+        hand_match_max_cost=getattr(args, "hand_match_max_cost", 1.0),
         hand_variants=hand_variants,
         unify_skeleton=args.unify_skeleton,
         pool_bones_pass=args.pool_bones,
@@ -390,6 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="keep each model's OWN hand mesh, but still rename its hand "
                             "bones onto the common naming so the skeleton is shared and "
                             "pooled (bone-sharing without hand-sharing)")
+    merge.add_argument("--hand-match-max-cost", dest="hand_match_max_cost",
+                       type=float, default=1.0, metavar="COST",
+                       help="if the reference hand fits a model's rig worse than COST "
+                            "(default 1.0; a matching rig scores 0), keep that model's own "
+                            "hand mesh instead of reposing the shared one onto it — the "
+                            "repose warps badly-matched fingers (v_bhdagger, v_knifedragon). "
+                            "Set 0 to always share")
     merge.add_argument("--default-hands", dest="default_hands", action="store_true",
                        help="use the two hands in storage/hands/default (male, female) as a "
                             "shared, selectable hands bodypart for every weapon; "

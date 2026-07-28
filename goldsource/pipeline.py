@@ -489,6 +489,57 @@ def _repose_hand_to_model(new_hand: SMD, donor: SMD) -> None:
             bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
 
 
+def _rebind_offrig_hand_verts(mesh: SMD, reference_names: set[str]) -> dict[str, str]:
+    """
+    Move *mesh*'s vertices off any bone not in *reference_names* onto the nearest
+    reference bone (by bind-pose position), in place.  Returns ``{off-rig bone:
+    reference bone}`` for the bones actually moved.
+
+    Used when a model keeps its **own** hand mesh because the reference matched it
+    too poorly to repose (see :func:`normalise_hands`).  The own mesh is correct,
+    but it stays rigged to a few bones the reference hand lacks — usually the
+    intermediate wrist joint some rigs put between forearm and palm
+    (``Bip01_R_Hand`` under ``Bone02`` rather than the forearm), or a stray dummy.
+    Left in place those bones give the palm a parent no other model has, so the
+    merger renames the whole hand — palm and every finger — apart, and 33 knives
+    balloon from 127 to 215 bones.  Re-anchoring their vertices to the reference
+    bone they sit on lets pruning fold the extras away, so the model shares the one
+    reference hand skeleton while still showing its own correctly-shaped mesh.
+
+    The move is rigid per vertex and only ever picks a *near-coincident* reference
+    bone, so the geometry does not shift; only which bone drives it in animation
+    changes, from an intermediate that already tracks its neighbour.
+    """
+    if not mesh.skeleton:
+        return {}
+    world = world_transforms(mesh, 0)
+    reference_pos = {
+        name: world[name][:3, 3] for name in reference_names if name in world
+    }
+    if not reference_pos:
+        return {}
+    reference_id = {node.name: node.id for node in mesh.nodes if node.name in reference_names}
+
+    remap: dict[int, int] = {}
+    moved: dict[str, str] = {}
+    used = {vertex.bone_id for triangle in mesh.triangles for vertex in triangle.vertices}
+    for node in mesh.nodes:
+        if node.name in reference_names or node.id not in used or node.name not in world:
+            continue
+        position = world[node.name][:3, 3]
+        nearest = min(
+            reference_pos, key=lambda name: float(np.linalg.norm(reference_pos[name] - position))
+        )
+        remap[node.id] = reference_id[nearest]
+        moved[node.name] = nearest
+
+    for triangle in mesh.triangles:
+        for vertex in triangle.vertices:
+            if vertex.bone_id in remap:
+                vertex.bone_id = remap[vertex.bone_id]
+    return moved
+
+
 def normalise_hands(
     model: ModelInput,
     reference_hand: SMD,
@@ -500,6 +551,7 @@ def normalise_hands(
     repose: bool = True,
     replace_mesh: bool = True,
     vertex_budget: int = VERTEX_BUDGET,
+    max_match_cost: float | None = None,
 ) -> HandNormalisation:
     """
     Replace *model*'s hand mesh(es) with the optimised reference hand.
@@ -513,6 +565,16 @@ def normalise_hands(
     the *bones* are renamed onto the common naming, which is what lets the
     skeleton be shared and pooled so many weapons still fit one file.  Each
     weapon then shows its original hands (bone-sharing without hand-sharing).
+
+    *max_match_cost* guards against forcing the shared hand onto a rig it fits
+    badly.  The shared mesh is reposed onto the model's own bind, so when the
+    reference fingers align poorly (``match.score`` high) the reposed hand comes
+    out warped — ``v_bhdagger``/``v_hdagger`` score 3.92 and ``v_knifedragon``
+    1005.90 against 0.00 for a matching rig, and their fingers distort.  Above
+    the threshold the model keeps its own hand (``replace_mesh`` forced off);
+    the bones are still renamed, so it shares the skeleton and merely lands in
+    its own hands-bodygroup entry, which ``_collapse_shared_hands`` assigns via
+    ``pev_body`` automatically.
     """
     result = HandNormalisation(model_name=model.name)
 
@@ -538,6 +600,13 @@ def normalise_hands(
     result.pairs = match.pairs
     result.score = match.score
     result.unmapped = match.unmapped
+
+    # Too poor a fit to repose the shared hand onto without warping the fingers:
+    # keep this model's own hand mesh (bones are still renamed just below, so the
+    # skeleton is shared regardless).
+    if max_match_cost is not None and match.score > max_match_cost:
+        replace_mesh = False
+        result.kept_own_hand = True
 
     # Rename this model's hand bones onto the reference naming, everywhere:
     # reference mesh, every animation, and the QC's bone references.  This is
@@ -593,6 +662,14 @@ def normalise_hands(
         hand_meshes = [model.smds[key] for key in keys]
         new_hand = hand_meshes[0] if len(hand_meshes) == 1 else concat_meshes(hand_meshes)
 
+        # Kept because the reference matched too poorly to repose without warping
+        # the fingers: the mesh is the model's own (correct) hand, but re-anchor its
+        # few off-reference bones so pruning folds them and it still shares the one
+        # reference hand skeleton instead of inflating the merged bone count.
+        if result.kept_own_hand:
+            reference_names = {node.name for node in reference_hand.nodes}
+            _rebind_offrig_hand_verts(new_hand, reference_names)
+
         # The original CSO hands are high-poly; ~1/3 sit just over studiomdl's
         # 2048-vertex-per-submodel cap (the very limit the optimised hand exists
         # to dodge).  A single mesh cannot be split by grouping, so trim only the
@@ -612,6 +689,34 @@ def normalise_hands(
     hand_key = _unique_key(model, HAND_SMD_KEY)
     model.smds[hand_key] = new_hand
     result.replaced_keys.append(hand_key)
+
+    # A kept-own hand shares the reference *names* but may keep its own parent
+    # structure (v_bhdagger parents Bip01_L_Finger32 differently), which the merger
+    # would rename apart — inflating the skeleton.  Re-anchor its palm and fingers
+    # onto the reference hierarchy, in every SMD, so the hand is structurally
+    # identical to the shared one.  reparent re-solves each frame, so the own mesh
+    # renders unchanged; only the forearm (attached to the model's own arm) and the
+    # root are left as the model has them.  Doing it here, locally, keeps these few
+    # hand bones out of the global flatten, which would perturb bone pooling.
+    if result.kept_own_hand:
+        reference_hierarchy = _hierarchy(reference_hand)
+        targets = {
+            name: parent for name, parent in reference_hierarchy.items()
+            if parent is not None and "forearm" not in name.lower()
+        }
+        for smd in model.smds.values():
+            reparent(smd, targets)
+
+        # Keep every reference hand bone the model has, even joints its own mesh
+        # puts no geometry on (v_bhdagger's ring finger skips the middle knuckle).
+        # Pruning them would re-parent the surviving child onto a grandparent the
+        # shared hand keeps, so the merger sees one bone with two parents and renames
+        # the whole finger apart.  Held inert, the skeleton stays identical to the
+        # shared hand and the model still costs zero extra bones.
+        present = {node.name for smd in model.smds.values() for node in smd.nodes}
+        for node in reference_hand.nodes:
+            if node.name in present and node.name not in model.qc.keepbones:
+                model.qc.keepbones.append(node.name)
 
     # Drop exactly the entries that pointed at the superseded meshes, then put
     # the unified group where the first of them lived.  Groups are matched by
@@ -997,7 +1102,9 @@ def _ensure_anchor(smd: SMD, anchor: str, donor: SMD) -> bool:
     return True
 
 
-def flatten_conflicting_parents(models: list[ModelInput]) -> dict[str, list[str]]:
+def flatten_conflicting_parents(
+    models: list[ModelInput], protect: set[str] | None = None
+) -> dict[str, list[str]]:
     """
     Make every bone whose parent disagrees across *models* agree on one parent.
 
@@ -1017,7 +1124,17 @@ def flatten_conflicting_parents(models: list[ModelInput]) -> dict[str, list[str]
     blows v_spknife's idle past 64 KB; matching the majority keeps its weapon
     bones on the hand where they were.  :func:`goldsource.bonepool.reparent`
     re-solves every frame, so motion is unchanged.  Returns ``{model: [bones]}``.
+
+    *protect* names bones that must keep their own parent even when it disagrees
+    across models — the hand-mesh bones (palm and fingers).  Re-anchoring those
+    warps the shared, reposed hand: ``v_bhdagger`` and ``v_hdagger`` route the
+    palm through an extra joint (``Bip01_R_Hand`` under ``Bone02`` rather than
+    straight off the forearm), so flattening moved their palms and the fingers
+    came out distorted.  The forearm is *not* protected — it sits above the hand
+    mesh, is the conflict that actually inflates the skeleton, and reconciling it
+    is exactly what lets the knives share one 127-bone rig.
     """
+    protect = protect or set()
     hierarchies: dict[str, dict[str, str | None]] = {}
     for model in models:
         hierarchy: dict[str, str | None] = {}
@@ -1035,7 +1152,10 @@ def flatten_conflicting_parents(models: list[ModelInput]) -> dict[str, list[str]
         for bone, parent in hierarchy.items():
             parents_of.setdefault(bone, []).append(parent)
 
-    conflicting = {bone for bone, seen in parents_of.items() if len(set(seen)) > 1}
+    conflicting = {
+        bone for bone, seen in parents_of.items()
+        if len(set(seen)) > 1 and bone not in protect
+    }
     if not conflicting:
         return {}
 
@@ -1714,6 +1834,7 @@ def run(
     share_hands: bool = True,
     repose_hands: bool = True,
     keep_hand_mesh: bool = False,
+    hand_match_max_cost: float | None = 1.0,
     hand_variants: list[tuple[str | Path, str | Path]] | None = None,
     unify_skeleton: bool = True,
     pool_bones_pass: bool = True,
@@ -1792,11 +1913,24 @@ def run(
                 texture=None if keep_hand_mesh else hand_texture_name,
                 repose=repose_hands, replace_mesh=not keep_hand_mesh,
                 vertex_budget=vertex_budget,
+                max_match_cost=(
+                    hand_match_max_cost
+                    if not keep_hand_mesh and (hand_match_max_cost or 0) > 0
+                    else None
+                ),
             )
             prep.hands = normalisation
             if normalisation.ok:
                 pairs = ", ".join(f"{a}->{b}" for a, b in normalisation.pairs)
-                log(f"    hands rebound ({pairs}), match cost {normalisation.score:.2f}")
+                kept = " — kept own hand (match too poor to share)" \
+                    if normalisation.kept_own_hand else ""
+                log(f"    hands rebound ({pairs}), match cost "
+                    f"{normalisation.score:.2f}{kept}")
+                if normalisation.kept_own_hand:
+                    prep.warnings.append(
+                        f"hand match cost {normalisation.score:.2f} over "
+                        f"{hand_match_max_cost}; kept own hand mesh to avoid distortion"
+                    )
                 hand_keys_by_model[model.name] = list(normalisation.replaced_keys)
                 if normalisation.unmapped:
                     prep.warnings.append(
@@ -1880,7 +2014,18 @@ def run(
 
     if flatten_weapon_bones and len(prepared) > 1:
         log("--- flattening conflicting-parent bones to root")
-        flattened = flatten_conflicting_parents(prepared)
+        # Never re-anchor a hand-mesh bone (palm or finger) here: fingers hang off
+        # the palm and the shared rig is reposed onto each model's bind, so a global
+        # flatten of them perturbs pooling and can push an unrelated weapon sequence
+        # past studiomdl's 64 KB cap.  Kept-own hands are instead normalised onto the
+        # reference hand hierarchy locally (in normalise_hands), so no hand bone ever
+        # conflicts and none of this reaches flatten.  Only the forearm — above the
+        # mesh, the real inflation source — stays movable.
+        protect_hand = {
+            node.name for node in (reference_hand.nodes if reference_hand else [])
+            if "forearm" not in node.name.lower()
+        }
+        flattened = flatten_conflicting_parents(prepared, protect=protect_hand)
         if flattened:
             total = sum(len(bones) for bones in flattened.values())
             log(f"    re-parented {total} bone(s) across {len(flattened)} model(s) "
