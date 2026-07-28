@@ -23,7 +23,7 @@ from goldsource.compiler import compile_qc, find_studiomdl
 from goldsource.config import AppConfig
 from goldsource.hands import detect_rigs, load_reference_hand, match_hands
 from goldsource.merger import MergeConfig, ModelInput, ModelMerger
-from goldsource.pipeline import discover_models, run
+from goldsource.pipeline import discover_models, plan_sequence_parts, run, sequence_count
 
 
 DEFAULT_HAND = Path("storage") / "hands" / "default_hand.smd"
@@ -164,10 +164,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(message)
 
-    result = run(
-        inputs=args.inputs,
-        output_dir=args.output,
-        model_name=model_name,
+    # Everything shared by every output (only inputs/output/name vary per part).
+    common = dict(
         hand_smd=args.hands if args.normalise else None,
         hand_texture=_resolve_hand_texture(args) if args.normalise else None,
         normalise=args.normalise,
@@ -203,9 +201,37 @@ def cmd_merge(args: argparse.Namespace) -> int:
         log=log,
     )
 
-    print()
-    print(result.summary())
+    max_seq = getattr(args, "max_sequences", None)
+    parts = plan_sequence_parts(args.inputs, args.exclude, max_seq)
 
+    if len(parts) <= 1:
+        result = run(inputs=args.inputs, output_dir=args.output,
+                     model_name=model_name, **common)
+        print()
+        print(result.summary())
+        return _merge_exit_code(result)
+
+    # Too many sequences for one model: emit <name>_part_1, _part_2, …
+    base = model_name[:-4] if model_name.lower().endswith(".mdl") else model_name
+    totals = [sum(sequence_count(d) for d in group) for group in parts]
+    log(f"--- {sum(totals)} sequences over the {max_seq} cap: splitting into "
+        f"{len(parts)} models ({', '.join(f'{t} seq' for t in totals)})")
+    worst = 0
+    for index, group in enumerate(parts, start=1):
+        part_name = f"{base}_part_{index}"
+        part_out = str(Path(args.output) / part_name)
+        log(f"=== part {index}/{len(parts)}: {part_name} — "
+            f"{len(group)} models, {totals[index - 1]} sequences ===")
+        result = run(inputs=[str(d) for d in group], output_dir=part_out,
+                     model_name=part_name + ".mdl", **common)
+        print()
+        print(result.summary())
+        worst = max(worst, _merge_exit_code(result))
+    return worst
+
+
+def _merge_exit_code(result) -> int:
+    """0 unless the build failed to compile or blew a hard limit."""
     if result.compile is not None and not result.compile.ok:
         output = result.compile.stdout.strip()
         if output:
@@ -213,13 +239,10 @@ def cmd_merge(args: argparse.Namespace) -> int:
             print("studiomdl output:")
             print(output)
         return 1
-
     if result.exceeds_bodygroup_limits:
         return 1
-
     if result.merge is not None and result.merge.report.exceeds_limit:
         return 1
-
     return 0
 
 
@@ -458,6 +481,12 @@ def build_parser(merge_config: dict | None = None) -> argparse.ArgumentParser:
     merge.add_argument("--index-sequences", action="store_true",
         help="rename every sequence to {model}_seq_{i} for easy identification "
              "in Model Viewer (original names kept as models.ini keys)")
+    merge.add_argument("--max-sequences", dest="max_sequences", type=int, default=None,
+                       metavar="N",
+                       help="if the models together hold more than N animation sequences, "
+                            "spread them across several output models named "
+                            "<name>_part_1, <name>_part_2, … (each within N). Some engines "
+                            "cap sequences per view model")
     merge.add_argument("--rename", action="append", metavar="FIND=REPLACE",
                        help="sequence name rewrite rule (repeatable)")
     merge.add_argument("--config", metavar="JSON",

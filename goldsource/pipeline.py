@@ -197,6 +197,55 @@ def discover_models(root: str | Path) -> list[Path]:
     return found
 
 
+def sequence_count(directory: Path) -> int:
+    """How many ``$sequence`` clips the model in *directory* declares."""
+    qcs = list(Path(directory).glob("*.qc"))
+    return len(QC.from_file(qcs[0]).sequences) if qcs else 0
+
+
+def plan_sequence_parts(
+    inputs: list[str | Path],
+    exclude: list[str] | None = None,
+    max_sequences: int | None = None,
+) -> list[list[Path]]:
+    """
+    Split the discovered model directories into groups whose combined
+    ``$sequence`` count each stays within *max_sequences*.
+
+    The merged model's sequence total is the sum of its models' clips, and some
+    engines cap how many a view model may hold; over that cap the extra sequences
+    are unusable, so the build has to be spread across several models
+    (``v_x_part_1`` …).  Models keep their given order and each is placed whole —
+    a single model with more clips than *max_sequences* still gets its own part
+    (it cannot be divided without breaking that weapon).  Returns one group when
+    no split is needed (``max_sequences`` unset or the total already fits).
+    """
+    excluded = {name.lower() for name in (exclude or [])}
+    directories: list[Path] = []
+    for item in inputs:
+        for directory in discover_models(item):
+            if directory.name.lower() in excluded or directory in directories:
+                continue
+            directories.append(directory)
+
+    if not max_sequences or max_sequences <= 0:
+        return [directories]
+
+    groups: list[list[Path]] = []
+    current: list[Path] = []
+    running = 0
+    for directory in directories:
+        count = sequence_count(directory)
+        if current and running + count > max_sequences:
+            groups.append(current)
+            current, running = [], 0
+        current.append(directory)
+        running += count
+    if current:
+        groups.append(current)
+    return groups or [directories]
+
+
 # ---------------------------------------------------------------------------
 # Per-model preparation
 # ---------------------------------------------------------------------------
