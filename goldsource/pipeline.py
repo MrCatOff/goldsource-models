@@ -69,6 +69,19 @@ from goldsource.skeleton import (
 from goldsource.smd import SMD, BoneTransform, Node, SkeletonFrame
 
 
+# Per-finger FABRIK retarget (TS.md Stage 3).  OFF: it was measured to regress
+# tightly-gripped pistols — a donor finger too long for the grip gap bulges into
+# the weapon regardless of where its tip lands (v_anaconda tip penetration 8x
+# worse), and some clipping is knuckle-placement, not curl.  Left in place as the
+# groundwork for a penetration-aware Stage 4 solve; the default retarget keeps
+# the known-good rotation-copy.  See _retarget_fingers_to_reference.
+_FINGER_IK = False
+
+# Bounded constant wrist offset (TS.md Stage 4 §8.3): lift the shared hand out of
+# the weapon where the donor hand's placement buries it (v_usp knuckles ~50u deep).
+# Bone lengths untouched (a palm translation only); ON by default.
+_WRIST_OFFSET = True
+
 SHARED_HAND_KEY = "_shared/hand"
 HAND_SMD_KEY = "hands"
 # Name for the packed always-on weapon parts.
@@ -778,13 +791,152 @@ def _shared_hand_excess_penetration(
     return shared_pen - own_pen
 
 
+def _swing_rotation(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Minimal 3×3 rotation taking direction *a* onto direction *b* (a pure swing,
+    no roll about the axis).  Used to redirect a bone onto the IK-solved bone
+    direction while leaving the weapon's roll — which side the nail faces —
+    untouched.
+    """
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    s = float(np.linalg.norm(v))
+    if s < 1e-9:
+        if c > 0.0:
+            return np.eye(3)
+        # Antiparallel: 180° about any axis perpendicular to a.
+        perp = np.cross(a, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(perp) < 1e-6:
+            perp = np.cross(a, np.array([0.0, 1.0, 0.0]))
+        perp = perp / np.linalg.norm(perp)
+        k = np.array([[0.0, -perp[2], perp[1]],
+                      [perp[2], 0.0, -perp[0]],
+                      [-perp[1], perp[0], 0.0]])
+        return np.eye(3) + 2.0 * (k @ k)          # Rodrigues at θ=π
+    k = np.array([[0.0, -v[2], v[1]],
+                  [v[2], 0.0, -v[0]],
+                  [-v[1], v[0], 0.0]])
+    return np.eye(3) + k + (k @ k) * (1.0 / (1.0 + c))
+
+
+def _fabrik_solve(base: np.ndarray, lengths: list[float], target: np.ndarray,
+                  init: list[np.ndarray], iters: int = 16, tol: float = 1e-3
+                  ) -> list[np.ndarray]:
+    """
+    FABRIK: solve joint positions of a chain of fixed *lengths* rooted at *base*
+    so the end reaches *target*, seeded from *init* (``len(lengths)+1`` points).
+
+    Fixed segment length is FABRIK's defining invariant, which is exactly the
+    dimension guarantee we need — a donor bone length is never touched, only the
+    joint angles change.  When the target is out of reach the chain straightens
+    toward it (donor finger shorter than the original needs); when it is in reach
+    the longer donor finger simply curls further, which is the point.
+    """
+    pts = [p.astype(float).copy() for p in init]
+    n = len(lengths)
+    reach = float(sum(lengths))
+    to_target = target - base
+    if float(np.linalg.norm(to_target)) >= reach:
+        d = to_target / (float(np.linalg.norm(to_target)) + 1e-12)
+        acc = base.astype(float).copy()
+        pts[0] = acc.copy()
+        for i in range(n):
+            acc = acc + d * lengths[i]
+            pts[i + 1] = acc.copy()
+        return pts
+    for _ in range(iters):
+        pts[n] = target.astype(float).copy()
+        for i in range(n - 1, -1, -1):          # backward reaching
+            d = pts[i] - pts[i + 1]
+            d /= (float(np.linalg.norm(d)) + 1e-12)
+            pts[i] = pts[i + 1] + d * lengths[i]
+        pts[0] = base.astype(float).copy()
+        for i in range(n):                       # forward reaching
+            d = pts[i + 1] - pts[i]
+            d /= (float(np.linalg.norm(d)) + 1e-12)
+            pts[i + 1] = pts[i] + d * lengths[i]
+        if float(np.linalg.norm(pts[n] - target)) < tol:
+            break
+    return pts
+
+
+def _leaf_tip_local(mesh: SMD, leaf_id: int | None, bind_world: np.ndarray | None
+                    ) -> np.ndarray | None:
+    """
+    Bone-local offset of a finger's **distal tip** — the mesh vertex bound to the
+    leaf phalanx that sits farthest from its joint, expressed in the leaf bone's
+    bind frame.  SMD reference vertices live in reference-pose *world* space, so
+    the bind world inverse brings them local.  ``None`` if nothing is bound to
+    the leaf (then that finger falls back to the plain rotation swap).
+    """
+    if leaf_id is None or bind_world is None:
+        return None
+    inv = np.linalg.inv(bind_world)
+    best: np.ndarray | None = None
+    best_d = -1.0
+    for triangle in mesh.triangles:
+        for v in triangle.vertices:
+            if v.bone_id != leaf_id:
+                continue
+            local = inv @ np.array([v.x, v.y, v.z, 1.0])
+            d = float(np.linalg.norm(local[:3]))
+            if d > best_d:
+                best_d, best = d, local[:3]
+    return best
+
+
+def _solve_frame_fingers(plans: list[dict], shared: dict[str, np.ndarray],
+                         world: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """
+    One animation frame: return ``{finger bone name → new 3×3 LOCAL rotation}``
+    that curls each donor-length finger so its tip lands on the **original**
+    fingertip instead of overshooting into the weapon (see
+    :func:`_retarget_fingers_to_reference`).
+    """
+    out: dict[str, np.ndarray] = {}
+    for plan in plans:
+        palm = plan["palm"]
+        bones = plan["bones"]
+        if palm not in world or not all(b in world for b in bones):
+            continue
+        palm_w = world[palm]
+        seg = plan["seg"]
+        axis = plan["axis"]
+        # Base: the knuckle placed at the DONOR offset from the (unchanged) palm.
+        base = (palm_w @ np.append(shared[bones[0]][:3, 3], 1.0))[:3]
+        # Current world direction of each bone's donor axis under the weapon's
+        # own rotation — the roll to keep, and the (overshooting) seed pose.
+        cur_dir = [world[name][:3, :3] @ axis[i] for i, name in enumerate(bones)]
+        init = [base.copy()]
+        acc = base.copy()
+        for i in range(len(bones)):
+            acc = acc + seg[i] * (cur_dir[i] / (float(np.linalg.norm(cur_dir[i])) + 1e-12))
+            init.append(acc.copy())
+        # Goal: where the original finger tip actually was this frame — the point
+        # the artist placed on the weapon surface.
+        goal = (world[bones[-1]] @ np.append(plan["own_tip"], 1.0))[:3]
+        pts = _fabrik_solve(base, seg, goal, init)
+        # Positions → per-bone local rotation: swing each bone's original world
+        # rotation onto the solved direction, then express it relative to the new
+        # parent.  Forcing the donor translation on write reproduces these exact
+        # positions, so bone lengths stay byte-identical.
+        parent_rot = palm_w[:3, :3]
+        for i, name in enumerate(bones):
+            world_rot = _swing_rotation(cur_dir[i], pts[i + 1] - pts[i]) @ world[name][:3, :3]
+            out[name] = parent_rot.T @ world_rot
+            parent_rot = world_rot
+    return out
+
+
 def _retarget_fingers_to_reference(
-    model: ModelInput, reference_hand: SMD, donor: SMD
+    model: ModelInput, reference_hand: SMD, reference_rigs: list, donor: SMD
 ) -> int:
     """
     Rewrite every animation's **finger** bones so they drive the shared reference
-    hand without stretching, keeping the weapon's finger pose (the grip and its
-    motion) but the reference hand's bone *lengths*.  Returns bone-frames rewritten.
+    hand without stretching *and* without clipping into the weapon.  Returns
+    bone-frames rewritten.
 
     A single shared hand mesh cannot be re-posed per weapon (see
     :func:`_repose_hand_to_model`), so when every weapon shares one fixed hand
@@ -793,21 +945,20 @@ def _retarget_fingers_to_reference(
     driving the shared mesh — whose vertices expect the reference hand's lengths —
     with them stretches the fingers, and where a source bone is much longer or
     shorter a triangle explodes into a sliver (v_bhdagger's worst edge reached
-    36x).  This is exactly the mismatch re-posing cancels for the mesh; here we
-    cancel it on the animation instead.
+    36x).  So the reference finger's translation is forced in ``[R | S_trans]``,
+    giving the bone exactly the length the mesh was bound to.
 
-    Each finger frame keeps the weapon's **absolute** local rotation and only
-    swaps in the reference finger's translation ``[A_rot | S_trans]``.  The
-    rotation is what curls the finger, so the weapon's grip and its per-frame
-    motion carry over verbatim; forcing ``S``'s translation gives the bone the
-    length the mesh was bound to, so it moves rigidly and cannot stretch.  A
-    *delta* transfer (``S·W⁻¹·A``) was tried first and left the fingers frozen at
-    the reference hand's **open** rest: these weapon hands are authored already
-    gripping the weapon, so the motion relative to that grip-rest is almost
-    nothing and the reference hand's own rest (open) showed through.  Palm and
-    forearm are left on the weapon's own animation, so the hand still sits exactly
-    where it grips the weapon.  *donor* is unused now but kept for signature
-    stability.
+    Keeping the weapon's rotation verbatim (the old behaviour) leaves the grip
+    off by the donor/original length difference: the donor fingers run ~5–9%
+    longer, so the same curl overshoots the original fingertip and sinks the tip
+    into the gun (v_deagle/v_usp visibly, v_anaconda barely).  So the rotation is
+    re-solved per finger by **FABRIK** (:func:`_solve_frame_fingers`) with the
+    goal set to the *original* hand's fingertip world position at that frame — the
+    contact point the artist authored — so a longer finger curls further and lands
+    on the surface instead of through it.  Only rotations change; the forced donor
+    translation keeps every bone length byte-identical, so the compile-gate drift
+    stays exactly 0.  Palm and forearm are left on the weapon's own animation, so
+    the hand still sits exactly where it grips the weapon.
     """
     is_finger = lambda name: "finger" in name.lower()
     reference_id = {node.id: node.name for node in reference_hand.nodes}
@@ -821,28 +972,650 @@ def _retarget_fingers_to_reference(
     if not shared:
         return 0
 
+    # One FABRIK plan per finger chain: donor segment lengths + the axis toward
+    # each child (all in reference dimensions), plus the model's own distal-tip
+    # offset that fixes where the tip must land.
+    ref_bind = world_transforms(reference_hand, 0)
+    ref_id = {n.name: n.id for n in reference_hand.nodes}
+    own_bind = world_transforms(donor, 0)
+    own_id = {n.name: n.id for n in donor.nodes}
+    plans: list[dict] = []
+    for rig in (reference_rigs or []) if _FINGER_IK else []:
+        for chain in rig.chains:
+            if not all(b in shared for b in chain):
+                continue
+            leaf = chain[-1]
+            ref_tip = _leaf_tip_local(reference_hand, ref_id.get(leaf), ref_bind.get(leaf))
+            own_tip = _leaf_tip_local(donor, own_id.get(leaf), own_bind.get(leaf))
+            if ref_tip is None or own_tip is None:
+                continue                      # no distal geometry → plain swap
+            seg: list[float] = []
+            axis: list[np.ndarray] = []
+            for i, name in enumerate(chain):
+                off = shared[chain[i + 1]][:3, 3] if i + 1 < len(chain) else ref_tip
+                length = max(float(np.linalg.norm(off)), 1e-6)
+                seg.append(length)
+                axis.append(off / length)
+            plans.append({"palm": rig.hand, "bones": list(chain),
+                          "seg": seg, "axis": axis, "own_tip": own_tip})
+
     count = 0
     for smd in model.smds.values():
         id_to_name = {node.id: node.name for node in smd.nodes}
+        if smd.is_animation:
+            for frame_index, frame in enumerate(smd.skeleton):
+                world = world_transforms(smd, frame_index)   # weapon pose, pre-rewrite
+                new_rot = _solve_frame_fingers(plans, shared, world)
+                for bone in frame.bones:
+                    name = id_to_name.get(bone.bone_id)
+                    if name not in shared:
+                        continue
+                    local = _mat4_from_bt(bone).copy()       # weapon grip + motion
+                    if name in new_rot:
+                        local[:3, :3] = new_rot[name]        # FABRIK-corrected curl
+                    local[:3, 3] = shared[name][:3, 3]       # reference length (locked)
+                    solved = _bt_from_mat4(bone.bone_id, local)
+                    bone.tx, bone.ty, bone.tz = solved.tx, solved.ty, solved.tz
+                    bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
+                    count += 1
+        else:
+            # A reference (non-animation) mesh: agree with the shared hand's finger
+            # bind so studiomdl's single per-bone bind is consistent.  The weapon's
+            # own hand mesh is replaced, so its finger verts never render here.
+            for frame in smd.skeleton:
+                for bone in frame.bones:
+                    name = id_to_name.get(bone.bone_id)
+                    if name not in shared:
+                        continue
+                    solved = _bt_from_mat4(bone.bone_id, shared[name])
+                    bone.tx, bone.ty, bone.tz = solved.tx, solved.ty, solved.tz
+                    bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
+                    count += 1
+    return count
+
+
+# Bounded wrist offset (TS.md Stage 4 / §8.3, "cheap variant"): the max distance
+# the hand may be lifted out of the weapon, in units, and the line-search step.
+_WRIST_OFFSET_MAX = 1.5
+_WRIST_OFFSET_STEP = 0.1
+
+
+def _signed_to_surface(points: np.ndarray, wP: np.ndarray, wN: np.ndarray
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    For each of *points*, the distance to the nearest weapon vertex and the
+    signed distance along that vertex's outward normal (negative = inside the
+    weapon).  Batched to keep the pairwise distance matrix small.
+    """
+    idx = np.empty(len(points), dtype=int)
+    dist = np.empty(len(points))
+    for i in range(0, len(points), 256):
+        batch = points[i:i + 256]
+        d = np.linalg.norm(batch[:, None, :] - wP[None, :, :], axis=2)
+        idx[i:i + 256] = d.argmin(1)
+        dist[i:i + 256] = d.min(1)
+    signed = np.einsum("ij,ij->i", points - wP[idx], wN[idx])
+    return dist, signed, idx
+
+
+def _apply_wrist_offsets(model: ModelInput, reference_hand: SMD,
+                         reference_rigs: list, donor: SMD) -> int:
+    """
+    Lift the shared hand out of the weapon with a **bounded constant wrist offset**
+    per hand (TS.md Stage 4, cheap variant §8.3).  Returns hands offset.
+
+    Rotation retargeting (:func:`_retarget_fingers_to_reference`) fixes the finger
+    *shape* but not placement: the donor hand can sit *inside* the gun — on the
+    tightly-gripped pistols the knuckle row of v_usp is buried ~50 units deep, a
+    pure placement error no finger-curl solve can reach.  So the whole hand below
+    the palm is translated rigidly, just far enough to clear the surface.
+
+    Only **rotations were touched before and only a palm translation here**, so
+    every bone length stays byte-identical.  The offset is solved once on the idle
+    frame — the direction is the mean outward weapon normal under the penetrating
+    finger vertices, the distance a line search that stops as soon as penetration
+    clears (capped at :data:`_WRIST_OFFSET_MAX`, so the grip cannot float away) —
+    then held constant across all frames, expressed in the forearm frame so it
+    tracks the arm.  It is applied to the **palm** bone: on these rigs the weapon
+    hangs off the forearm as a sibling of the palm, so the gun does not move; where
+    a weapon bone *does* descend from the palm (v_anaconda), its world transform is
+    restored per frame so the gun stays pinned exactly.
+    """
+    slots = _hand_slots(model, _HANDS_GROUP_RE)
+    hand_keys = {slot.key for slot in slots}
+    weapon_meshes = [smd for key, smd in model.smds.items()
+                     if not smd.is_animation and key not in hand_keys and smd.triangles]
+    idle = next((smd for key, smd in model.smds.items()
+                 if smd.is_animation and "idle" in key.lower() and smd.skeleton), None)
+    if idle is None:
+        idle = next((smd for smd in model.smds.values()
+                     if smd.is_animation and smd.skeleton), None)
+    if not weapon_meshes or idle is None or not reference_rigs:
+        return 0
+
+    ref_bind = world_transforms(reference_hand, 0)
+    ref_id = {n.name: n.id for n in reference_hand.nodes}
+    ref_id_to_name = {n.id: n.name for n in reference_hand.nodes}
+    is_finger = lambda name: "finger" in name.lower()
+
+    idle_pose = world_transforms(idle, 0)
+    weapon_pts: list[np.ndarray] = []
+    weapon_nrm: list[np.ndarray] = []
+    for mesh in weapon_meshes:
+        p, n = _posed_world_verts(mesh, world_transforms(mesh, 0), idle_pose)
+        if len(p):
+            weapon_pts.append(p)
+            weapon_nrm.append(n)
+    if not weapon_pts:
+        return 0
+    wP = np.vstack(weapon_pts)
+    wN = np.vstack(weapon_nrm)
+    wN = wN / (np.linalg.norm(wN, axis=1, keepdims=True) + 1e-9)
+
+    applied = 0
+    for rig in reference_rigs:
+        palm, forearm = rig.hand, rig.forearm
+        if palm not in idle_pose or (forearm and forearm not in idle_pose):
+            continue
+        chain_fingers = {b for chain in rig.chains for b in chain}
+        # Idle-frame finger vertices of the donor hand, posed by the model's anim.
+        xform = {name: idle_pose[name] @ np.linalg.inv(ref_bind[name])
+                 for name in ref_bind if name in idle_pose}
+        finger_pts: list[np.ndarray] = []
+        for triangle in reference_hand.triangles:
+            for v in triangle.vertices:
+                name = ref_id_to_name.get(v.bone_id)
+                if name in chain_fingers and name in xform:
+                    finger_pts.append((xform[name] @ np.array([v.x, v.y, v.z, 1.0]))[:3])
+        if not finger_pts:
+            continue
+        fp = np.array(finger_pts)
+
+        dist, signed, idx = _signed_to_surface(fp, wP, wN)
+        inside = (dist < 3.0) & (signed < -0.15)
+        if not inside.any():
+            continue                                    # already clear of the gun
+        # Push direction: mean outward normal where the fingers are buried.
+        direction = wN[idx[inside]].mean(axis=0)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-6:
+            continue
+        direction = direction / norm
+
+        # Line search: smallest lift that clears (or minimises) penetration.
+        def penetration(shift: float) -> float:
+            _, s, _ = _signed_to_surface(fp + shift * direction, wP, wN)
+            near = s > -3.0
+            return float((-s[near & (s < -0.15)]).sum())
+
+        base_pen = penetration(0.0)
+        best_t, best_pen = 0.0, base_pen
+        t = _WRIST_OFFSET_STEP
+        while t <= _WRIST_OFFSET_MAX + 1e-9:
+            pen = penetration(t)
+            if pen < best_pen - 1e-6:
+                best_pen, best_t = pen, t
+            if pen <= 0.01 * base_pen:                  # cleared — stop, stay close
+                best_pen, best_t = pen, t
+                break
+            t += _WRIST_OFFSET_STEP
+        if best_t <= 0.0:
+            continue
+
+        # World lift → constant offset in the forearm frame (tracks the arm).
+        anchor = forearm if forearm and forearm in idle_pose else palm
+        forearm_rot = idle_pose[anchor][:3, :3]
+        offset = forearm_rot.T @ (best_t * direction)   # in palm's parent frame
+
+        _shift_palm(model, palm, chain_fingers, offset)
+        applied += 1
+    return applied
+
+
+def _shift_palm(model: ModelInput, palm: str, chain_fingers: set[str],
+                offset: np.ndarray) -> None:
+    """
+    Add *offset* (in the palm's parent frame) to the palm bone's local translation
+    in every animation frame, so the whole hand below it rides along.  Any weapon
+    bone that descends from the palm is a direct non-finger child; its world
+    transform is restored per frame so the gun stays pinned.
+    """
+    for smd in model.smds.values():
+        if not smd.is_animation:
+            continue
+        name_to_id = {n.name: n.id for n in smd.nodes}
+        id_to_name = {n.id: n.name for n in smd.nodes}
+        palm_id = name_to_id.get(palm)
+        if palm_id is None:
+            continue
+        child_map: dict[int, list[int]] = {}
+        for n in smd.nodes:
+            child_map.setdefault(n.parent_id, []).append(n.id)
+        weapon_children = [c for c in child_map.get(palm_id, [])
+                           if id_to_name.get(c) not in chain_fingers]
+        for frame_index, frame in enumerate(smd.skeleton):
+            bt = {b.bone_id: b for b in frame.bones}
+            palm_bone = bt.get(palm_id)
+            if palm_bone is None:
+                continue
+            # Record the gun-carrying children's world before the palm moves.
+            saved = {}
+            if weapon_children:
+                world = world_transforms(smd, frame_index)
+                for c in weapon_children:
+                    nm = id_to_name.get(c)
+                    if nm in world:
+                        saved[c] = world[nm]
+            palm_bone.tx += float(offset[0])
+            palm_bone.ty += float(offset[1])
+            palm_bone.tz += float(offset[2])
+            if saved:
+                new_palm_world = world_transforms(smd, frame_index)[palm]
+                inv_palm = np.linalg.inv(new_palm_world)
+                for c, world_c in saved.items():
+                    child = bt.get(c)
+                    if child is None:
+                        continue
+                    solved = _bt_from_mat4(c, inv_palm @ world_c)
+                    child.tx, child.ty, child.tz = solved.tx, solved.ty, solved.tz
+                    child.rx, child.ry, child.rz = solved.rx, solved.ry, solved.rz
+
+
+# Per-finger curl relief (TS.md Stage 4 penetration term): the most a finger may
+# be un-curled toward the open bind (fraction of the grip->open rotation), and the
+# line-search step.  Bounded so the grip stays a grip.
+_FINGER_RELAX = True
+_RELAX_MAX = 0.5
+_RELAX_STEP = 0.05
+_RELAX_GATE = 0.2       # target max finger penetration depth (units)
+
+
+def _axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
+    """3×3 rotation of *angle* radians about unit *axis* (Rodrigues)."""
+    k = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]])
+    return np.eye(3) + np.sin(angle) * k + (1.0 - np.cos(angle)) * (k @ k)
+
+
+def _rotate_toward(current: np.ndarray, target: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Rotate *current* a fraction *alpha* of the way toward *target* (both 3×3, same
+    frame).  ``alpha=0`` keeps the grip; ``alpha=1`` reaches the open bind.  Used
+    to back a finger's flexion off just enough to lift it out of the weapon.
+    """
+    rel = target @ current.T
+    cos = (np.trace(rel) - 1.0) / 2.0
+    angle = float(np.arccos(max(-1.0, min(1.0, cos))))
+    if angle < 1e-6:
+        return current
+    ax = np.array([rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]])
+    n = float(np.linalg.norm(ax))
+    if n < 1e-9:
+        return current                              # ~180°: leave as-is (rare here)
+    return _axis_angle_matrix(ax / n, angle * alpha) @ current
+
+
+def _relax_finger_curl(model: ModelInput, reference_hand: SMD,
+                       reference_rigs: list) -> int:
+    """
+    Un-curl each finger toward the open bind just enough that it stops clipping the
+    weapon (TS.md Stage 4 penetration term, cheap constant-per-finger variant).
+    Returns fingers relaxed.
+
+    The donor fingers run 5-9% longer than the originals, so after rotation copy
+    they wrap the grip a touch too deep and the pads poke through (~0.4-0.9 units on
+    most pistols — a wrap-around penetration a rigid wrist offset cannot reach,
+    since lifting one side of the finger buries the other).  Per finger, the smallest
+    fraction of the grip->open rotation that clears the surface is solved on the idle
+    frame and held constant across all frames, so the finger still animates and grips
+    — just a hair looser.  Rotations only; bone lengths are never touched.
+    """
+    slots = _hand_slots(model, _HANDS_GROUP_RE)
+    hand_keys = {slot.key for slot in slots}
+    weapon_meshes = [smd for key, smd in model.smds.items()
+                     if not smd.is_animation and key not in hand_keys and smd.triangles]
+    idle = next((smd for key, smd in model.smds.items()
+                 if smd.is_animation and "idle" in key.lower() and smd.skeleton), None)
+    if idle is None:
+        idle = next((smd for smd in model.smds.values()
+                     if smd.is_animation and smd.skeleton), None)
+    if not weapon_meshes or idle is None or not reference_rigs:
+        return 0
+
+    ref_bind = world_transforms(reference_hand, 0)
+    ref_id_to_name = {n.id: n.name for n in reference_hand.nodes}
+    open_rot = {}
+    if reference_hand.skeleton:
+        for bone in reference_hand.skeleton[0].bones:
+            name = ref_id_to_name.get(bone.bone_id, "")
+            if "finger" in name.lower():
+                open_rot[name] = _mat4_from_bt(bone)[:3, :3]
+
+    # Reference-hand vertices grouped by the finger bone they ride.
+    verts_by_bone: dict[str, list[np.ndarray]] = {}
+    for triangle in reference_hand.triangles:
+        for v in triangle.vertices:
+            name = ref_id_to_name.get(v.bone_id)
+            if name in open_rot:
+                verts_by_bone.setdefault(name, []).append(np.array([v.x, v.y, v.z, 1.0]))
+    verts_by_bone = {k: np.array(v) for k, v in verts_by_bone.items()}
+
+    id_to_name_idle = {n.id: n.name for n in idle.nodes}
+    name_to_id_idle = {n.name: n.id for n in idle.nodes}
+
+    # Solve over several idle frames, not one: an un-curl that clears frame 0 but
+    # digs in as the grip shifts would otherwise be accepted and make things worse.
+    count = len(idle.skeleton)
+    # Sample the idle densely (~10 poses spread across it): a constant backoff
+    # solved on a sparse set can dig in on the poses between, so validate on many.
+    step = max(1, count // 10)
+    frame_indices = sorted({min(f, count - 1) for f in range(0, count, step)})
+    frames: list[tuple] = []
+    for fi in frame_indices:
+        pose = world_transforms(idle, fi)
+        wp, wn = [], []
+        for mesh in weapon_meshes:
+            p, n = _posed_world_verts(mesh, world_transforms(mesh, 0), pose)
+            if len(p):
+                wp.append(p)
+                wn.append(n)
+        if not wp:
+            continue
+        wP = np.vstack(wp)
+        wN = np.vstack(wn)
+        wN = wN / (np.linalg.norm(wN, axis=1, keepdims=True) + 1e-9)
+        local = {id_to_name_idle[b.bone_id]: _mat4_from_bt(b)
+                 for b in idle.skeleton[fi].bones if b.bone_id in id_to_name_idle}
+        frames.append((pose, wP, wN, local))
+    if not frames:
+        return 0
+
+    def finger_penetration(chain: list[str], alpha: float) -> float:
+        """
+        **Deepest** penetration of *chain*'s verts, un-curled by *alpha*, over the
+        sampled frames.  Max, not sum: the visible defect is the single deepest
+        poke, and minimising the sum can trade many shallow pokes for a few deeper
+        ones — lowering the total while making the clipping look *worse*.
+        """
+        parent_name = _parent_of(idle, chain[0], name_to_id_idle, id_to_name_idle)
+        worst = 0.0
+        for pose, wP, wN, local in frames:
+            parent_world = pose.get(parent_name)
+            if parent_world is None:
+                continue
+            pts = []
+            world_c = parent_world
+            for name in chain:
+                lm = local.get(name)
+                if lm is None:
+                    break
+                rot = _rotate_toward(lm[:3, :3], open_rot[name], alpha) if alpha > 0 else lm[:3, :3]
+                m = np.eye(4)
+                m[:3, :3] = rot
+                m[:3, 3] = lm[:3, 3]
+                world_c = world_c @ m
+                if name in verts_by_bone and name in ref_bind:
+                    xf = world_c @ np.linalg.inv(ref_bind[name])
+                    pts.append((verts_by_bone[name] @ xf.T)[:, :3])
+            if not pts:
+                continue
+            hp = np.vstack(pts)
+            _, signed, _ = _signed_to_surface(hp, wP, wN)
+            deep = -signed[(signed < -0.15) & (signed > -3.0)]
+            if len(deep):
+                worst = max(worst, float(deep.max()))
+        return worst
+
+    idle_local = frames[0][3]
+    alphas: dict[str, float] = {}
+    for rig in reference_rigs:
+        for chain in rig.chains:
+            if not all(b in open_rot and b in idle_local for b in chain):
+                continue
+            base = finger_penetration(chain, 0.0)
+            if base <= _RELAX_GATE:
+                continue                            # already within the depth gate
+            best_a, best_pen = 0.0, base
+            a = _RELAX_STEP
+            while a <= _RELAX_MAX + 1e-9:
+                pen = finger_penetration(chain, a)
+                if pen < best_pen - 1e-6:            # only accept a real improvement
+                    best_pen, best_a = pen, a
+                if pen <= _RELAX_GATE:               # cleared the gate — stop, stay close
+                    break
+                a += _RELAX_STEP
+            if best_a > 0.0:
+                for name in chain:
+                    alphas[name] = best_a
+
+    if not alphas:
+        return 0
+    _apply_finger_relax(model, alphas, open_rot)
+    return len(alphas)
+
+
+def _parent_of(smd: SMD, name: str, name_to_id: dict, id_to_name: dict) -> str | None:
+    """Name of *name*'s parent bone in *smd* (the palm, for a finger root)."""
+    nid = name_to_id.get(name)
+    by_id = {n.id: n for n in smd.nodes}
+    node = by_id.get(nid)
+    if node is None:
+        return None
+    return id_to_name.get(node.parent_id)
+
+
+def _apply_finger_relax(model: ModelInput, alphas: dict[str, float],
+                        open_rot: dict[str, np.ndarray]) -> None:
+    """
+    Rotate each finger bone in *alphas* a constant fraction toward its open bind, in
+    every animation frame, preserving the per-frame grip motion and the donor length.
+    """
+    for smd in model.smds.values():
+        if not smd.is_animation:
+            continue
+        id_to_name = {n.id: n.name for n in smd.nodes}
         for frame in smd.skeleton:
             for bone in frame.bones:
                 name = id_to_name.get(bone.bone_id)
-                if name not in shared:
+                alpha = alphas.get(name)
+                if alpha is None:
                     continue
-                if smd.is_animation:
-                    local = _mat4_from_bt(bone).copy()   # weapon's grip + finger motion
-                    local[:3, 3] = shared[name][:3, 3]   # reference hand's bone length
-                else:
-                    # A reference (non-animation) mesh: agree with the shared hand's
-                    # finger bind so studiomdl's single per-bone bind is consistent.
-                    # The weapon's own hand mesh is replaced, so its finger vertices
-                    # never render at this bind.
-                    local = shared[name]
+                local = _mat4_from_bt(bone)
+                local[:3, :3] = _rotate_toward(local[:3, :3], open_rot[name], alpha)
                 solved = _bt_from_mat4(bone.bone_id, local)
                 bone.tx, bone.ty, bone.tz = solved.tx, solved.ty, solved.tz
                 bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
-                count += 1
-    return count
+
+
+# Full per-frame penetration solve (TS.md Stage 4 §8.2).  OFF: measured to be both
+# impractical (~4 min/model — a per-frame weapon re-pose) and unreliable on exactly
+# the grips it was meant for.  It helps mid cases (v_bglock18 0.80->0.53u) but makes
+# the tightest wrap-around WORSE (v_usp 0.71->0.83u): a finger hooked >90° round a
+# cylindrical grip cannot be rotated out of one wall without poking the other, so
+# rotation-only optimisation just trades penetration between sides.  For those grips
+# the donor hand geometrically does not fit — keep-own is the honest answer.  Left in
+# place as documented groundwork.
+_CONTACT_FIT = False
+_GN_ITERS = 6
+_GN_LAMBDA = 0.4          # Levenberg damping: stability + keeps the pose near the grip
+_GN_STEP_MAX = 0.20       # max joint rotation per iteration (rad)
+_GN_TOTAL_MAX = 0.55      # max cumulative joint rotation from the grip pose (rad)
+_GN_DEPTH = 0.15          # a vertex counts as penetrating past this depth (units)
+
+
+def _finger_fk(chain: list[str], parent_world: np.ndarray,
+               local_rot: list[np.ndarray], donor_trans: list[np.ndarray]
+               ) -> list[np.ndarray]:
+    """World 4×4 per joint of *chain* from *parent_world* and per-joint local
+    rotation + (locked) donor translation."""
+    worlds = []
+    w = parent_world
+    for i in range(len(chain)):
+        m = np.eye(4)
+        m[:3, :3] = local_rot[i]
+        m[:3, 3] = donor_trans[i]
+        w = w @ m
+        worlds.append(w)
+    return worlds
+
+
+def _gn_finger_frame(chain: list[str], parent_world: np.ndarray,
+                     local_rot: list[np.ndarray], donor_trans: list[np.ndarray],
+                     verts: list[np.ndarray], bind_inv: list[np.ndarray],
+                     wP: np.ndarray, wN: np.ndarray) -> list[np.ndarray] | None:
+    """
+    Gauss-Newton: rotate the joints of one finger, one frame, so its penetrating
+    vertices ride out to the weapon surface.  Returns new per-joint local rotations,
+    or ``None`` when the finger does not clip (no change).
+
+    The Jacobian of a vertex's penetration depth w.r.t. a small rotation about a
+    world axis *e* at joint *j* is ``(v − p_j) × n`` (n = weapon surface normal at
+    the vertex), a plain cross product — so one linear solve per iteration moves
+    every joint at once.  Damped and bounded: the pose stays a grip, and because
+    only rotations change, every bone length is preserved exactly.
+    """
+    m = len(chain)
+    rot = [r.copy() for r in local_rot]
+    total = np.zeros((m, 3))                    # cumulative rotation vector per joint
+    changed = False
+    for _ in range(_GN_ITERS):
+        worlds = _finger_fk(chain, parent_world, rot, donor_trans)
+        p = [w[:3, 3] for w in worlds]
+        pts, jidx = [], []
+        for i in range(m):
+            if len(verts[i]) == 0:
+                continue
+            xf = worlds[i] @ bind_inv[i]
+            pts.append((verts[i] @ xf.T)[:, :3])
+            jidx.append(np.full(len(verts[i]), i))
+        if not pts:
+            return rot if changed else None
+        V = np.vstack(pts)
+        B = np.concatenate(jidx)
+        _, signed, idx = _signed_to_surface(V, wP, wN)
+        depth = -signed
+        inside = (depth > _GN_DEPTH) & (signed > -3.0)
+        if not inside.any():
+            break
+        Vi, Bi, ni, ri = V[inside], B[inside], wN[idx[inside]], depth[inside]
+        J = np.zeros((len(ri), 3 * m))
+        for r_i in range(len(ri)):
+            for j in range(Bi[r_i] + 1):        # joints 0..b move this vertex
+                J[r_i, 3 * j:3 * j + 3] = np.cross(Vi[r_i] - p[j], ni[r_i])
+        JtJ = J.T @ J + _GN_LAMBDA * np.eye(3 * m)
+        delta = np.linalg.solve(JtJ, J.T @ ri).reshape(m, 3)
+        moved = False
+        for j in range(m):
+            wvec = delta[j]
+            mag = float(np.linalg.norm(wvec))
+            if mag > _GN_STEP_MAX:
+                wvec = wvec * (_GN_STEP_MAX / mag)
+            cand = total[j] + wvec
+            cmag = float(np.linalg.norm(cand))
+            if cmag > _GN_TOTAL_MAX:
+                cand = cand * (_GN_TOTAL_MAX / cmag)
+                wvec = cand - total[j]
+            if float(np.linalg.norm(wvec)) < 1e-6:
+                continue
+            total[j] = cand
+            angle = float(np.linalg.norm(wvec))
+            dR = _axis_angle_matrix(wvec / (angle + 1e-12), angle)
+            parent_rot = (parent_world[:3, :3] if j == 0 else worlds[j - 1][:3, :3])
+            rot[j] = parent_rot.T @ dR @ parent_rot @ rot[j]
+            moved = True
+        if moved:
+            changed = True
+        else:
+            break
+    return rot if changed else None
+
+
+def _contact_fit(model: ModelInput, reference_hand: SMD,
+                 reference_rigs: list, donor: SMD) -> int:
+    """
+    Per-frame penetration solve (TS.md Stage 4 §8.2) for grips the cheap passes miss.
+    Returns finger-frames adjusted.  Self-gating: per frame it only touches fingers
+    that still clip, and a finger already clear costs one nearest-surface query.
+    """
+    slots = _hand_slots(model, _HANDS_GROUP_RE)
+    hand_keys = {slot.key for slot in slots}
+    weapon_meshes = [smd for key, smd in model.smds.items()
+                     if not smd.is_animation and key not in hand_keys and smd.triangles]
+    if not weapon_meshes or not reference_rigs:
+        return 0
+    weapon_binds = [(mesh, world_transforms(mesh, 0)) for mesh in weapon_meshes]
+
+    ref_bind = world_transforms(reference_hand, 0)
+    ref_id_to_name = {n.id: n.name for n in reference_hand.nodes}
+    finger_names = {n for n in ref_bind if "finger" in n.lower()}
+    verts_by_bone: dict[str, np.ndarray] = {}
+    tmp: dict[str, list] = {}
+    for triangle in reference_hand.triangles:
+        for v in triangle.vertices:
+            name = ref_id_to_name.get(v.bone_id)
+            if name in finger_names:
+                tmp.setdefault(name, []).append([v.x, v.y, v.z, 1.0])
+    for k, v in tmp.items():
+        verts_by_bone[k] = np.array(v)
+    bind_inv = {n: np.linalg.inv(ref_bind[n]) for n in finger_names if n in ref_bind}
+
+    chains = []
+    for rig in reference_rigs:
+        for chain in rig.chains:
+            if all(b in bind_inv for b in chain):
+                chains.append((rig.hand, chain))
+    if not chains:
+        return 0
+
+    def weapon_cloud(smd, frame_index):
+        pose = world_transforms(smd, frame_index)
+        ps, ns = [], []
+        for mesh, bind in weapon_binds:
+            p, n = _posed_world_verts(mesh, bind, pose)
+            if len(p):
+                ps.append(p)
+                ns.append(n)
+        if not ps:
+            return pose, None, None
+        P = np.vstack(ps)
+        N = np.vstack(ns)
+        N = N / (np.linalg.norm(N, axis=1, keepdims=True) + 1e-9)
+        return pose, P, N
+
+    adjusted = 0
+    for smd in model.smds.values():
+        if not smd.is_animation or not smd.skeleton:
+            continue
+        name_to_id = {n.name: n.id for n in smd.nodes}
+        for frame_index, frame in enumerate(smd.skeleton):
+            pose, wP, wN = weapon_cloud(smd, frame_index)
+            if wP is None:
+                continue
+            bt = {b.bone_id: b for b in frame.bones}
+            for palm, chain in chains:
+                if palm not in pose:
+                    continue
+                ids = [name_to_id.get(b) for b in chain]
+                if any(i is None or i not in bt for i in ids):
+                    continue
+                local_rot = [_mat4_from_bt(bt[i])[:3, :3] for i in ids]
+                donor_trans = [np.array([bt[i].tx, bt[i].ty, bt[i].tz]) for i in ids]
+                verts = [verts_by_bone.get(b, np.empty((0, 4))) for b in chain]
+                binv = [bind_inv[b] for b in chain]
+                new_rot = _gn_finger_frame(chain, pose[palm], local_rot, donor_trans,
+                                           verts, binv, wP, wN)
+                if new_rot is None:
+                    continue
+                for i in range(len(chain)):
+                    bone = bt[ids[i]]
+                    mat = np.eye(4)
+                    mat[:3, :3] = new_rot[i]
+                    mat[:3, 3] = donor_trans[i]
+                    solved = _bt_from_mat4(bone.bone_id, mat)
+                    bone.rx, bone.ry, bone.rz = solved.rx, solved.ry, solved.rz
+                    adjusted += 1
+    return adjusted
 
 
 def normalise_hands(
@@ -940,7 +1713,12 @@ def normalise_hands(
     # the shared mesh curls without stretching.  Done before the mesh is swapped,
     # while the model's own hand bind is still available as the source pose.
     if retarget_fingers and replace_mesh:
-        result.retargeted = _retarget_fingers_to_reference(model, reference_hand, donor)
+        result.retargeted = _retarget_fingers_to_reference(
+            model, reference_hand, reference_rigs, donor)
+        if _WRIST_OFFSET:
+            _apply_wrist_offsets(model, reference_hand, reference_rigs, donor)
+        if _FINGER_RELAX:
+            _relax_finger_curl(model, reference_hand, reference_rigs)
 
     if replace_mesh:
         mapped = set(match.mapping)
