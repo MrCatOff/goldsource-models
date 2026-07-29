@@ -524,6 +524,7 @@ class HandNormalisation:
     error: str | None = None
     kept_own_hand: bool = False   # match too poor to share; own mesh retained
     retargeted: int = 0           # finger bone-frames baked onto the shared hand
+    carved: int = 0               # weapon grip vertices recessed out of the fingers
 
     @property
     def ok(self) -> bool:

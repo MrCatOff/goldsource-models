@@ -1618,6 +1618,157 @@ def _contact_fit(model: ModelInput, reference_hand: SMD,
     return adjusted
 
 
+# Grip carving: per-vertex weapon-side recess where the donor fingers penetrate, so
+# the shared hand can stay on every weapon.  OFF: it needs a reliable "into the gun"
+# direction, and these decompiled meshes provide none — vertex normals are
+# inconsistent (partly inward) and the mesh Laplacian isn't interior on thin,
+# non-convex grips, so every direction heuristic carves the wrong way somewhere
+# (v_usp 0.71→1.2/2.2u).  A correct carve needs a true solid inside/outside
+# (generalised winding number); these non-watertight meshes don't support one
+# cheaply.  Left as documented groundwork.
+_CARVE_GRIPS = False
+_CARVE_RADIUS = 1.6       # groove half-width (units)
+_CARVE_MARGIN = 0.12      # extra clearance behind the finger
+_CARVE_MAX = 1.6          # cap on how deep a vertex may be carved
+
+
+def _carve_grips(model: ModelInput, reference_rigs: list) -> int:
+    """
+    Recess the weapon grip out of the donor fingers.  Returns vertices moved.
+
+    Decompiled weapon meshes carry inconsistent, often inward-facing vertex normals,
+    so "which way is into the gun" cannot be read from them.  Instead the interior
+    direction is the mesh **Laplacian** — from a vertex toward the mean of its
+    triangle neighbours, which points into the solid for a convex grip and needs no
+    normal.  A finger vertex on the interior side of a weapon vertex (positive
+    Laplacian projection) is penetrating by that projection; the weapon vertex is
+    then pushed inward by the deepest such projection across sampled frames (smooth
+    radial falloff, capped).  Only the weapon mesh moves — the shared hand and every
+    bone are untouched, so the hand still reads identically on all 56 weapons.
+    """
+    slots = _hand_slots(model, _HANDS_GROUP_RE)
+    if not slots:
+        return 0
+    hand_keys = {s.key for s in slots}
+    hand_mesh = model.smds[slots[0].key]
+    weapon_meshes = [smd for key, smd in model.smds.items()
+                     if not smd.is_animation and key not in hand_keys and smd.triangles]
+    if not weapon_meshes:
+        return 0
+
+    hid = {n.id: n.name for n in hand_mesh.nodes}
+    is_finger = lambda b: "finger" in hid.get(b, "").lower()
+    hbind = world_transforms(hand_mesh, 0)
+    hbind_inv = {n: np.linalg.inv(hbind[n]) for n in hbind}
+    finger_by_bone: dict[str, list] = {}
+    for tri in hand_mesh.triangles:
+        for v in tri.vertices:
+            name = hid.get(v.bone_id)
+            if name and is_finger(v.bone_id) and name in hbind_inv:
+                finger_by_bone.setdefault(name, []).append([v.x, v.y, v.z, 1.0])
+    finger_by_bone = {k: np.array(v) for k, v in finger_by_bone.items()}
+    if not finger_by_bone:
+        return 0
+
+    frames = []
+    for smd in model.smds.values():
+        if smd.is_animation and smd.skeleton:
+            n = len(smd.skeleton)
+            for fi in sorted({0, n // 2, n - 1}):
+                frames.append((smd, fi))
+    if not frames:
+        return 0
+
+    moved = 0
+    for mesh in weapon_meshes:
+        mid = {n.id: n.name for n in mesh.nodes}
+        mbind = world_transforms(mesh, 0)
+        mbind_inv = {n: np.linalg.inv(mbind[n]) for n in mbind}
+        # Unique weapon vertices + triangle adjacency for the Laplacian.
+        index: dict[tuple, int] = {}
+        order: list[tuple] = []
+        pos_list, bone_list, corners = [], [], []
+        neigh: list[set] = []
+        for tri in mesh.triangles:
+            uid = []
+            for v in tri.vertices:
+                key = (round(v.x, 3), round(v.y, 3), round(v.z, 3))
+                i = index.get(key)
+                if i is None:
+                    i = len(order)
+                    index[key] = i
+                    order.append(key)
+                    pos_list.append([v.x, v.y, v.z])
+                    bone_list.append(mid.get(v.bone_id))
+                    corners.append([])
+                    neigh.append(set())
+                corners[i].append(v)
+                uid.append(i)
+            for a in range(3):                       # mutual neighbours
+                neigh[uid[a]].update(uid[b] for b in range(3) if b != a)
+        ref_pos = np.array(pos_list)
+        U = len(order)
+        # Reference-pose interior direction (Laplacian), normalised.
+        lap = np.zeros((U, 3))
+        for i in range(U):
+            if neigh[i]:
+                lap[i] = ref_pos[list(neigh[i])].mean(0) - ref_pos[i]
+        lap_n = np.linalg.norm(lap, axis=1, keepdims=True)
+        lap_dir = lap / (lap_n + 1e-9)
+        by_bone: dict[str, np.ndarray] = {}
+        for i, b in enumerate(bone_list):
+            by_bone.setdefault(b, []).append(i)
+        by_bone = {b: np.array(idx) for b, idx in by_bone.items() if b in mbind_inv}
+        carve = np.zeros(U)
+
+        for smd, fi in frames:
+            pose = world_transforms(smd, fi)
+            Wp = np.full((U, 3), np.nan)
+            Dw = np.zeros((U, 3))                     # world interior direction
+            for b, idx in by_bone.items():
+                if b not in pose:
+                    continue
+                x = pose[b] @ mbind_inv[b]
+                Wp[idx] = (ref_pos[idx] @ x[:3, :3].T) + x[:3, 3]
+                Dw[idx] = lap_dir[idx] @ x[:3, :3].T
+            valid = ~np.isnan(Wp[:, 0])
+            if not valid.any():
+                continue
+            Fp = []
+            for b, arr in finger_by_bone.items():
+                if b in pose:
+                    Fp.append((arr @ (pose[b] @ hbind_inv[b]).T)[:, :3])
+            if not Fp:
+                continue
+            F = np.vstack(Fp)
+            widx = np.nonzero(valid)[0]
+            Wv, Dv = Wp[widx], Dw[widx]
+            wdot = np.einsum("ij,ij->i", Wv, Dv)     # W·d per weapon vertex
+            # For each weapon vertex, deepest finger on its interior side within radius.
+            for s in range(0, len(widx), 256):
+                sl = slice(s, s + 256)
+                wv, dv, wd = Wv[sl], Dv[sl], wdot[sl]
+                dist = np.linalg.norm(wv[:, None, :] - F[None, :, :], axis=2)  # (chunk, F)
+                t = (F @ dv.T).T - wd[:, None]        # (chunk, F): (f - w)·d
+                fall = np.clip(1.0 - dist / _CARVE_RADIUS, 0.0, 1.0)
+                cand = np.where((t > _CARVE_MARGIN) & (dist < _CARVE_RADIUS),
+                                (t + _CARVE_MARGIN) * fall, 0.0).max(1)
+                gi = widx[sl]
+                carve[gi] = np.maximum(carve[gi], cand)
+
+        carve = np.minimum(carve, _CARVE_MAX)
+        hit = carve > 1e-3
+        if not hit.any():
+            continue
+        new_pos = ref_pos + carve[:, None] * lap_dir  # push toward interior
+        for i in np.nonzero(hit)[0]:
+            p = new_pos[i]
+            for v in corners[i]:
+                v.x, v.y, v.z = float(p[0]), float(p[1]), float(p[2])
+            moved += 1
+    return moved
+
+
 def normalise_hands(
     model: ModelInput,
     reference_hand: SMD,
@@ -1858,6 +2009,9 @@ def normalise_hands(
         name for name in retired
         if name.lower() not in {u.lower() for u in still_used}
     )
+    if _CARVE_GRIPS and replace_mesh and retarget_fingers:
+        result.carved = _carve_grips(model, reference_rigs)
+
     result.smd = new_hand
     return result
 
